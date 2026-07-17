@@ -1,8 +1,17 @@
 """EnerjiOne DNP3 Gateway paketi.
 
-DNP3 protokolu uzerinden Horstmann SN 2.0 cihazlarina baglanip sahadan okunan
-sinyalleri NATS JetStream uzerinden cati'nin tag-engine servisine ileten
-standalone gateway servisi.
+DNP3 protokolu uzerinden saha outstation cihazlarina TCP master olarak
+baglanan, okudugu sinyalleri normalize ederek NATS JetStream uzerinden
+EnerjiOne Grid backend'inin tag-engine servisine ileten standalone gateway
+servisi.
+
+Telemetri yayin yolu (0.4.x ve sonrasi):
+    DNP3 cihaz -> adapter -> poller -> ResilientPublisher
+        -> JetStreamPublisher -> NATS subject `e1.telemetry.raw.<GATEWAY_CODE>`
+        -> backend stream TELEMETRY_RAW -> tag-engine
+
+NATS bagi yoksa mesajlar SQLite outbox'a yazilir, baglanti gelince retrier
+bosaltir (at-least-once).
 """
 
 from pathlib import Path

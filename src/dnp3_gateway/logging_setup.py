@@ -45,16 +45,33 @@ def _scrub_message(text: str) -> str:
     return text
 
 
-# RabbitMQ AMQP URL parolasini regex ile maskeler:
+# Broker URL parolasini regex ile maskeler:
 #   amqp://user:password@host  →  amqp://user:***@host
+#   nats://user:password@host  →  nats://user:***@host
+#   tls://user:password@host   →  tls://user:***@host   (NATS TLS varyanti)
 # Genel safety net: kullanici register_secret unutsa bile parola log'a sizmasin.
-_AMQP_PASSWORD_RE = re.compile(r"(amqp[s]?://[^:@\s/]+):([^@\s/]+)@", re.IGNORECASE)
+# Onceden sadece AMQP yakaliyordu; NATS cutover sonrasi NATS URL'leri de
+# log'lara sizabilir.
+_BROKER_PASSWORD_RE = re.compile(
+    r"((?:amqp|amqps|nats|tls)://[^:@\s/]+):([^@\s/]+)@",
+    re.IGNORECASE,
+)
 
 
-def _scrub_amqp_passwords(text: str) -> str:
-    if not text or "amqp" not in text.lower():
+def _scrub_broker_passwords(text: str) -> str:
+    if not text:
         return text
-    return _AMQP_PASSWORD_RE.sub(r"\1:***@", text)
+    low = text.lower()
+    # Early-out: hicbir broker scheme yoksa regex'i atla (CPU tasarruf)
+    if "amqp" not in low and "nats" not in low and "tls://" not in low:
+        return text
+    return _BROKER_PASSWORD_RE.sub(r"\1:***@", text)
+
+
+# Geriye uyumluluk: eski `_scrub_amqp_passwords` cagirilari yeni broker
+# fonksiyonuna delege edilir.
+def _scrub_amqp_passwords(text: str) -> str:
+    return _scrub_broker_passwords(text)
 
 
 class _RedactionFilter(logging.Filter):
@@ -248,5 +265,14 @@ def configure_logging(
             )
             sys.stderr.flush()
 
-    # AMQP baglanti ayrintilari: genelde sadece dnp3_gateway loglari yeterlidir
-    logging.getLogger("pika").setLevel(logging.WARNING)
+    # 3rd-party kutuphane loglarini sessizlestir. Gateway log'unda genelde
+    # sadece dnp3_gateway namespace'i altindaki kayitlar gozlenir.
+    #
+    # NOT: `pika` 0.4.x cutover'i sonrasi runtime'da kullanilmiyor (RabbitMQ
+    # kaldirildi) — modul yuklu olmadigi icin logger zaten aktif degil. Eski
+    # kontrolun zararı yok ama gereksiz. `nats` ve `urllib3` daha kritik:
+    # baglanti retry log'lari INFO seviyesinde gurultu yapabilir, WARNING'e
+    # cek.
+    logging.getLogger("nats").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("urllib3.connectionpool").setLevel(logging.WARNING)

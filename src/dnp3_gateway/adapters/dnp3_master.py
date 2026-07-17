@@ -1,8 +1,17 @@
-"""Gercek DNP3 master adapter'i (dnp3py / nfm-dnp3 tabanli).
+"""FALLBACK DNP3 master adapter'i (nfm-dnp3 / dnp3py tabanli, saf Python).
 
-Horstmann (ve uyumlu) outstation'lara TCP uzerinden DNP3 master olarak baglanir;
+Saha DNP3 outstation'larina TCP uzerinden DNP3 master olarak baglanir;
 backend sinyal katalogundaki `dnp3_object_group` + `dnp3_index` ile esleşen
 degerler okunur ve `SignalReading` listesine donusturulur.
+
+NOT: Production'da ONERILEN adapter `dnp3_yadnp3_master.py` (yadnp3 / OpenDNP3
+native binding). Bu modul:
+  * Group 110 (Octet String) sinyallerini DESTEKLEMEZ
+  * Bazi OpenDNP3 outstation'larla "Transport segment data too short" /
+    TCP RST sorunlari yasayabilir (kutuphane uyumsuzlugu)
+
+Tercih edilen sebep: yadnp3 wheel saglanamayan platformlar veya saf-Python
+deploy ihtiyaci.
 
 Her cihaz icin `Dnp3DeviceSession` tutulur; varsayilan strateji `direct`
 (sadece katalogdaki DNP3 grup/index aralik okumalari). `integrity` / `class0`
@@ -248,7 +257,7 @@ class Dnp3DeviceSession:
                 # icin ~200-300ms ihtiyac duyuyor. Hemen READ atilirsa frame
                 # confused -> timeout/RST. Standalone test bu bekleme ile %100 OK.
                 time.sleep(0.3)
-            # disable_unsolicited bazi outstation'larda (Horstmann SN2 / OpenDNP3 sim)
+            # disable_unsolicited bazi outstation'larda (saha cihazlari / OpenDNP3 sim)
             # connection'i tamamen kopariyor; event_driven mod zaten unsolicited
             # FRAME'lerini empty-frame filtresi + read_class polling ile saglikli
             # ele aliyor — bu yuzden event_driven'da disable cagrisini ATLA.
@@ -505,7 +514,7 @@ class Dnp3DeviceSession:
 
         Chunklar arasina kisa gecikme: OpenDNP3 outstation ardisik hizli istekleri
         zaman zaman timeout ile dusurur — kisa nefes alinca cache hit orani ciddi
-        artar (Horstmann sim & gercek SN2 ile gozlendi).
+        artar (sim + gercek saha cihazlari ile gozlendi).
         """
         nmax = _effective_read_chunk_size(self._direct_max_points, group)
         need = set(idxs)
@@ -574,8 +583,9 @@ class Dnp3DeviceSession:
 
         if is_baseline_due:
             # Baseline: catalog'daki sinyalleri DIRECT range READ ile cek.
-            # Horstmann SN2 / OpenDNP3 outstation'larda read_class(0) timeout
-            # verip TCP'yi kopariyor; direct range read stabil calisiyor.
+            # Bazi OpenDNP3 outstation'larda (saha cihazlari + simulator)
+            # read_class(0) timeout verip TCP'yi kopariyor; direct range read
+            # stabil calisiyor.
             self._absorb_signals_via_direct(master, signals)
             absorbed = len(self._event_value_cache)
 
@@ -1016,7 +1026,7 @@ class Dnp3TelemetryReader(TelemetryReader):
                 )
                 for s in signals
             ]
-        # Read sirasinda outstation'in baglantiyi kapatmasi (Horstmann SN2 davranisi)
+        # Read sirasinda outstation'in baglantiyi kapatmasi (bazi saha cihazlarinda)
         # session._master'i None yapar; cache'den dus ki sonraki cycle yenilensin.
         if not session._master_connected():
             self._evict_session(device.code)
@@ -1062,6 +1072,26 @@ class Dnp3TelemetryReader(TelemetryReader):
                 )
             )
         return readings
+
+    def operate_device(
+        self,
+        *,
+        device: DeviceConfig,
+        index: int,
+        op_type: str = "pulse_on",
+        count: int = 1,
+        on_time_ms: int = 100,
+        off_time_ms: int = 100,
+        timeout_sec: float = 10.0,
+    ) -> dict[str, Any]:
+        # dnp3py adapter'i CROB gonderimi desteklemiyor; komut icin yadnp3 gerek.
+        _ = index, op_type, count, on_time_ms, off_time_ms, timeout_sec
+        return {
+            "ok": False,
+            "status": "unsupported",
+            "device_code": device.code,
+            "error": "dnp3py adapter komut desteklemiyor; DNP3_LIBRARY=yadnp3 kullanin",
+        }
 
     def close(self) -> None:
         with self._sessions_lock:

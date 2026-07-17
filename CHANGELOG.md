@@ -2,6 +2,194 @@
 
 Semver'a gore tutulur. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.6] - 2026-05-13
+
+### Security — Audit follow-up (sprint sonrasi 2. pas)
+
+Cross-reference auditi sonucu kapatilan ek bulgular:
+
+- **Rate-limit memory leak FIX (B1)**: `_SlidingWindowRateLimiter._buckets`
+  dict'i unbounded buyuyebilirdi (saldirgan farkli IP'lerden spam yaparsa).
+  `start_health_server` artik daemon `rate-limit-cleanup` thread'i baslatir;
+  her 120sn'de bir `cleanup_stale()` cagrir ve eskimis IP entry'lerini siler.
+- **X-Forwarded-For trust boundary FIX (H1)**: Onceki impl XFF header'ini
+  her zaman okuyordu — saldirgan dogrudan gateway'e baglanip
+  `X-Forwarded-For: 127.0.0.1` set ederek localhost-muafiyetinden rate-limit
+  bypass yapabilirdi. Yeni model nginx `real_ip` mantigi:
+    * `HEALTH_TRUSTED_PROXIES` (CIDR listesi, default BOS) — bos ise XFF
+      TAMAMEN yok sayilir (en guvenli default).
+    * Set edilirse SADECE bu subnet'lerden gelen istekte XFF okunur.
+- **429 / 401 / 404 / 503 Content-Length=0 (H2)**: HTTP/1.1 framing spec
+  uyumu. Bazi client'lar Content-Length yoksa connection'i half-close gorur
+  ve keep-alive bozulur.
+- **404 fast-path rate-limit bypass FIX (M1)**: `do_POST` artik 404 dispatch
+  oncesinde rate-limit check yapar. Saldirgan `POST /random` spam'le
+  sunucuyu yoramaz.
+- **LOG_LEVEL=DEBUG production WARN (M5)**: Boot'ta loud uyari log. DEBUG
+  seviyesinde 3rd-party kutuphaneler (requests, urllib3) hassas detay
+  loglayabilir; redaction filter cogu kapatir ama garanti yok.
+
+### Added — Konfigurasyon
+
+- **`HEALTH_TRUSTED_PROXIES`** (.env / config.py): Reverse proxy CIDR
+  allowlist. Bos = XFF yok sayilir (default, en guvenli). Set edilirse
+  sadece bu subnet'lerden gelen XFF okunur. Ornek:
+  `HEALTH_TRUSTED_PROXIES=10.0.0.0/8,192.168.1.5/32`.
+
+### Removed — Legacy kod (CR-3 follow-up)
+
+- **`src/dnp3_gateway/messaging/rabbit_publisher.py`** tamamen silindi.
+  0.4.3 cutover'da rollback amaciyla duruyordu; 0.4.6 audit sonrasi
+  production'a guven geldigi icin saldiri yuzeyi azaltma amaciyla
+  kaldirildi. Eski `pika` ile rollback gerekirse `git revert` ile geri
+  alinabilir.
+
+### Tests
+
+- **`tests/test_health_server.py`** (16 yeni test):
+  - `_SlidingWindowRateLimiter`: allow + localhost muafiyet + farkli IP
+    bucket'lar + window slide + cleanup_stale.
+  - `_parse_trusted_proxies`: bos/gecersiz/IPv6 CIDR.
+  - `_ip_in_networks`: tek/coklu CIDR + bos liste + gecersiz IP.
+- **`tests/test_outbox.py`** (11 yeni test):
+  - enqueue / fetch_batch / delete / pending estimate.
+  - `OutboxFullError` raise senaryosu.
+  - `mark_retry` + `move_to_dead_letter`.
+  - Restart sonrasi DB tutarliligi.
+  - Unicode payload serileme.
+- Toplam test coverage: 45 -> 72 test (sprintten sonra +27).
+
+### Security — Production validator genisletildi
+
+- **GATEWAY_TOKEN placeholder prefix reddi (PROD)**: `config._PLACEHOLDER_TOKEN_PREFIXES`
+  listesi (orn. `change-me`, `gw-default`, `gw-001-token`, `please-change`,
+  `example-token`) ile baslayan token'lar production'da SystemExit eder.
+  `.env.example`'dan kopyalanip token guncellenmeden boot edilirse erken
+  yakalanir. Auth katmanindaki literal `_PLACEHOLDER_TOKENS` set'i (frozenset)
+  exact-match icin staging + production'da hala aktif.
+- **RABBITMQ_URL production'da reddedildi**: Gateway 0.4.x'te RabbitMQ
+  telemetri akisindan kaldirilmisti; bu validator eski .env'lerin sessizce
+  prod'a deploy edilmesini engeller. Operator satiri silmek zorunda.
+- **NATS_DUAL_PUBLISH_ENABLED=true production'da reddedildi**: DEPRECATED
+  bayrak. Onceden no-op + WARN log; simdi prod'da hata vererek operator
+  beklediginden farkli davranisla karsilasmasin.
+
+### Security — Health server rate-limit (H-8/H-9)
+
+- **Per-IP sliding window** her endpoint'te aktif:
+  - `/health`, `/healthz`, `/info`, `/metrics`: 120 req/min/IP
+  - `POST /refresh-all`: 10 req/min/IP (token leak senaryosunda saha cihazi
+    DoS koruma).
+- Localhost (`127.0.0.1`, `::1`) muaf — cati paneli/backend ayni host'tan
+  sinirsiz probe yapabilir.
+- `X-Forwarded-For` ilk degeri dikkate alinir (reverse proxy arkasinda gercek
+  client IP'sini yakala).
+- Rate-limit ihlali: HTTP 429 + `Retry-After: 60` header + WARN log.
+
+### Removed — RabbitMQ legacy temizligi (CR-3)
+
+- **`src/dnp3_gateway/messaging/rabbit_publisher.py` silindi**. 0.4.3'te
+  cutover yapilmisti, modul rollback amaciyla duruyordu; production'a guven
+  geldigi icin saldiri yuzeyi azaltma amaciyla kaldirildi.
+- **`pyproject.toml` `legacy-rabbit` extra'si silindi** (`pika>=1.3` opsiyonel
+  dependency).
+- **`requirements.txt`** "pika ROLLBACK" yorumlari + Horstmann basligi
+  temizlendi; production-friendly modern format.
+- `messaging/__init__.py` docstring guncellendi — mimari diyagrami eklendi.
+- `main.py` RabbitMQ password redaction blogu silindi (artik gerek yok).
+
+### Changed — Tutarlilik (CR-1, CR-2)
+
+- **`NATS_PUBLISH_TIMEOUT_SEC` doc/kod senkronizasyonu**: kod default `0.5sn`'den
+  `2.0sn`'ye yukseltildi; `.env.example` ile uyumlu. 100 cihaz x 30 sinyal
+  paralel cycle yuk senaryosunda agresif outbox dusurmesinin onune gecer
+  (yerel/LAN icin makul, 4G/WAN icin de uygun).
+- **`config.py` validator docstring** yeniden yazildi — staging-only vs
+  production-only kurallar ayri listelendi.
+- **`config.rabbitmq_exchange` ve `rabbitmq_routing_key` default'lari bos**
+  (eskiden `hsl.events` / `telemetry.raw_received`). Field'lar sadece pydantic
+  schema compat icin tutuluyor, hicbir yerde okunmuyor.
+
+### Changed — Logging
+
+- **3rd-party logger seviyeleri**: `nats`, `urllib3`, `urllib3.connectionpool`
+  WARNING'e cekildi. Onceden INFO seviyesinde baglanti retry log'lari gurultu
+  yapardi. `pika` logger silindi (paket artik yuklu degil).
+- **Log redaction broker regex** halen `(amqp|amqps|nats|tls)://user:pass@`
+  patternini yakalar (eski .env'lerden gelen amqp URL'leri parolasini
+  redact eder).
+
+### Changed — Rebrand temizligi (L-1..L-4)
+
+- Tum source/docs/scripts'te "Horstmann SN2", "Horstmann Smart Logger",
+  "hsl.events", "hsl-gw-*" referanslari **EnerjiOne** / **eg-gw-*** /
+  **enerjione-gateway-*** ile degistirildi. Saha cihazlari artik
+  uretici-agnostik "DNP3 outstation" olarak adlandiriliyor.
+- `config.LOG_FILE_PATH` default ornek: `C:/ProgramData/EnerjiOne/...`
+- `DeviceConfig.signal_profile` default `"default"` (eskiden
+  `"horstmann_sn2_fixed"`); backend ne gonderirse o tasinmaya devam eder.
+- `docker/compose.template.yml` container ismi `eg-gw-{code}`, network adi
+  `enerjione`, volume `eg-gw-{code}-state`.
+- User-Agent zaten `EnerjiOne-Dnp3Gateway/{ver}` (0.2.0'dan beri).
+
+### Added — Operasyonel
+
+- **`scripts/install.ps1`**:
+  - `.env` artik UTF-8 BOM-siz yazilir (`.env.example`'dan kopyalama). Docker
+    Compose `env_file` ve Python pydantic-settings BOM karakterini ilk
+    anahtarin parcasi sanmasin.
+  - `.env` olusturulduktan sonra NTFS ACL kisitlanir (sadece mevcut kullanici
+    FullControl). Token PowerShell history / yedek vol'lara sizmasin.
+- **`scripts/run_gateway.ps1`**: `-RabbitmqUrl` parametresi `-NatsUrl` ile
+  degistirildi.
+
+### Docs — Tam yeniden yazim
+
+- **`docs/SECURITY.md`**: Kimlik modeli tablosu + multi-instance lock
+  bolumu + NATS auth (NKEY/JWT credentials) detayi + DNP3 cihaz IP
+  allowlist + log redaction katmanlari + production checklist.
+- **`docs/RUNBOOK.md`**: NSSM kurulumu + `LOG_FILE_PATH` zorunlulugu +
+  yeni log etiketleri + incident response (8 sik sorun) + operator
+  endpoint'leri + graceful shutdown sirasi.
+- **`docs/ARCHITECTURE.md`**: Bilesen diyagrami JetStream + outbox akisi +
+  recovery state machine (lost -> recovering -> online) + defansif sema
+  validasyonu tablosu + roadmap.
+- **`docs/DOCKER.md`**: Image tagging (`:latest` yerine semver), NATS
+  networking ornekleri, persistent state yedekleme.
+- **`README.md`**: 0.4.x mimari diyagrami + production checklist + ozet
+  ozellik listesi (yadnp3, outbox, allowlist, multi-instance lock,
+  rate-limit). Eski RabbitMQ akis diyagrami silindi.
+- **`scripts/README.md`**: install / run / new_gateway her birinin
+  parametre ornekleri + NSSM ozetli yonlendirme.
+
+### Tests
+
+- `test_config_settings.py`:
+  - `rabbitmq_exchange` / `rabbitmq_routing_key` default'lari bos kabulu.
+  - `nats_publish_timeout_sec == 2.0` default kabulu.
+  - 4 yeni prod validator testi:
+    - `test_prod_rejects_placeholder_token`
+    - `test_prod_rejects_change_me_prefix`
+    - `test_prod_rejects_rabbitmq_url`
+    - `test_prod_rejects_dual_publish_enabled`
+  - `test_dev_allows_rabbitmq_url_and_placeholder` — development'da hepsi
+    kabul edildigini dogrular.
+- `tests/conftest.py`: `signal_profile="default"` (rebrand).
+
+### Migration notes (0.4.5 -> 0.4.6)
+
+Sahada `.env` icinde su satirlar varsa boot SystemExit eder (production):
+
+```diff
+- RABBITMQ_URL=amqp://...      # Sil, gateway artik kullanmiyor
+- NATS_DUAL_PUBLISH_ENABLED=true   # Sil veya false yap
+- GATEWAY_TOKEN=gw-001-token   # Yenisini uret: secrets.token_urlsafe(48)
+- GATEWAY_TOKEN=change-me-...  # Aynisi: gercek token at
+```
+
+Eski deploy'lar `APP_ENVIRONMENT=staging` veya `development` ile bu kurallari
+atlatabilir (gecici); kalici cozum yukaridakileri temizlemek.
+
 ## [0.4.5] - 2026-05-12
 
 ### Changed — production validator esnetildi (private network HTTP)

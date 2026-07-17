@@ -1,62 +1,60 @@
 # EnerjiOne DNP3 Gateway
 
-**Version:** 0.2.2
-**Hedef platform:** Windows Server / Windows 10+ (Linux systemd de calisabilir)
+**Version:** 0.4.6
+**Hedef platform:** Windows Server / Windows 10+ (Linux Docker da desteklenir)
 **Python:** 3.10 - 3.12
 
-Bu proje [EnerjiOne Grid Dashboard](../Horstman%20Smart%20Logger) catisinin saha
-katmanidir. Her gateway instance'i **1 gateway kaydinda tanimli 100'e kadar
-Horstmann SN 2.0 cihazi** ile DNP3 uzerinden haberlesir; okudugu sinyalleri
-normalize ederek NATS JetStream uzerinden cati yazilima iletir. Sistem mimarisinde
-toplam 6 gateway paralel calisir (6 x 100 = 600 cihaz).
+EnerjiOne Grid platformunun **saha gateway** servisidir. DNP3 protokolu uzerinden
+saha outstation cihazlarini master rolunde poll eder, okudugu sinyalleri
+normalize eder ve **NATS JetStream** uzerinden cati backend'inin tag-engine
+servisine iletir.
 
 ```
-+-----------------+                +------------------------+
-| Horstmann SN2.0 |  DNP3 TCP     |                        |
-|   (100 adet)    +--------------->|  dnp3_gateway (bu proje)|
-+-----------------+                |                        |
-                                   |  - config_client       |
-                                   |  - poller              |
-                                   |  - dnp3 adapter        |
-                                   |  - rabbit publisher    |
-                                   +-----------+------------+
-                                               |
-                                               | AMQP
-                                               v
-                          +-----------------------------------+
-                          |  RabbitMQ  hsl.events             |
-                          |  routing: telemetry.raw_received  |
-                          +-----------------+-----------------+
-                                            |
-                                            v
-                                   tag-engine / alarm-service
-                                   dashboard & outbound
++-------------------+         +----------------------+        +------------------+
+| DNP3 outstation   |  TCP    |  EnerjiOne DNP3      |  NATS  |  Backend tag-    |
+| (saha cihazlari)  +-------->|  Gateway (bu proje)  +------->|  engine + DB     |
+|  100 cihaz/gw     |  20000  |                      |  4222  |                  |
++-------------------+         |  - config_client     |        +------------------+
+                              |  - poller (yadnp3)   |
+                              |  - outbox (SQLite)   |
+                              |  - jetstream pub.    |
+                              +----------+-----------+
+                                         |
+                                         | health HTTP (8020)
+                                         v
+                                  /health  (auth-suz, minimum)
+                                  /info, /metrics (Bearer auth)
+                                  /refresh-all (Bearer auth, POST)
 ```
 
-## Ozet
+Sistem mimarisinde 6 gateway paralel calisir = 6 × 100 cihaz = 600 cihaz/site.
 
-- **Otonom konfigurasyon**: Backend API `/gateways/{code}/config` endpoint'inden
-  cihaz listesi + standart Horstmann SN 2.0 sinyal kataloğu cekilir. Her
-  `CONFIG_REFRESH_SEC` periyodunda yenilenir, boylece yeni cihaz/sinyal/adres
-  degisiklikleri gateway'i yeniden baslatmadan etkili olur.
-- **Master/Sat01/Sat02 ayrimi**: Horstmann SN2 cihazinda ayni olcum birden fazla
-  unite (master + 2 satellite) uzerinden gelir. Sinyal kataloğu `source` alani
-  ile bu uc kaynagi ayirir; her telemetri mesajinda `signal_source` tasinir.
-- **Poll bazli + event ready**: Cihaz ayarlarindaki `poll_interval_sec` ile
-  integrity poll yapilir. Gelecekte class-event baglantisi icin temel hazirdir.
-- **Scale + offset**: Ham deger `value = raw * scale + offset` ile gercek
-  birime cevrilir ve yayinlanir.
-- **Publisher confirms + reconnect**: RabbitMQ bağlantı koptuğunda otomatik
-  yeniden bağlanır; delivery mode 2 (persistent) + publisher confirms aktiftir.
-- **Health endpoint**: `GET /health` - kontrol paneli + orchestration tools
-  icin durum (config_version, devices, is_active) gosterir.
-- **Mock mod**: Fiziksel cihaz olmadan tum zincirin testi icin `GATEWAY_MODE=mock`
-  secenegi vardir. Gercek mod `GATEWAY_MODE=dnp3` ile acilir.
-- **Kimlik ve yuk dagitimi**: Her proses `GATEWAY_CODE` + gizli `GATEWAY_TOKEN`
-  ile backend’e baglanir; token yalnizca `X-Gateway-Token` ile gider. Ayni
-  sunucuda veya farkli sunucularda birden cok instance: farkli kod/ token +
-  farkli health port; cihazlar backend’de `gateway_code` ile bolunur.
-  Ayrintilar: [docs/SECURITY.md](./docs/SECURITY.md).
+## Ozet ozellikler
+
+- **Otonom konfigurasyon:** Backend `/gateways/{code}/config` endpoint'inden
+  cihaz listesi + sinyal katalogu cekilir; `config_version` degisince yeni
+  hali yansir (gateway restart gerektirmez).
+- **At-least-once delivery:** SQLite tabanli persistent outbox + retrier
+  thread. NATS bagi koparsa mesajlar diske yazilir, bagi gelince retrier
+  bosaltir. Mesaj kaybi YOK; tag-engine idempotent islem.
+- **DNP3 master, yadnp3 (OpenDNP3 native):** Tam DNP3 standardi, Group 110
+  octet-string destegi, event-driven (Class 1/2/3 scan + periyodik Class 0
+  baseline). Fallback adapter: nfm-dnp3 (saf Python, Group 110 yok).
+- **Cihaz IP allowlist:** `DNP3_DEVICE_ALLOWED_SUBNETS` CIDR listesi.
+  Backend kompromize olsa bile gateway sadece saha LAN'inda TCP acar.
+- **Multi-instance lock:** Ayni `GATEWAY_CODE` ile ikinci kopya boot ederse
+  SystemExit. Outbox corrupt + duplicate publish riski yok.
+- **Production validator:** TLS zorunlulugu (public host), token min length
+  + placeholder prefix reddi, deprecated alanlarda hata. Saha hatalarini
+  boot'ta yakalar.
+- **Per-IP rate-limit:** `/health` (120 req/min) ve `/refresh-all` (10 req/min)
+  defansif limit; localhost muaf.
+- **Recovery state machine:** TCP up + DNP3 dead durumunda sahte "online"
+  yayini onler. 15sn grace icinde fresh frame gelmezse cihaz tekrar lost.
+- **Rotating log + secret redaction:** RotatingFileHandler (20MB × 10
+  backup) + token / NATS parolasi otomatik `***REDACTED***`.
+- **Graceful shutdown:** SIGINT/SIGTERM + Windows SIGBREAK (NSSM stop).
+  Tipik <8sn kaynak temizligi.
 
 ## Hizli Baslangic
 
@@ -68,36 +66,49 @@ py -3.10 -m venv .venv
 py -m pip install -r requirements.txt
 ```
 
+Production: yadnp3 wheel manuel kurulur (PyPI'de manylinux + win wheel'leri):
+```powershell
+py -m pip install "yadnp3==3.2.1.1"
+```
+
+Veya hizli kurulum scripti:
+```powershell
+./scripts/install.ps1
+```
+
 ### 2. Ortami yapilandir
 
-`.env.example` -> `.env` olarak kopyalayin ve kendi backend / RabbitMQ / gateway
-kodunuzu yazin. Onemli alanlar:
+`.env.example` -> `.env` kopyalayin ve doldurun. Kritik alanlar:
 
 | Key | Amac |
 | --- | --- |
-| `GATEWAY_CODE` | Bu instance'in backend'de kayitli gateway kodu |
-| `GATEWAY_TOKEN` | Backend `gateways.token` alaniyla ayni deger |
-| `APP_ENVIRONMENT` | `development` / `staging` / `production` (uretimde guclu token zorunlulugu) |
+| `GATEWAY_CODE` | Backend'deki gateway kodu (orn. `GW-001`) |
+| `GATEWAY_TOKEN` | Backend `gateways.token` ile birebir; production'da >=32 char rastgele |
+| `APP_ENVIRONMENT` | `development` / `staging` / `production` (validator sertligi degisir) |
 | `GATEWAY_MODE` | `mock` (test) veya `dnp3` (saha) |
-| `BACKEND_API_URL` | Cati backend-api adresi (`/api/v1` ile biter) |
-| `RABBITMQ_URL` | `amqp://user:pass@host:5672/` |
-| `WORKER_HEALTH_PORT` | Instance basina unique olmali (8020, 8021...) |
+| `BACKEND_API_URL` | EnerjiOne backend (`/api/v1` ile biter) |
+| `NATS_URL` | NATS JetStream (`nats://` private ag / `tls://` public) |
+| `WORKER_HEALTH_PORT` | Instance basina unique (8020, 8021, ...) |
+| `DNP3_DEVICE_ALLOWED_SUBNETS` | Saha LAN CIDR'leri (production'da MUTLAKA set) |
+| `LOG_FILE_PATH` | NSSM kurulumda zorunlu (rotation icin) |
 
-Tum parametrelerin aciklamasi icin [.env.example](./.env.example) dosyasina
-bakin.
+Tam aciklamali: [.env.example](./.env.example) + [docs/SECURITY.md](./docs/SECURITY.md).
 
 ### 3. Gateway'i calistir
 
 ```powershell
-# Windows - tek gateway
+# Tek gateway, default .env
 py -3.10 -m dnp3_gateway
 
-# veya setuptools ile kurulduysa
+# veya setuptools ile kuruldu
 enerjione-dnp3-gateway
+
+# Coklu instance, ayri .env
+py -3.10 -m dnp3_gateway --env-file .env.GW-002 --health-port 8021
 ```
 
-Birden fazla gateway ayni makinede calistirilacaksa `scripts/run_gateway.ps1`
-betigini kullanabilirsiniz (bkz. [scripts/README.md](./scripts/README.md)).
+Birden fazla gateway ayni makinede: `./scripts/new_gateway.ps1 -Code GW-002`
+ile yeni `.env.GW-002` uretin (random token + NTFS ACL otomatik).
 
 ### 4. Saglik kontrolu
 
@@ -111,72 +122,110 @@ Yanit ornegi:
 {
   "status": "ok",
   "service": "dnp3-gateway",
-  "version": "0.2.0",
+  "version": "0.4.6",
   "gateway_code": "GW-001",
-  "gateway_instance_id": "8f2b...-uuid",
-  "app_environment": "development",
-  "mode": "mock",
+  "gateway_instance_id": "8f2b...",
+  "app_environment": "production",
+  "mode": "dnp3",
+  "issues": [],
   "config": {
     "config_version": "ab12cd34ef56",
     "device_count": 100,
     "signal_count": 180,
-    "active": true
+    "active": true,
+    "config_cache_age_sec": 12.3,
+    "config_cache_stale": false
+  },
+  "outbox": {
+    "outbox_pending": 0,
+    "outbox_dead_letter": 0,
+    "broker_ready": true,
+    "broker_publish_successes": 14530,
+    "broker_publish_failures": 0
+  },
+  "metrics": {
+    "uptime_sec": 3210,
+    "poll_cycles_total": 642,
+    "signals_published_total": 14530
   }
 }
 ```
 
-## Proje Yapisi
+Status semantigi: `ok` / `starting` / `degraded` / `unhealthy` (503).
+Detayli incident response: [docs/RUNBOOK.md](./docs/RUNBOOK.md).
+
+## Proje yapisi
 
 ```
-Horstmann Smart Logger DNP3 Gateway/
+EnerjiOne Grid DNP3 Gateway/
 |-- README.md
-|-- VERSION                    <- semver; mevcut surum
-|-- pyproject.toml             <- paket meta ve setuptools konfigurasyonu
-|-- requirements.txt           <- runtime bagimliliklar
-|-- requirements-dev.txt       <- gelistirme/test bagimliliklar
+|-- CHANGELOG.md
+|-- VERSION                       <- semver; mevcut surum
+|-- pyproject.toml                <- paket meta + setuptools
+|-- requirements.txt              <- runtime bagimliliklar
+|-- requirements-dev.txt          <- gelistirme/test
 |-- .env.example
+|-- Dockerfile
 |-- src/
 |   `-- dnp3_gateway/
 |       |-- __init__.py
-|       |-- __main__.py        <- py -m dnp3_gateway
-|       |-- main.py            <- ana dongu / config refresh / graceful shutdown
-|       |-- config.py          <- Settings (pydantic-settings)
-|       |-- logging_setup.py
-|       |-- state.py           <- GatewayState (thread-safe)
-|       |-- poller.py          <- Cihaz bazli poll scheduler
-|       |-- health_server.py
-|       |-- auth/              <- kimlik, instance_id, HTTP basliklari
+|       |-- __main__.py           <- py -m dnp3_gateway
+|       |-- main.py               <- ana dongu / config refresh / shutdown
+|       |-- config.py             <- Settings (pydantic-settings + validator)
+|       |-- logging_setup.py      <- rotating + secret redaction
+|       |-- state.py              <- GatewayState (thread-safe, disk cache)
+|       |-- poller.py             <- run_poll_cycle (paralel okuma)
+|       |-- health_server.py      <- /health, /info, /metrics, /refresh-all
+|       |-- auth/                 <- identity, headers, instance_lock
 |       |-- backend/
-|       |   `-- config_client.py
+|       |   `-- config_client.py  <- BackendConfigClient (HMAC opt-in)
 |       |-- messaging/
-|       |   `-- rabbit_publisher.py
+|       |   |-- jetstream_publisher.py
+|       |   |-- outbox.py
+|       |   `-- resilient_publisher.py
 |       `-- adapters/
-|           |-- base.py        <- TelemetryReader arayuzu
-|           |-- mock.py        <- Rastgele degerli mock okuyucu
-|           `-- dnp3_master.py <- opendnp3 tabanli gercek okuyucu
+|           |-- base.py
+|           |-- mock.py
+|           |-- dnp3_master.py    <- fallback (nfm-dnp3)
+|           `-- dnp3_yadnp3_master.py  <- primary (yadnp3/OpenDNP3)
 |-- scripts/
-|   |-- README.md
+|   |-- install.ps1
 |   |-- run_gateway.ps1
-|   `-- install.ps1
+|   |-- new_gateway.ps1
+|   `-- render_compose.py
+|-- docker/
+|   `-- compose.template.yml
 |-- tests/
-|   |-- test_state.py
-|   |-- test_config_client.py
-|   |-- test_poller.py
-|   |-- test_mock_adapter.py
-|   `-- test_auth_identity.py
 `-- docs/
     |-- ARCHITECTURE.md
     |-- SECURITY.md
-    `-- RUNBOOK.md
+    |-- RUNBOOK.md
+    `-- DOCKER.md
 ```
+
+## Production checklist
+
+Sahaya cikmadan once:
+
+- [ ] `GATEWAY_TOKEN` >=32 char rastgele (`secrets.token_urlsafe(48)`)
+- [ ] `APP_ENVIRONMENT=production`
+- [ ] Backend ile token eslesmesi dogrulandi (smoke test: /health "ok")
+- [ ] `DNP3_DEVICE_ALLOWED_SUBNETS` saha LAN'ina gore set
+- [ ] `LOG_FILE_PATH` rotation icin set (NSSM kurulumda)
+- [ ] `.env` ACL kisitlandi (install.ps1 otomatik yapar)
+- [ ] (Public NATS) `NATS_URL=tls://` + `NATS_CREDENTIALS_PATH` + `NATS_TLS_CA_PATH`
+- [ ] (Public backend) `BACKEND_API_URL=https://` + sertifika gecerli
+- [ ] Multi-instance kullanilacaksa `WORKER_HEALTH_PORT` her gateway icin farkli
+- [ ] `RABBITMQ_URL` ve `NATS_DUAL_PUBLISH_ENABLED` `.env`'den silindi (DEPRECATED)
+
+Tam detay: [docs/SECURITY.md "Checklist"](./docs/SECURITY.md#checklist-yeni-sunucuya-gateway).
 
 ## Versiyonlama
 
-Versiyon numarasi `MAJOR.MINOR.PATCH` seklindedir:
-
-- **Patch** (`0.1.1`): bugfix, kucuk yama
-- **Minor** (`0.2.0`): yeni ozellik, geri-uyumlu genisleme
-- **Major** (`1.0.0`): kirici degisiklik ya da 2 haneli minor'den taşma
+Versiyon `MAJOR.MINOR.PATCH`:
+- **Patch** (`0.4.6`): bugfix, kucuk yama, doc temizligi
+- **Minor** (`0.5.0`): yeni ozellik, geri-uyumlu genisleme
+- **Major** (`1.0.0`): kirici degisiklik
 
 `VERSION` dosyasi + `pyproject.toml` daima birlikte guncellenir.
 

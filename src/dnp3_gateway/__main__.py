@@ -28,7 +28,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dnp3_gateway",
         description=(
-            "Horstmann SN2 DNP3 Gateway. Ayni PC'de coklu instance icin "
+            "EnerjiOne DNP3 Gateway. Saha DNP3 outstation cihazlarini poll edip "
+            "telemetriyi NATS JetStream'e basar. Ayni PC'de coklu instance icin "
             "--env-file ile farkli .env, --health-port ile farkli port verin."
         ),
     )

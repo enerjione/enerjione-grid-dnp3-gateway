@@ -1,25 +1,32 @@
-# Horstmann Smart Logger DNP3 Gateway
-# Runtime bagimliliklari
+# EnerjiOne DNP3 Gateway - runtime bagimliliklari
+#
+# Versiyon stratejisi: minor-pinned (>=X.Y,<X.Z) — patch'leri otomatik al,
+# breaking change'leri (minor/major) opt-in et. Production reproducibility
+# icin `requirements-lock.txt` (pip-compile --generate-hashes) onerilir;
+# bu dosya geliştirme kolayligi icin tutuluyor.
 
+# Konfigurasyon / HTTP
 pydantic>=2.5,<3.0
 pydantic-settings>=2.1,<3.0
 requests>=2.31,<3.0
 
-# NATS JetStream — PRIMARY telemetri yayinlama yolu. Gateway 0.4.x ile
-# RabbitMQ telemetri akisindan kaldirildi; tum telemetri JetStream'e
-# basilir. Backend tarafindaki alarm/notification akisi RabbitMQ'da
-# kalmaya devam ediyor (gateway onunla ilgilenmez).
+# NATS JetStream — PRIMARY telemetri yayinlama yolu (gateway'in tek
+# telemetri yayin kanali). Gateway 0.4.x ile RabbitMQ telemetri akisindan
+# tamamen kaldirildi (backend tarafinda alarm/notification icin RabbitMQ
+# kullanilmaya devam ediyor; gateway onunla ilgilenmez).
 nats-py>=2.6,<3
 
-# LEGACY — pika sadece rollback senaryosunda (rabbit_publisher.py modulunu
-# explicit kullanan kod icin) gerekli. Production gateway pika'ya BAGLI
-# DEGIL; bu satir geriye uyumluluk icin tutuluyor. Cutover'a guven gelince
-# tamamen kaldirilabilir.
-pika>=1.3,<2.0
-
-# Onerilen DNP3 master: yadnp3 (OpenDNP3 reference, Group 110 / Octet String).
-# pypi'de yok; wheel asagidaki dizinden kurulur (install.ps1).
-# yadnp3>=3.2,<4.0  # _wheels/yadnp3-3.2.1.1-...whl
-
-# Legacy (Group 110 yok, OpenDNP3 outstation ile tutarsiz):
+# DNP3 master kutuphanesi: yadnp3 (OpenDNP3 reference) — Group 110 (Octet
+# String) destegi + tam DNP3 standart implementasyonu. PyPI'de manylinux
+# + Windows wheel'leri olarak yayinlanir.
+#
+# Production default (Linux/Docker): wheel manuel kuruluyor cunku yadnp3
+# bazi platformlarda hala wheel saglamiyor olabilir. Dockerfile builder
+# stage'inde direct `pip install yadnp3==X.Y.Z` cagrisi yapilir.
+# Local Windows kurulumu: install.ps1 .venv kurarken `pip install yadnp3`
+# komutunu calistirir.
+#
+# Asagidaki nfm-dnp3 FALLBACK — yadnp3 kurulamiyorsa veya saf-python tercih
+# ediliyorsa. Group 110 destegi YOK; numeric tip okuma calisir. Default
+# konfigurasyonda yadnp3 onerilir (config.py DNP3_LIBRARY=yadnp3).
 nfm-dnp3>=1.0.1,<2.0

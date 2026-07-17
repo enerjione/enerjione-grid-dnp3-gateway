@@ -48,7 +48,7 @@ def make_device(
         poll_interval_sec=poll_interval_sec,
         timeout_ms=3000,
         retry_count=2,
-        signal_profile="horstmann_sn2_fixed",
+        signal_profile="default",
     )
 
 

@@ -1,28 +1,28 @@
 # Docker ile Coklu Gateway Yonetimi
 
-Bu dokuman Horstmann Smart Logger DNP3 Gateway'in Docker container'i olarak nasil
-kurulup ayni host uzerinde N tane instance halinde yonetildigini anlatir. Hedef:
-**bir Ubuntu sunucusunda 5-10 farkli sahaya bagi gateway'leri tek bir docker
-engine altinda calistirmak**.
+Bu dokuman EnerjiOne DNP3 Gateway'in Docker container'i olarak nasil kurulup
+ayni host uzerinde N tane instance halinde yonetildigini anlatir. Hedef:
+**bir Linux sunucusunda 5-10 farkli sahaya bagi gateway'leri tek docker engine
+altinda calistirmak**.
 
 ## Mimari ozeti
 
 ```
 +-----------------+     +-----------------+
 |  Frontend (UI)  | --> |  backend-api    |
-|  Yeni Gateway + |     |  POST /gateways |
-+-----------------+     |  GET  /.../docker-compose
+|  Yeni Gateway   |     |  POST /gateways |
++-----------------+     +-----------------+
                               |
                               v
-+-----------------+     +---------------------------+
-|  Gateway YAML   | <-- |  Backend renderlar:       |
-|  hsl-gw-001.yml |     |  - GATEWAY_CODE/TOKEN     |
-+-----------------+     |  - BACKEND_URL/RABBIT_URL |
-        |                +---------------------------+
-        | docker compose -f hsl-gw-001.yml up -d
++-----------------+     +-----------------------------+
+|  Gateway YAML   | <-- |  Backend renderlar:         |
+|  gw-001.yml     |     |  - GATEWAY_CODE/TOKEN       |
++-----------------+     |  - BACKEND_URL/NATS_URL     |
+        |               +-----------------------------+
+        | docker compose -f gw-001.yml up -d
         v
 +----------------------+
-| Ubuntu sunucu        |
+| Linux sunucu         |
 |  +----------------+  |   - container 1: GW-001  port 8020
 |  | docker engine  |  |   - container 2: GW-002  port 8021
 |  +----------------+  |   - container N: GW-NNN  port 80NN
@@ -33,37 +33,34 @@ engine altinda calistirmak**.
 
 Her container:
 
-- **Kendi `.env` ile**: GATEWAY_CODE, GATEWAY_TOKEN, BACKEND_API_URL, RABBITMQ_URL
+- **Kendi `.env` ile**: GATEWAY_CODE, GATEWAY_TOKEN, BACKEND_API_URL, NATS_URL
 - **Sabit container portu**: 8020 (health/metrics)
 - **Farkli host portu**: 8020, 8021, 8022, ...
-- **Persistent volume**: `hsl-gw-<code>-state` — instance_id + outbox SQLite
-- **Outbound TCP**: 600 cihaza kadar DNP3 baglanti (host network'u uzerinden)
+- **Persistent volume**: `eg-gw-<code>-state` — instance_id + outbox SQLite
+  + multi-instance lock dosyasi
+- **Outbound TCP**: 100+ cihaza kadar DNP3 baglanti
 
-## 1. Image (kullaniciya hazir)
+## 1. Image
 
-Image GitHub Container Registry'de **public** olarak yayinlanir; musteri sunucusunda
-ayrica build veya `docker login` GEREKMEZ. `docker compose up -d` cagrisi ilk acilista
-image'i otomatik pull eder.
+Image GitHub Container Registry'de yayinlanir:
 
 ```
 ghcr.io/fikretsafak/enerjionegrid-dnp3-gateway:latest    # her main push'unda taze
-ghcr.io/fikretsafak/enerjionegrid-dnp3-gateway:0.4.3     # surume kilitli
+ghcr.io/fikretsafak/enerjionegrid-dnp3-gateway:0.4.6     # surume kilitli (ONERILEN)
 ```
 
-Image otomatik olarak `.github/workflows/release-image.yml` workflow'u tarafindan
-build edilir:
+Production deploy'larda **semver tag** kullanin (`:0.4.6`); `:latest` rollback
+yapamaz. CI workflow (`.github/workflows/release-image.yml`):
 
 | Trigger             | Etiketler                          |
 |---------------------|------------------------------------|
 | `main` push         | `:latest`, `:sha-<short>`         |
-| `git tag v0.4.3`    | `:0.4.3`, `:0.4`, `:latest`       |
+| `git tag v0.4.6`    | `:0.4.6`, `:0.4`, `:latest`       |
 
-Multi-arch: `linux/amd64` + `linux/arm64`. yadnp3 (OpenDNP3 native) ile derlenir,
-Horstmann SN2 string sinyalleri tam desteklenir.
+Multi-arch: `linux/amd64` + `linux/arm64`. yadnp3 (OpenDNP3 native) ile
+derlenir, Group 110 string sinyaller dahil tam DNP3 destegi.
 
-### Kaynaktan build (sadece gelistirme)
-
-Repo'ya commit yetkisi olan gelistiriciler local image build edebilir:
+### Kaynaktan build (gelistirme)
 
 ```bash
 git clone https://github.com/fikretsafak/EnerjiOneGrid-DNP3-Gateway.git
@@ -76,21 +73,20 @@ docker build \
 
 ## 2. Yeni gateway ekle (frontend akisi)
 
-Operator/installer arayuzde "Yeni Gateway Ekle" butonuna basar:
+Operator/installer panelinde "Yeni Gateway Ekle":
 
 1. Frontend `POST /api/v1/gateways` ile kayit acar; backend rastgele 48 karakter
-   token olusturur.
-2. Frontend `GET /api/v1/gateways/<code>/docker-compose` ile YAML indirir.
+   token uretir.
+2. Frontend `GET /api/v1/gateways/<code>/docker-compose?...` ile YAML indirir.
    Sorgu parametreleri:
-   - `backend_url` (zorunlu)  : Gateway'in cikacagi backend URL (orn.
-     `https://hsl.formelektrik.com/api/v1`).
-   - `rabbitmq_url` (zorunlu) : AMQP broker URL.
+   - `backend_url` (zorunlu): Gateway'in backend URL'i (orn.
+     `https://api.enerjione.local/api/v1`).
+   - `nats_url` (zorunlu): NATS JetStream URL (orn. `nats://nats.local:4222`).
    - `host_port` (varsayilan 8020): Bu instance icin host portu.
-   - `image` (varsayilan `ghcr.io/fikretsafak/enerjionegrid-dnp3-gateway:latest`).
+   - `image` (varsayilan `ghcr.io/fikretsafak/enerjionegrid-dnp3-gateway:0.4.6`).
    - `app_environment` (varsayilan `production`).
-   - `fmt` (varsayilan `compose`): `compose` veya `env`.
-3. Inen dosya `hsl-gw-<code>.yml` (compose) veya `hsl-gw-<code>.env` (raw env).
-4. Sunucuya kopyalanir + `docker compose -f hsl-gw-<code>.yml up -d`.
+3. Inen dosya `gw-<code>.yml`.
+4. Sunucuya kopyalanir + `docker compose -f gw-<code>.yml up -d`.
 
 ### Manuel renderleme (frontend olmadan)
 
@@ -99,12 +95,12 @@ Gateway repo'sunda CLI:
 ```bash
 python scripts/render_compose.py \
     --code GW-002 \
-    --token "$(python -c 'import secrets,string;print("".join(secrets.choice(string.ascii_letters+string.digits) for _ in range(48)))')" \
-    --name "Saha B SCADA" \
-    --backend-url https://hsl.formelektrik.com/api/v1 \
-    --rabbitmq-url amqp://hsl:secret@rmq.hsl.local:5672/ \
+    --token "$(python -c 'import secrets;print(secrets.token_urlsafe(48))')" \
+    --name "Saha B" \
+    --backend-url https://api.enerjione.local/api/v1 \
+    --nats-url nats://nats.local:4222 \
     --host-port 8021 \
-    --image hsl/dnp3-gateway:0.4.3 \
+    --image ghcr.io/fikretsafak/enerjionegrid-dnp3-gateway:0.4.6 \
     --output ./gateways/gw-002.yml
 ```
 
@@ -113,12 +109,11 @@ veritabanina ayni kod altinda eklemek operator sorumlulugundadir.
 
 ## 3. Calistirma
 
-Ayni Ubuntu host'ta 5 gateway:
+Ayni host'ta 5 gateway:
 
 ```bash
-# Klasor duzeni:
 gateways/
-  gw-001.yml   # backend'den indirilen
+  gw-001.yml
   gw-002.yml
   gw-003.yml
   gw-004.yml
@@ -144,11 +139,10 @@ docker compose -f gateways/gw-001.yml down            # container siler, volume 
 docker compose -f gateways/gw-001.yml down -v         # volume da siler (DIKKAT)
 ```
 
-Logs (tek instance):
+Logs:
 
 ```bash
-docker logs -f hsl-gw-gw-001
-# veya:
+docker logs -f eg-gw-001
 docker compose -f gateways/gw-001.yml logs -f
 ```
 
@@ -161,112 +155,95 @@ curl http://127.0.0.1:8021/health   # gw-002
 
 ## 4. Networking
 
-### RabbitMQ ve backend ayni host'ta ise
+### NATS ve backend ayni host'ta ise
 
-`compose.template.yml`'deki `networks: hsl` external degil — gateway compose
-kendi ag'ini olusturur. RabbitMQ ve backend baska bir compose project'inde ise:
+Compose `networks: enerjione` external degil — gateway compose kendi ag'ini
+olusturur. NATS ve backend baska bir compose project'inde ise:
 
 ```bash
-# Once ortak ag olustur (bir kere):
-docker network create hsl
+docker network create enerjione
 
-# compose.template.yml'de external: true olarak guncelle (veya
-# render_compose --network external)
+# compose'da external: true olarak guncelle
 ```
 
-Ayni host'ta RabbitMQ ayri bir compose'da `hsl` ag'inda calistiriliyorsa
-gateway'lerin compose dosyasinda `external: true` yapilmali. Aksi halde
-container'lar broker'a `host.docker.internal` veya host ip'si ile baglanir.
+### NATS uzakta ise
 
-### RabbitMQ uzakta ise
-
-`RABBITMQ_URL=amqp://user:pass@rmq.example.com:5672/` -> herhangi bir ek ag
-yapilandirmasi gerekmez. TLS icin `amqps://` ve sunucuda kok sertifika.
+`NATS_URL=nats://user:pass@nats.example.com:4222` (veya `tls://`). Ek ag
+yapilandirmasi gerekmez. TLS icin `tls://` + `NATS_TLS_CA_PATH` mount.
 
 ### DNP3 outbound TCP
 
-Container default bridge ag'inda bile remote IP'lere outbound baglanti
-kurabilir. **Saha cihazlari container'larin Docker bridge'ine erisemez** ve
-gerek yok — master role outbound. Saha cihazlarinin gateway'i kabul etmesi
-icin sunucu IP'si firewall'da whitelist'te olmali (DNP3 standart 20000/tcp).
+Container default bridge ag'inda remote IP'lere outbound baglanti kurabilir.
+**Saha cihazlari container'larin Docker bridge'ine erisemez** ve gerek yok —
+gateway master role outbound.
 
-### Coklu network arabirimi (advanced)
-
-Bir sahaya ozel VLAN arabirimi varsa: `network_mode: host` kullan, port
-mapping'leri kaldir, `WORKER_HEALTH_PORT` her gateway icin elle farkli ver
-(8020/8021/...). Bu durum coklu instance icin biraz daha sıkıntılı; default
-bridge mode'u tercih et.
+Saha cihazlarinin gateway IP'sini kabul etmesi icin sunucu IP'si firewall'da
+whitelist'te olmali (DNP3 standart 20000/tcp).
 
 ## 5. Persistent state
 
 Volume kaybolursa:
 
-- **instance_id** yeniden uretilir -> backend log'unda "yeni baglanti" gorunur.
-- **Outbox SQLite** kaybolur -> RabbitMQ'ya gonderilemeyen mesajlar gider.
+- **instance_id** yeniden uretilir -> backend log'unda "yeni baglanti" gorulur.
+- **Outbox SQLite** kaybolur -> NATS'a gonderilemeyen mesajlar gider (acil
+  durumda kabul edilebilir; tag-engine zaten idempotent).
+- **Multi-instance lock dosyasi** silinir -> sorun yok, bir sonraki bootta
+  yeniden olusturulur.
 
 Yedekleme:
 
 ```bash
-# Tum gateway state volumelarini yedekle
 docker run --rm \
-    -v hsl-gw-gw-001-state:/src \
+    -v eg-gw-001-state:/src \
     -v $(pwd)/backup:/dst \
     busybox tar czf /dst/gw-001-state-$(date +%F).tgz -C /src .
-```
-
-Geri alma:
-
-```bash
-docker run --rm \
-    -v hsl-gw-gw-001-state:/dst \
-    -v $(pwd)/backup:/src \
-    busybox tar xzf /src/gw-001-state-2026-04-29.tgz -C /dst
 ```
 
 ## 6. Upgrade / image yeni surum
 
 ```bash
-# Tum host'ta:
-docker pull hsl/dnp3-gateway:0.5.0
-
-# Tek tek (zero-downtime: cihaz polling 5sn, kabul edilebilir):
-sed -i 's/dnp3-gateway:0.4.3/dnp3-gateway:0.5.0/' gateways/gw-001.yml
+# Tek tek (zero-downtime: cihaz polling 1sn, kabul edilebilir):
+sed -i 's/enerjionegrid-dnp3-gateway:0.4.5/enerjionegrid-dnp3-gateway:0.4.6/' gateways/gw-001.yml
 docker compose -f gateways/gw-001.yml up -d
-# instance saniyeler icinde yeni image'a gecer
 ```
 
-Production'da bunu Ansible/script ile dongude koselendirin.
+Tum host'ta dongu:
 
-## 7. Tipik 600-cihaz kurulumu
+```bash
+for f in gateways/*.yml; do
+    docker compose -f "$f" up -d
+    sleep 5   # bir gateway recover etmeden digeri restart'a girmesin
+done
+```
 
-| Sahalar | Cihaz dagilimi | Onerilen container sayisi | RAM/proses (yaklasik) |
-|---------|----------------|---------------------------|------------------------|
-| Tek site | 200 cihaz       | 1 container               | ~150MB                |
-| 2-3 site | 600 cihaz toplam| 3 container × 200 cihaz   | ~150MB her biri       |
-| Coklu yedeklilik | 600 cihaz | 3 container + 3 standby (farkli host) | ayni |
+## 7. Tipik kurulum boyutlari
 
-3 container yapisinda: GW-001 / GW-002 / GW-003 farkli sahalar. Backend
-`gateway_code` ile her birine **ayri device listesi** verir; yuk dengeli olur,
-arıza durumunda diger 2 site etkilenmez (fault isolation).
+| Sahalar | Cihaz dagilimi | Container sayisi | RAM/proses |
+|---------|----------------|------------------|------------|
+| Tek site | 100 cihaz | 1 container | ~150MB |
+| 2-3 site | 600 cihaz | 3-6 container (100 cihaz/ea.) | ~150MB each |
+| Coklu yedeklilik | 600 cihaz + standby | 3+3 farkli host | ayni |
+
+100 cihaz/gateway senaryosunda: `MAX_PARALLEL_DEVICES=100`, paralel okumayla
+cycle suresi <1sn. yadnp3 manager 4 IO thread (default heuristic).
 
 ## 8. Sorun giderme
 
-### Container baslarken `GATEWAY_CODE ve GATEWAY_TOKEN env zorunludur`
+### Container baslarken "GATEWAY_CODE bos olamaz"
 
-`.env` dosyasi compose'a yuklenmemis ya da `--env-file` verilmemis. Compose
-icindeki `environment:` blogu zaten degerleri tasiyor; YAML render edilmeden
-kullaniliyorsa o blok bos demektir.
+`.env` dosyasi compose'a yuklenmemis. Compose `environment:` blogu render
+edilmeden kullanildi demek. `gw-001.yml`'i kontrol edin.
 
 ### Health 8020 portu cevap vermiyor
 
 ```bash
-docker exec -it hsl-gw-gw-001 curl http://127.0.0.1:8020/health
-docker logs hsl-gw-gw-001 --tail 50
+docker exec -it eg-gw-001 curl http://127.0.0.1:8020/health
+docker logs eg-gw-001 --tail 50
 ```
 
-Konteyner ic ic erisilebiliyor ama host'tan erisilemiyor: `ports:` mapping
-bozuk olabilir. `127.0.0.1:8020:8020` ise sadece localhost; uzaktan erisim
-istiyorsaniz `0.0.0.0:8020:8020` veya reverse proxy.
+Container ic erisilebiliyor, host'tan erisilemiyor: `ports:` mapping bozuk.
+`127.0.0.1:8020:8020` sadece localhost; uzak erisim icin `0.0.0.0:8020:8020`
+veya reverse proxy.
 
 ### Backend 401 dönuyor
 
@@ -277,9 +254,16 @@ dosyayi acip token'i kontrol edin.
 ### Outbox surekli buyuyor
 
 ```bash
-docker exec -it hsl-gw-gw-001 \
-    sqlite3 /app/.gateway_state/outbox_GW-001.db "SELECT COUNT(*), MAX(retry_count) FROM outbox;"
+docker exec -it eg-gw-001 \
+    sqlite3 /app/.gateway_state/outbox_GW-001.db \
+    "SELECT COUNT(*), MAX(retry_count) FROM outbox; SELECT COUNT(*) FROM outbox_dead_letter;"
 ```
 
-RabbitMQ kapali ya da broker URL yanlis. `RABBITMQ_URL` duzelt + container
-restart -> retrier 2 saniye icinde drenaj baslar.
+NATS server kapali ya da URL/credentials yanlis. `NATS_URL` + creds duzelt +
+container restart -> retrier 2 saniye icinde drenaj baslar. Outbox 500K'a
+yaklasırsa /health unhealthy doner (HTTP 503).
+
+### "Ayni GATEWAY_CODE icin baska bir proses zaten calisiyor"
+
+Multi-instance lock — volume eskimisken ayni kodla 2. container kalkti.
+Onceki container'i down + volume'u ya temizleyin ya yeni kodla baslatin.

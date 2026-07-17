@@ -67,13 +67,13 @@ $token = [Convert]::ToBase64String($bytes).Replace("+","-").Replace("/","_").Tri
 $envContent = @"
 # Bu dosya scripts/new_gateway.ps1 tarafindan uretilmistir. Code: $Code
 # ----------------------------------------------------------------------------
-# Horstmann SN2 DNP3 Gateway - $Code
+# EnerjiOne DNP3 Gateway - $Code
 # ----------------------------------------------------------------------------
 
 # Kimlik
 GATEWAY_CODE=$Code
 GATEWAY_TOKEN=$token
-GATEWAY_NAME=Horstmann SN2 Gateway $Code
+GATEWAY_NAME=EnerjiOne DNP3 Gateway $Code
 
 # Ortam
 APP_ENVIRONMENT=$Environment

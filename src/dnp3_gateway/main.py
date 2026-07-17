@@ -27,6 +27,7 @@ from typing import Any
 from dnp3_gateway import __version__
 from dnp3_gateway.adapters import TelemetryReader, build_adapter
 from dnp3_gateway.auth import GatewayIdentity, bootstrap_gateway_identity
+from dnp3_gateway.auth.instance_lock import acquire_instance_lock
 from dnp3_gateway.backend import BackendConfigClient, GatewayConfigError
 from dnp3_gateway.config import Settings, settings
 from dnp3_gateway.health_server import GatewayMetrics, start_health_server
@@ -272,6 +273,14 @@ def run(current_settings: Settings | None = None) -> int:
     configure_logging(level=cfg.log_level, fmt=cfg.log_format)
 
     identity = bootstrap_gateway_identity(settings=cfg, app_version=__version__)
+    # Multi-instance lock — ayni GATEWAY_CODE iki kez calismasin (outbox
+    # corrupt + duplicate publish riskini onler). Lock dosyasi state_dir
+    # icinde acik kalir; main fonksiyonu cikinca OS otomatik release eder.
+    # Referansi local degiskende tutuyoruz ki garbage collect close etmesin.
+    _instance_lock = acquire_instance_lock(
+        state_dir=cfg.gateway_state_dir,
+        gateway_code=identity.gateway_code,
+    )
     # Identity hazir — rotating dosya handler'i da ekleyerek logging'i tekrar
     # yapilandir (idempotent: eski handler'lar temizlenir).
     configure_logging(
@@ -283,9 +292,9 @@ def run(current_settings: Settings | None = None) -> int:
         gateway_code=identity.gateway_code,
         instance_id=identity.instance_id,
     )
-    # Sirli verileri (token, NATS/RabbitMQ parolasi) log redaction listesine
-    # kaydet — boylece exception/3rd party log'lara kazara sizmasin. Bu
-    # cagri configure_logging SONRASI yapilmali (filter aktif olduktan).
+    # Sirli verileri (token, NATS parolasi) log redaction listesine kaydet —
+    # boylece exception/3rd party log'lara kazara sizmasin. Bu cagri
+    # configure_logging SONRASI yapilmali (filter aktif olduktan).
     try:
         register_secret(identity.token)
         if cfg.gateway_refresh_token:
@@ -296,12 +305,6 @@ def run(current_settings: Settings | None = None) -> int:
         _nats_parsed = _urlparse(cfg.nats_url) if cfg.nats_url else None
         if _nats_parsed and _nats_parsed.password:
             register_secret(_nats_parsed.password)
-        # RabbitMQ URL parolasi (LEGACY — gateway artik kullanmiyor ama eski
-        # .env'lerden gelirse log'a sizmasin diye yine de redact ediyoruz)
-        if cfg.rabbitmq_url:
-            _rmq_parsed = _urlparse(cfg.rabbitmq_url)
-            if _rmq_parsed.password:
-                register_secret(_rmq_parsed.password)
     except Exception:  # noqa: BLE001
         # Secret kayit hatasi gateway'i durdurmamali
         pass
@@ -341,6 +344,19 @@ def run(current_settings: Settings | None = None) -> int:
             "public host'a clear-text HTTP/nats:// izin veriyor. Token ve "
             "telemetri MITM riski altinda. Mumkun olan en kisa zamanda TLS "
             "kurun (backend Caddy/Let's Encrypt, NATS tls:// listener)."
+        )
+    # M5: Production'da LOG_LEVEL=DEBUG olursa loud WARN. DEBUG seviyesinde
+    # 3rd-party kutuphaneler (requests, urllib3, sqlite3) cookie/payload/
+    # header detaylari loglayabilir. `register_secret` + broker URL regex
+    # cogu sirri yakalar AMA tum hassas verileri garanti edemez. Operator
+    # gecici debug yapiyorsa OK; uzun sureli production DEBUG istenmez.
+    if identity.app_environment == "production" and cfg.log_level.upper() == "DEBUG":
+        logger.warning(
+            "PRODUCTION_DEBUG_LOG_LEVEL: LOG_LEVEL=DEBUG bircok 3rd-party "
+            "kutuphanenin (requests, urllib3, sqlite3 vb.) gizli detay "
+            "logu uretmesine yol acar. Redaction filter saldirgan attack "
+            "vector'lerini kapatsa da garanti vermez. Geçici debug oturumu "
+            "icin OK; uzun sureli prod'da INFO/WARNING tavsiye edilir."
         )
 
     # Disk cache: backend kapali iken / container restart'ta gateway en son
@@ -393,6 +409,18 @@ def run(current_settings: Settings | None = None) -> int:
             identity.gateway_code,
         )
 
+    command_endpoint_token = (cfg.gateway_command_token or "").strip()
+    if command_endpoint_token:
+        register_secret(command_endpoint_token)
+    else:
+        logger.warning(
+            "operate_endpoint_disabled gateway=%s — GATEWAY_COMMAND_TOKEN "
+            ".env'de bos. Backend cihaz komut proxy'si (`/operate`) cagrildiginda "
+            "503 doner. Komut butonlari kullanilacaksa .env'e yuksek-entropy "
+            "GATEWAY_COMMAND_TOKEN atayin.",
+            identity.gateway_code,
+        )
+
     health, metrics, actual_health_port = start_health_server(
         host=cfg.worker_health_host,
         port=cfg.worker_health_port,
@@ -404,8 +432,13 @@ def run(current_settings: Settings | None = None) -> int:
         app_environment=identity.app_environment,
         publisher_provider=_publisher_provider,
         reader_provider=_reader_provider,
-        # Backend bu endpoint'i Bearer + refresh_token ile cagirir.
+        # Backend bu endpoint'leri Bearer token ile cagirir.
         refresh_token=refresh_endpoint_token,
+        command_token=command_endpoint_token,
+        # Trusted reverse-proxy CIDR'leri — `X-Forwarded-For` sadece bu
+        # subnet'lerden gelen istekler icin okunur. Bos ise XFF yok sayilir
+        # (saldirgan rate-limit bypass yapamaz).
+        trusted_proxies=cfg.health_trusted_proxies,
     )
     # Banner: gercek (auto-assigned olabilir) health portunu yansitabilmek icin
     # health_server start sonrasi yazdirilir.
@@ -426,6 +459,8 @@ def run(current_settings: Settings | None = None) -> int:
         gateway_code=identity.gateway_code,
         connect_timeout_sec=cfg.nats_connect_timeout_sec,
         publish_timeout_sec=cfg.nats_publish_timeout_sec,
+        tls_ca_path=cfg.nats_tls_ca_path,
+        credentials_path=cfg.nats_credentials_path,
     )
     if broker is None:
         # nats-py paketi yok (production'da requirements'ta; sadece dev koruma).

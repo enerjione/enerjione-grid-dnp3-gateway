@@ -9,8 +9,10 @@ def test_settings_defaults_are_sensible() -> None:
     # Test icin disk'teki .env'yi kullanma
     s = Settings(_env_file=None)  # type: ignore[call-arg]
     assert s.gateway_mode == "mock"
-    assert s.rabbitmq_routing_key == "telemetry.raw_received"
-    assert s.rabbitmq_exchange == "hsl.events"
+    # 0.4.x: RabbitMQ default'lari bos (legacy field, runtime'da kullanilmiyor)
+    assert s.rabbitmq_url == ""
+    assert s.rabbitmq_exchange == ""
+    assert s.rabbitmq_routing_key == ""
     assert s.worker_health_port == 8020
     assert s.is_mock_mode is True
     assert s.is_dnp3_mode is False
@@ -18,12 +20,13 @@ def test_settings_defaults_are_sensible() -> None:
     # olmasin). Operator istege bagli SHOW_GATEWAY_TOKEN_ON_START=true ile
     # gecici acabilir; production'da validator zaten bunu engeller.
     assert s.show_gateway_token_on_start is False
-    # GATEWAY_REFRESH_TOKEN default bos; main.py /refresh-all icin
-    # GATEWAY_TOKEN'a fallback eder ve uyari log atar.
+    # GATEWAY_REFRESH_TOKEN default bos; /refresh-all endpoint'i devre disi
     assert s.gateway_refresh_token == ""
     # Default FALSE — public host'a clear-text HTTP/nats:// validator
     # tarafindan reddedilir; bilincli opt-out gerekir.
     assert s.gateway_insecure_allow_plaintext is False
+    # 0.4.x: NATS publish timeout default 2.0sn (yerel/LAN icin makul)
+    assert s.nats_publish_timeout_sec == pytest.approx(2.0)
 
 
 def test_dnp3_mode_flag(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -41,7 +44,9 @@ def test_dnp3_mode_flag(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _strong_token() -> str:
-    return "x" * 40  # >=32 char prod min length
+    # `x` placeholder prefix listesinde olmayan, 40 char rastgele-gibi token.
+    # 32 char prod min'den uzun; `_is_placeholder_token` False doner.
+    return "x" * 40
 
 
 def test_prod_allows_http_to_private_ip(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -103,6 +108,70 @@ def test_prod_accepts_https_public(monkeypatch: pytest.MonkeyPatch) -> None:
     """Hedef deploy: backend HTTPS, NATS TLS — temiz prod konfigurasyonu."""
     monkeypatch.setenv("APP_ENVIRONMENT", "production")
     monkeypatch.setenv("GATEWAY_TOKEN", _strong_token())
-    monkeypatch.setenv("BACKEND_API_URL", "https://hsl.formelektrik.com/api/v1")
-    monkeypatch.setenv("NATS_URL", "tls://nats.formelektrik.com:4222")
+    monkeypatch.setenv("BACKEND_API_URL", "https://api.enerjione.local/api/v1")
+    monkeypatch.setenv("NATS_URL", "tls://nats.enerjione.local:4222")
     Settings(_env_file=None)  # type: ignore[call-arg]
+
+
+# ---- Production validator: yeni 0.4.6 kontrolleri --------------------------
+
+
+def test_prod_rejects_placeholder_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`.env.example`'dan kopyalanan `gw-001-token` reddedilmeli."""
+    monkeypatch.setenv("APP_ENVIRONMENT", "production")
+    monkeypatch.setenv("GATEWAY_TOKEN", "gw-001-token-with-some-extra-chars-to-pass-min-len")
+    monkeypatch.setenv("BACKEND_API_URL", "https://api.enerjione.local/api/v1")
+    monkeypatch.setenv("NATS_URL", "tls://nats.enerjione.local:4222")
+    with pytest.raises(ValueError, match="placeholder"):
+        Settings(_env_file=None)  # type: ignore[call-arg]
+
+
+def test_prod_rejects_change_me_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`change-me...` prefix'i reddedilmeli."""
+    monkeypatch.setenv("APP_ENVIRONMENT", "production")
+    monkeypatch.setenv(
+        "GATEWAY_TOKEN", "change-me-and-fill-with-real-token-32-chars-pls"
+    )
+    monkeypatch.setenv("BACKEND_API_URL", "https://api.enerjione.local/api/v1")
+    monkeypatch.setenv("NATS_URL", "tls://nats.enerjione.local:4222")
+    with pytest.raises(ValueError, match="placeholder"):
+        Settings(_env_file=None)  # type: ignore[call-arg]
+
+
+def test_prod_rejects_rabbitmq_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Eski .env'den kalan `RABBITMQ_URL` production'da reddedilmeli."""
+    monkeypatch.setenv("APP_ENVIRONMENT", "production")
+    monkeypatch.setenv("GATEWAY_TOKEN", _strong_token())
+    monkeypatch.setenv("BACKEND_API_URL", "https://api.enerjione.local/api/v1")
+    monkeypatch.setenv("NATS_URL", "tls://nats.enerjione.local:4222")
+    monkeypatch.setenv("RABBITMQ_URL", "amqp://user:pass@rmq:5672/")
+    with pytest.raises(ValueError, match="RABBITMQ_URL"):
+        Settings(_env_file=None)  # type: ignore[call-arg]
+
+
+def test_prod_rejects_dual_publish_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """DEPRECATED `NATS_DUAL_PUBLISH_ENABLED=true` production'da reddedilmeli."""
+    monkeypatch.setenv("APP_ENVIRONMENT", "production")
+    monkeypatch.setenv("GATEWAY_TOKEN", _strong_token())
+    monkeypatch.setenv("BACKEND_API_URL", "https://api.enerjione.local/api/v1")
+    monkeypatch.setenv("NATS_URL", "tls://nats.enerjione.local:4222")
+    monkeypatch.setenv("NATS_DUAL_PUBLISH_ENABLED", "true")
+    with pytest.raises(ValueError, match="NATS_DUAL_PUBLISH_ENABLED"):
+        Settings(_env_file=None)  # type: ignore[call-arg]
+
+
+def test_dev_allows_rabbitmq_url_and_placeholder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Development ortaminda eski placeholder + rabbitmq_url kabul edilir
+    (operator yerel test yapabilir, deploy oncesi temizleyecek)."""
+    monkeypatch.setenv("APP_ENVIRONMENT", "development")
+    monkeypatch.setenv("GATEWAY_TOKEN", "gw-001-token")  # placeholder, dev OK
+    monkeypatch.setenv("BACKEND_API_URL", "http://127.0.0.1:8000/api/v1")
+    monkeypatch.setenv("NATS_URL", "nats://localhost:4222")
+    monkeypatch.setenv("RABBITMQ_URL", "amqp://user:pass@localhost:5672/")
+    monkeypatch.setenv("NATS_DUAL_PUBLISH_ENABLED", "true")
+    s = Settings(_env_file=None)  # type: ignore[call-arg]
+    assert s.gateway_token == "gw-001-token"
+    assert s.rabbitmq_url.startswith("amqp://")
+    assert s.nats_dual_publish_enabled is True

@@ -34,4 +34,11 @@ hsl-gw-*.env
 .env.*
 !.env.example
 
+# Imzalama anahtarlari / sertifikalar — ASLA repoya girmemeli.
+*.keystore
+*.jks
+*.pem
+*.key
+*.p12
+
 .claude/

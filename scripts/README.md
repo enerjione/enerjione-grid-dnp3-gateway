@@ -1,40 +1,61 @@
 # Scripts
 
-PowerShell yardimcilari:
+PowerShell yardimcilari (Windows ortami icin):
 
-- `install.ps1` - Python 3.10+ venv olusturur, requirements yukler, `.env`
-  dosyasi yoksa ornekten kopyalar.
-- `run_gateway.ps1` - `.env`'yi yukleyip `py -m dnp3_gateway` calistirir.
-  Parametre ile `GATEWAY_CODE`, `GATEWAY_TOKEN`, `WORKER_HEALTH_PORT` override
-  edilebilir (ayni makinede birden fazla instance calistirmak icin).
+- **`install.ps1`** — Python 3.10+ venv olusturur, requirements.txt'i yukler,
+  `.env` dosyasi yoksa `.env.example`'dan UTF-8 BOM-siz kopyalar ve NTFS ACL
+  ile sadece mevcut kullaniciya erisim verir.
+  ```powershell
+  ./scripts/install.ps1
+  ./scripts/install.ps1 -Recreate           # .venv'i sifirlayip yeniden kur
+  ./scripts/install.ps1 -Python "py -3.12"  # farkli Python surumu
+  ```
 
-Ust dizinde `run_gateway.cmd` — PowerShell betigi calismazsa (Execution Policy)
-`cmd` ile ayni isi yapar: `PYTHONPATH=src` + `python -m dnp3_gateway`.
+- **`run_gateway.ps1`** — `.env`'yi yukleyip `py -m dnp3_gateway` calistirir.
+  Parametre ile process-level override:
+  ```powershell
+  ./scripts/run_gateway.ps1
+  ./scripts/run_gateway.ps1 -GatewayCode GW-002 -GatewayToken <token> -HealthPort 8021
+  ```
+
+- **`new_gateway.ps1`** — Yeni bir gateway instance icin `.env.<CODE>` dosyasi
+  uretir. Rastgele 32-byte token uretir + NTFS ACL ile dosya izinlerini
+  kisitlar. Token konsola yazilmaz (PSReadLine history sizmasini onler).
+  ```powershell
+  ./scripts/new_gateway.ps1 -Code GW-002
+  ./scripts/new_gateway.ps1 -Code GW-002 -HealthPort 8021 -Environment production
+  py -m dnp3_gateway --env-file .env.GW-002
+  ```
 
 ## "ps1 calismiyor" (sik nedenler)
 
 1. **Execution Policy** — Proje kokunden:
    ```powershell
-   Set-Location "...\Horstmann Smart Logger DNP3 Gateway"
+   Set-Location "...\EnerjiOne Grid DNP3 Gateway"
    powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1
    powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run_gateway.ps1
    ```
 2. **Profil yok / Path** — Yukaridaki gibi `powershell -File` tam yol ile deneyin.
-3. **Betiği çalıştırmak için** Explorer'da `install.ps1`e sağ tık → *PowerShell ile çalıştır* (bazen çalışmaz); en güvenlisi yukarıdaki `Bypass` komutu.
+3. **Sag tikla calistir** bazen Working Directory yanlis alir; yukaridaki
+   `Set-Location` yontemi en guvenli.
 
-Kurulumdan sonra: `run_gateway.cmd` cift tik veya
-`cd` proje + `.venv\Scripts\python.exe -m dnp3_gateway` (`PYTHONPATH` icin
-`run_gateway.cmd` kullanin veya `pip install -e .` once).
+Kurulumdan sonra:
+- `run_gateway.cmd` (varsa) cift tik ile baslatma, veya
+- proje kokunden: `.\.venv\Scripts\python.exe -m dnp3_gateway`
 
-## Ornekler
+## NSSM ile Windows servisi olarak kurulum
 
+Production saha kurulumu icin tam adimlar: [`docs/RUNBOOK.md`](../docs/RUNBOOK.md#1-baslatma).
+
+Ozet:
 ```powershell
-# Ilk kurulum
-./scripts/install.ps1
-
-# Tek gateway (default .env)
-./scripts/run_gateway.ps1
-
-# Ayni makinede 2. gateway instance (farkli port + kod)
-./scripts/run_gateway.ps1 -GatewayCode GW-002 -GatewayToken gw-002-token -HealthPort 8021
+nssm install EnerjiOneDnp3Gateway `
+    "C:\Projeler\EnerjiOne Grid DNP3 Gateway\.venv\Scripts\python.exe" `
+    "-m dnp3_gateway"
+nssm set EnerjiOneDnp3Gateway AppDirectory "C:\Projeler\EnerjiOne Grid DNP3 Gateway"
+nssm start EnerjiOneDnp3Gateway
 ```
+
+Onemli: NSSM stdout rotasyonu yapmaz; `.env`'de `LOG_FILE_PATH` set ederek
+gateway'in kendi RotatingFileHandler'ini kullanmasini saglayin (yoksa servis
+log dosyasi sonsuza kadar buyur).

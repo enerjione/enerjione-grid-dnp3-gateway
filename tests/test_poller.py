@@ -43,6 +43,9 @@ class _StubReader(TelemetryReader):
         self.read_calls += 1
         return list(self._readings)
 
+    def operate_device(self, **kwargs):  # type: ignore[no-untyped-def]
+        return {"ok": True, "status": "ok", **kwargs}
+
 
 def test_filter_readable_signals_drops_commands_only() -> None:
     """Gateway 0.4.x: string sinyal (Group 110) artik yayinlanir; sadece
@@ -116,6 +119,9 @@ def test_poll_device_swallows_reader_errors() -> None:
         def read_device(self, *, device, signals):  # type: ignore[no-untyped-def]
             raise RuntimeError("boom")
 
+        def operate_device(self, **kwargs):  # type: ignore[no-untyped-def]
+            return {"ok": False, "status": "unsupported"}
+
     published = poll_device(
         gateway_code="GW-001",
         device=make_device(),
@@ -158,6 +164,9 @@ def test_run_poll_cycle_parallel_reads_all_due_devices() -> None:
         def read_device(self, *, device, signals):  # type: ignore[no-untyped-def]
             self.read_devices.append(device.code)
             return [SignalReading(signal.key, signal.source, signal.data_type, 1.0, 1.0, "good")]
+
+        def operate_device(self, **kwargs):  # type: ignore[no-untyped-def]
+            return {"ok": True, "status": "ok"}
 
     reader = _CountingReader()
     publisher = _StubPublisher()

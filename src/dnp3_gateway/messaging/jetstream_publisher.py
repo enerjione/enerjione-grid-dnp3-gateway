@@ -76,6 +76,8 @@ class JetStreamPublisher:
         gateway_code: str,
         connect_timeout_sec: int,
         publish_timeout_sec: float,
+        tls_ca_path: str = "",
+        credentials_path: str = "",
     ) -> None:
         self.url = url
         self.subject_prefix = subject_prefix.rstrip(".")
@@ -83,6 +85,10 @@ class JetStreamPublisher:
         self.subject = f"{self.subject_prefix}.{gateway_code}"
         self._connect_timeout = connect_timeout_sec
         self._publish_timeout = publish_timeout_sec
+        # NATS auth + TLS — bos string ise nats.connect default davranisi
+        # kullanilir (URL'deki user:pass + system trust store).
+        self._tls_ca_path = (tls_ca_path or "").strip()
+        self._credentials_path = (credentials_path or "").strip()
 
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
@@ -112,6 +118,8 @@ class JetStreamPublisher:
         gateway_code: str,
         connect_timeout_sec: int = 5,
         publish_timeout_sec: float = 2.0,
+        tls_ca_path: str = "",
+        credentials_path: str = "",
     ) -> "JetStreamPublisher | None":
         """Publisher instance olustur ve background thread'i baslat.
 
@@ -136,6 +144,8 @@ class JetStreamPublisher:
             gateway_code=gateway_code,
             connect_timeout_sec=connect_timeout_sec,
             publish_timeout_sec=publish_timeout_sec,
+            tls_ca_path=tls_ca_path,
+            credentials_path=credentials_path,
         )
         inst._start()
         return inst
@@ -185,18 +195,40 @@ class JetStreamPublisher:
         nats-py'nin kendi reconnect mekanizmasi (max_reconnect_attempts=-1)
         ile birlestirilir; bizim is_ready Event'i ilk basari ile set olur.
         """
+        # NATS auth + TLS opsiyonel parametreleri; sadece set edilenler nats.connect'e
+        # gecirilir ki kutuphane default davranisini ezmeyelim.
+        connect_kwargs: dict[str, Any] = {
+            "servers": [self.url],
+            "connect_timeout": self._connect_timeout,
+            "max_reconnect_attempts": -1,
+            "reconnect_time_wait": 2,
+            "name": f"e1-dnp3-gw-{self.gateway_code}",
+            "error_cb": self._on_nats_error,
+            "reconnected_cb": self._on_reconnected,
+            "disconnected_cb": self._on_disconnected,
+            "closed_cb": self._on_closed,
+        }
+        # NKEY/JWT credentials (.creds dosyasi). nsc ile uretilir; user_credentials
+        # parametresi nats-py'de path olarak veya tuple (jwt, seed) olarak kabul edilir.
+        if self._credentials_path:
+            connect_kwargs["user_credentials"] = self._credentials_path
+        # Custom CA bundle (PEM) — kurumsal/self-signed CA icin SSLContext insa et.
+        if self._tls_ca_path:
+            import ssl as _ssl
+
+            try:
+                ctx = _ssl.create_default_context(cafile=self._tls_ca_path)
+                connect_kwargs["tls"] = ctx
+            except (OSError, _ssl.SSLError) as exc:
+                logger.error(
+                    "jetstream_publisher_tls_ca_load_failed path=%s error=%s — "
+                    "system trust store'a dusuyor (kurumsal CA dogrulama yapamayabilir)",
+                    self._tls_ca_path,
+                    exc,
+                )
+
         try:
-            self._nc = await nats.connect(  # type: ignore[union-attr]
-                servers=[self.url],
-                connect_timeout=self._connect_timeout,
-                max_reconnect_attempts=-1,
-                reconnect_time_wait=2,
-                name=f"e1-dnp3-gw-{self.gateway_code}",
-                error_cb=self._on_nats_error,
-                reconnected_cb=self._on_reconnected,
-                disconnected_cb=self._on_disconnected,
-                closed_cb=self._on_closed,
-            )
+            self._nc = await nats.connect(**connect_kwargs)  # type: ignore[union-attr]
             self._js = self._nc.jetstream()
             self._ready.set()
             logger.info(

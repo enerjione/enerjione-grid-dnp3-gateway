@@ -11,7 +11,11 @@
     ./scripts/run_gateway.ps1
 
 .EXAMPLE
-    ./scripts/run_gateway.ps1 -GatewayCode GW-002 -GatewayToken gw-002-token -HealthPort 8021
+    ./scripts/run_gateway.ps1 -GatewayCode GW-002 -GatewayToken <token> -HealthPort 8021
+
+.EXAMPLE
+    # Mevcut .env'i ezmeden saha test deploy'u
+    ./scripts/run_gateway.ps1 -BackendUrl "https://api.enerjione.local/api/v1" -NatsUrl "nats://nats.local:4222"
 #>
 [CmdletBinding()]
 param(
@@ -20,7 +24,7 @@ param(
     [string] $Mode,
     [int] $HealthPort,
     [string] $BackendUrl,
-    [string] $RabbitmqUrl
+    [string] $NatsUrl
 )
 
 $ErrorActionPreference = 'Stop'
@@ -37,7 +41,7 @@ if ($GatewayToken)  { $env:GATEWAY_TOKEN  = $GatewayToken }
 if ($Mode)          { $env:GATEWAY_MODE   = $Mode }
 if ($HealthPort)    { $env:WORKER_HEALTH_PORT = "$HealthPort" }
 if ($BackendUrl)    { $env:BACKEND_API_URL = $BackendUrl }
-if ($RabbitmqUrl)   { $env:RABBITMQ_URL   = $RabbitmqUrl }
+if ($NatsUrl)       { $env:NATS_URL       = $NatsUrl }
 
 $env:PYTHONPATH = (Join-Path $projectRoot 'src') + [IO.Path]::PathSeparator + $env:PYTHONPATH
 # .env sadece Python/pydantic ile yuklenir; bos env ile yaniltici satir vermeyelim

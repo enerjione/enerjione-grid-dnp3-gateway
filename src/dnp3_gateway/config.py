@@ -9,6 +9,46 @@ from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+# Production validator placeholder-token tespiti icin prefix listesi.
+#
+# .env.example ve eski seed scriptlerinden gelen jenerik degerler buraya
+# alinmis. Operator gercek backend `gateways.token` ile eslesen token'i
+# atamadiysa boot SystemExit ile reddedilir — saha kurulumlarinda en sik
+# yapilan hata, .env.example'dan .env'i kopyalayip token'i degistirmeyi
+# unutmak. Karsilastirma case-insensitive ve trimmed olarak yapilir.
+_PLACEHOLDER_TOKEN_PREFIXES: tuple[str, ...] = (
+    "change-me",
+    "change_me",
+    "changeme",
+    "please-change",
+    "please_change",
+    "your-secret",
+    "your_secret",
+    "gw-default",
+    "gw_default",
+    "gw-001-token",  # .env.example default
+    "gw-002-token",
+    "default-token",
+    "example-token",
+    "secret-token",
+    "test-token",
+)
+
+
+def _is_placeholder_token(token: str) -> bool:
+    """Token, bilinen bir placeholder prefix ile basliyor mu?
+
+    Production validator'inda kullanilir. Trim + lower + startswith mantigi;
+    bos/None token False doner (caller ayrica zorunlulugu kontrol eder).
+    """
+    if not token:
+        return False
+    t = token.strip().lower()
+    if not t:
+        return False
+    return t.startswith(_PLACEHOLDER_TOKEN_PREFIXES)
+
+
 def _host_is_private(host: str | None) -> bool:
     """Host private/loopback ag uzerinde mi? (RFC1918, link-local, loopback, ULA).
 
@@ -68,6 +108,14 @@ class Settings(BaseSettings):
             "endpoint devre disi kalir. GATEWAY_TOKEN'dan FARKLI olmali; ayni "
             "ise backend tokeni leak olunca tum gateway'leri uzaktan yorma "
             "(DoS) acilir."
+        ),
+    )
+    gateway_command_token: str = Field(
+        default="",
+        description=(
+            "POST /operate icin ayri Bearer token. Backend cihaz komutlarini "
+            "(CROB) bu token ile gateway'e proxy eder. Bos ise komut endpoint'i "
+            "devre disi kalir (503). GATEWAY_TOKEN'dan FARKLI olmali."
         ),
     )
     gateway_name: str = Field(default="EnerjiOne DNP3 Gateway", description="Log/health icin insan-okur isim")
@@ -173,18 +221,39 @@ class Settings(BaseSettings):
             "mesajlar outbox'a yazilir, baglanti gelince retrier bosaltir."
         ),
     )
+    nats_tls_ca_path: str = Field(
+        default="",
+        description=(
+            "NATS sunucusunun sundugu sertifikayi dogrulamak icin kullanilan CA "
+            "bundle dosyasinin (PEM) tam yolu. Bos birakilirsa system trust "
+            "store kullanilir. Kurumsal/self-signed CA varsa bu yolu doldurun; "
+            "aksi halde tls:// baglantisinda SSL handshake fail eder."
+        ),
+    )
+    nats_credentials_path: str = Field(
+        default="",
+        description=(
+            "NATS NKEY/JWT credentials dosyasinin (.creds) tam yolu. "
+            "`nsc generate user --account ... --name gateway-GW001` ile uretilen "
+            "dosyayi gateway host'una koyup bu yolu set edin. Bos ise URL'deki "
+            "user:password (nats://user:pass@host) kullanilir; ikisi de bos "
+            "ise NATS server anonim baglanti red eder (deny-all)."
+        ),
+    )
     nats_publish_timeout_sec: float = Field(
-        default=0.5,
+        default=2.0,
         ge=0.1,
         le=30.0,
         description=(
             "JetStream publish bekleme suresi (sn). Tek mesaj icin. Tipik "
-            "yerel cluster'da <10ms cevap; agresif kucuk timeout broker "
-            "yavasladiginda mesajin outbox'a hizla dusmesini saglar. 0.5sn "
-            "default: 100 cihaz x 30 sinyal paralel cycle'da bile cycle "
-            "timeout'a (120s) zarar vermeden, broker yavasladiginda kontrollu "
-            "outbox akisina geciyor. Slow-network deploylar icin >=2.0 "
-            "manuel set edilebilir."
+            "yerel cluster'da <10ms cevap doner. 2.0sn default: yerel/LAN "
+            "cluster'da fazlasiyla yeterli; 4G veya WAN broker icin de uygun. "
+            "Bu sureyi asan publish OutboxFullError'a sebep olmadan once "
+            "exception ile geri doner, mesaj outbox'a yazilir ve retrier "
+            "broker'a hizla bagi geldiginde bosaltir. Daha kucuk degerler "
+            "(0.5-1.0) agresif outbox'a dusurme yapar — yerel laboratuvar "
+            "icin tercih edilebilir; 100 cihaz x 30 sinyal yuk altinda "
+            "2.0sn cycle_timeout_sec=120sn ile rahatlikla uyumludur."
         ),
     )
     # Geriye uyumluluk: nats_dual_publish_enabled artik anlamsiz cunku JetStream
@@ -200,17 +269,26 @@ class Settings(BaseSettings):
         ),
     )
 
-    # ----- RabbitMQ (LEGACY — telemetri akisindan kaldirildi) -----------------
-    # Bu alanlar yalnizca geriye uyumluluk + log redaction icin saklaniyor;
-    # gateway artik RabbitMQ'ya BAGLANMIYOR. Alarm mesajlari backend tarafinda
-    # RabbitMQ'da kalmaya devam ediyor (gateway onunla ilgilenmez). .env'de
-    # RABBITMQ_URL bos kalabilir — sadece eski deploylar icin tutuluyor.
+    # ----- RabbitMQ (LEGACY/DEPRECATED — gateway 0.4.x'te kaldirildi) ---------
+    # Bu alanlar SADECE geriye-uyumlu .env parse'i icin tutuluyor; gateway
+    # artik RabbitMQ'ya BAGLANMIYOR. Alarm mesajlari backend tarafinda
+    # RabbitMQ'da kalmaya devam ediyor (gateway onunla ilgilenmez).
+    #
+    # Production validator (`_validate_production_safeguards`) bu field set
+    # edilirse SystemExit eder — operator yanlislikla eski .env'i deploy
+    # etmesin diye. Development/staging'te bos kabul edilir.
     rabbitmq_url: str = Field(
         default="",
-        description="LEGACY/DEPRECATED — gateway artik RabbitMQ kullanmiyor. Bos birakin.",
+        description=(
+            "LEGACY/DEPRECATED — gateway 0.4.x'te RabbitMQ kullanmiyor. "
+            "Production'da set edilemez (validator reddeder). Bos birakin."
+        ),
     )
-    rabbitmq_exchange: str = Field(default="hsl.events")
-    rabbitmq_routing_key: str = Field(default="telemetry.raw_received")
+    # Eski deploy'larin parse hatasi vermemesi icin default'lar bos. Bu
+    # field'lar runtime'da hicbir yerde okunmuyor — sadece pydantic schema
+    # compat icin tutuluyor.
+    rabbitmq_exchange: str = Field(default="")
+    rabbitmq_routing_key: str = Field(default="")
 
     # ----- Health HTTP ---------------------------------------------------------
     worker_health_host: str = Field(default="127.0.0.1")
@@ -222,6 +300,20 @@ class Settings(BaseSettings):
             "Health/metrics HTTP portu. 0 verilirse OS rastgele bos port atar; "
             "gercek port baslangictaki log'da ve /health icinde gosterilir. "
             "Ayni PC'de coklu gateway icin her birine ayri port verin."
+        ),
+    )
+    health_trusted_proxies: str = Field(
+        default="",
+        description=(
+            "`X-Forwarded-For` header'ina guvenilebilecek reverse proxy CIDR "
+            "listesi (virgulle ayrik). Bos ise XFF YOK SAYILIR — direkt TCP "
+            "client adresi kullanilir. Bu, en guvenli default'tur cunku XFF "
+            "header'ini herhangi bir uzaktan attacker spoofing yapip "
+            "`X-Forwarded-For: 127.0.0.1` ile rate-limit bypass edemez. "
+            "Reverse proxy (nginx, Caddy) arkasinda calistiriyorsaniz proxy "
+            "IP/subnet'ini buraya koyun; sadece proxy'den gelen istekler XFF "
+            "ile cozumlenir, dogrudan gelen istekler TCP adresinden cozumlenir. "
+            "Ornek: `10.0.0.0/8,192.168.1.5/32`."
         ),
     )
 
@@ -316,6 +408,19 @@ class Settings(BaseSettings):
         le=65535,
         description="Varsayilan DNP3 TCP port; cihaz API'de dnp3_tcp_port verirse o baskin",
     )
+    dnp3_device_allowed_subnets: str = Field(
+        default="",
+        description=(
+            "Cihaz IP allowlist (CIDR listesi, virgulle ayrilmis). Bos ise tum "
+            "IP'ler kabul edilir (geriye uyumlu). Backend kompromize olursa "
+            "saldirgan `169.254.169.254` (cloud metadata), `8.8.8.8` veya ic ag "
+            "scan'i icin gateway'i kullanamasin diye saha cihazlarinin "
+            "bulundugu LAN subnet'lerini buraya koyun. "
+            "Ornek: `192.168.10.0/24,10.0.5.0/24,172.16.20.0/24`. "
+            "Hostname (FQDN) gelen cihazlar bu kontrolden gecemez — DNS "
+            "cozumlemesini gateway yapmaz, IP olarak yapilandirin."
+        ),
+    )
     dnp3_integrity_poll_min: int = Field(default=60, ge=1, le=86400)
     dnp3_response_timeout_sec: int = Field(
         default=15,
@@ -356,7 +461,7 @@ class Settings(BaseSettings):
     )
     dnp3_confirm_required: bool = Field(
         default=False,
-        description="Data link onayli cerceve; OpenDNP3/Horstmann sim ile False genelde gerekir",
+        description="Data link onayli cerceve; OpenDNP3 sim/outstation ile False genelde gerekir",
     )
     dnp3_link_reset_on_connect: bool = Field(
         default=True,
@@ -366,9 +471,9 @@ class Settings(BaseSettings):
         default=False,
         description=(
             "Connect+Reset Link sonrasi DISABLE_UNSOLICITED gonderir. "
-            "OpenDNP3 outstation (Horstmann SN2 + simulator) bu mesaja bazen TCP'yi "
-            "kapatarak cevap verir; bu yuzden VARSAYILAN false. Empty-frame filter "
-            "unsolicited frame'leri zaten yutuyor; gerekmiyorsa kapali kalsin."
+            "Bazi OpenDNP3 outstation'lar (saha cihazlari + simulator) bu mesaja "
+            "TCP'yi kapatarak cevap verir; bu yuzden VARSAYILAN false. Empty-frame "
+            "filter unsolicited frame'leri zaten yutuyor; gerekmiyorsa kapali kalsin."
         ),
     )
     dnp3_unsolicited_class_mask: int = Field(
@@ -410,7 +515,7 @@ class Settings(BaseSettings):
         description=(
             "Rotating log dosyasi yolu. Bos ise sadece stdout'a yazilir (mevcut "
             "davranis, Docker icin uygundur). Windows NSSM kurulumlarinda set "
-            "edin: orn. 'C:/ProgramData/horstmann/dnp3-gateway/{gateway_code}.log'. "
+            "edin: orn. 'C:/ProgramData/EnerjiOne/dnp3-gateway/{gateway_code}.log'. "
             "Yer tutucular: {gateway_code}, {instance_id}."
         ),
     )
@@ -516,8 +621,19 @@ class Settings(BaseSettings):
     @field_validator("rabbitmq_url")
     @classmethod
     def _validate_rabbitmq_url(cls, v: str) -> str:
-        # LEGACY: gateway artik RabbitMQ kullanmiyor. Bos izinli; eski .env'lerden
-        # gelen amqp:// degerleri de gecerli (sadece doğrulanir, kullanilmaz).
+        """LEGACY/DEPRECATED — gateway 0.4.x'te RabbitMQ'ya BAGLANMIYOR.
+
+        Bu field tutuluyor cunku eski .env dosyalarinda satir olarak kalabilir
+        ve pydantic-settings unknown env'i sessizce yutmuyor. Buradaki davranis:
+          * Bos string  -> kabul (yeni dogru deploy).
+          * Bos olmayan -> WARN log + KABUL (development/staging). Operator
+            silmesi icin uyari verir ama boot'u bozmaz.
+          * Production  -> `_validate_production_safeguards` icinde
+            ValueError ile reddedilir (CR-3); operator silmek zorunda.
+
+        Eski format dogrulamasi (amqp/amqps scheme) tutuluyor — bilgilendirme
+        amacli. Gercekten baglanmiyoruz; sadece field tipini koruyoruz.
+        """
         s = (v or "").strip()
         if not s:
             return ""
@@ -527,7 +643,9 @@ class Settings(BaseSettings):
             raise ValueError(f"RABBITMQ_URL parse edilemedi: {exc}") from exc
         if parsed.scheme not in ("amqp", "amqps"):
             raise ValueError(
-                f"RABBITMQ_URL scheme amqp/amqps olmali (gelen: '{parsed.scheme}')"
+                f"RABBITMQ_URL scheme amqp/amqps olmali (gelen: '{parsed.scheme}'). "
+                "NOT: Bu alan 0.4.x'te DEPRECATED — gateway artik kullanmiyor; "
+                ".env'den silmeniz onerilir."
             )
         return s
 
@@ -535,21 +653,31 @@ class Settings(BaseSettings):
     def _validate_production_safeguards(self) -> "Settings":
         """Production / staging ortaminda guvenlik kontrolleri.
 
+        Staging + Production icin:
         * TLS verify ZORUNLU — kapatilirsa SystemExit (MITM koruma).
         * BACKEND_API_URL: public hostname/IP icin https:// zorunlu; private
           ag (RFC1918, loopback, link-local, *.local/.lan/.internal,
           localhost) icin http:// kabul. Public clear-text HTTP -> token
           MITM riski.
-        * NATS_URL: ayni mantik — public host'a nats:// (clear-text) yasak,
-          tls:// zorunlu; private host'ta nats:// kabul. Boş olamaz (prod).
+
+        Sadece Production icin:
+        * NATS_URL bos olamaz; public host'a tls:// zorunlu, private host'a
+          nats:// kabul.
         * Token MIN length staging=16, production=32.
-        * SHOW_GATEWAY_TOKEN_ON_START production'da kapali olmali — leak riski.
+        * GATEWAY_TOKEN placeholder prefix ile baslayamaz (`change-me`,
+          `gw-default`, `gw-001-token` vb. — `.env.example` kopyalanip token
+          guncellenmeden boot edilirse erken yakalanir).
+        * SHOW_GATEWAY_TOKEN_ON_START kapali olmali — token log'a sizmasin.
         * GATEWAY_REFRESH_TOKEN, GATEWAY_TOKEN'dan FARKLI olmali — ayni ise
           backend tokeni leak olunca uzaktan tum cihazlari yorma kapisi acilir.
-
-        NOT: RABBITMQ_URL artik gateway tarafindan kullanilmiyor (alarm/event
-        akisi backend tarafinda kalir). Bu validator RabbitMQ scheme'i kontrol
-        etmez; gateway baglanti kurmaz.
+        * GATEWAY_COMMAND_TOKEN, GATEWAY_TOKEN'dan FARKLI olmali — komut
+          endpoint'i (/operate) ayri yetkiyle korunur.
+        * RABBITMQ_URL set edilemez (cutover sonrasi gateway RabbitMQ'ya
+          baglanmaz). Eski .env'den gelen amqp:// reddedilir; operator hatali
+          deploy'u erken farkeder.
+        * NATS_DUAL_PUBLISH_ENABLED true olamaz — 0.4.x'te JetStream tek yol;
+          bu bayrak DEPRECATED ve no-op. Prod boot'unda hata vererek operator
+          eski .env'den bu satiri silmesi icin yonlendirilir.
         """
         env = (self.app_environment or "development").strip().lower()
         is_prod = env in ("production", "prod")
@@ -622,6 +750,71 @@ class Settings(BaseSettings):
                         "GUVENLIK: APP_ENVIRONMENT=production'da GATEWAY_REFRESH_TOKEN, "
                         "GATEWAY_TOKEN ile AYNI olamaz. Rol ayrimi icin farkli, "
                         "yuksek-entropy bir token kullanin."
+                    )
+                if (
+                    self.gateway_command_token
+                    and self.gateway_token
+                    and self.gateway_command_token.strip() == self.gateway_token.strip()
+                ):
+                    raise ValueError(
+                        "GUVENLIK: APP_ENVIRONMENT=production'da GATEWAY_COMMAND_TOKEN, "
+                        "GATEWAY_TOKEN ile AYNI olamaz. Komut endpoint'i (/operate) "
+                        "icin farkli, yuksek-entropy bir token kullanin."
+                    )
+                # H-3: token placeholder prefix kontrolu. Auth katmanindaki
+                # `ensure_credentials_allowed` zaten birkac literal placeholder'i
+                # yakaliyor; bu kontrol prefix-bazli olup daha genis (.env.example
+                # `gw-001-token` gibi degerleri de yakalar).
+                if _is_placeholder_token(self.gateway_token):
+                    raise ValueError(
+                        f"GUVENLIK: APP_ENVIRONMENT=production'da GATEWAY_TOKEN "
+                        f"placeholder degerle baslayamaz (gelen: {self.gateway_token[:16]!r}...). "
+                        ".env.example'dan kopyaladiysaniz GATEWAY_TOKEN'i backend "
+                        "`gateways.token` ile eslesen gercek (>=32 char) bir degere "
+                        "guncelleyin. Placeholder prefix listesi: "
+                        f"{', '.join(_PLACEHOLDER_TOKEN_PREFIXES[:6])}..."
+                    )
+                if self.gateway_refresh_token and _is_placeholder_token(
+                    self.gateway_refresh_token
+                ):
+                    raise ValueError(
+                        "GUVENLIK: APP_ENVIRONMENT=production'da GATEWAY_REFRESH_TOKEN "
+                        "placeholder degerle baslayamaz. /refresh-all endpoint'i "
+                        "kullanilacaksa yuksek-entropy yeni bir token uretin "
+                        "(`python -c \"import secrets;print(secrets.token_urlsafe(32))\"`)."
+                    )
+                if self.gateway_command_token and _is_placeholder_token(
+                    self.gateway_command_token
+                ):
+                    raise ValueError(
+                        "GUVENLIK: APP_ENVIRONMENT=production'da GATEWAY_COMMAND_TOKEN "
+                        "placeholder degerle baslayamaz. /operate endpoint'i "
+                        "kullanilacaksa yuksek-entropy yeni bir token uretin "
+                        "(`python -c \"import secrets;print(secrets.token_urlsafe(32))\"`)."
+                    )
+                # CR-3: RabbitMQ telemetri akisindan kaldirildi (0.4.x cutover).
+                # Eski .env'den `RABBITMQ_URL=amqp://...` gelirse production'da
+                # reddet. Operator yanlislikla legacy deploy'a yonelmis demek;
+                # sessiz "field tutuluyor ama yok sayiliyor" olarak gormek
+                # incident response'i zorlastirir.
+                if (self.rabbitmq_url or "").strip():
+                    raise ValueError(
+                        "GUVENLIK: APP_ENVIRONMENT=production'da RABBITMQ_URL "
+                        "set edilemez. Gateway 0.4.x ile telemetri NATS JetStream'e "
+                        "tasindi; gateway artik RabbitMQ'ya BAGLANMIYOR. "
+                        ".env dosyasindan RABBITMQ_URL satirini silin (alarm akisi "
+                        "backend tarafinda RabbitMQ'da kalir, gateway'i ilgilendirmez)."
+                    )
+                # CR-2: dual-publish bayragi 0.4.x'te DEPRECATED. Eski .env'lerden
+                # `true` gelirse no-op olarak sessizce gecmek yerine prod'da hata
+                # ver — operator beklediginden farkli bir davranisla karsilasmasin.
+                if self.nats_dual_publish_enabled:
+                    raise ValueError(
+                        "GUVENLIK: APP_ENVIRONMENT=production'da "
+                        "NATS_DUAL_PUBLISH_ENABLED=true olamaz. Bu bayrak 0.4.x "
+                        "cutover'i sonrasi DEPRECATED (gateway artik tek yol "
+                        "JetStream). .env'den NATS_DUAL_PUBLISH_ENABLED satirini "
+                        "silin veya false yapin."
                     )
         return self
 

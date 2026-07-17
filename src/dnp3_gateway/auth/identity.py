@@ -26,12 +26,20 @@ from pathlib import Path
 
 from dnp3_gateway.config import Settings
 
-# Backend seed / dokumanlardaki ornek; uretimde kabul edilmez (staging/production).
+# Backend seed / dokumanlardaki tam-string ornekler; uretimde kabul edilmez.
+# Bu liste literal tam-eslesme icindir; daha genis prefix-bazli kontrol
+# `config._PLACEHOLDER_TOKEN_PREFIXES` icinde — production validator orada
+# `_is_placeholder_token` ile yakalar. Iki kontrol birbirini tamamlar:
+#   * Bu liste (identity.py): exact-match, staging + production icin.
+#   * Prefix listesi (config.py): broader pattern, sadece production'da.
 _PLACEHOLDER_TOKENS = frozenset(
     {
         "gw-default-token",
         "change-me",
         "changeme",
+        "please-change-me",
+        "default-token",
+        "example-token",
     }
 )
 

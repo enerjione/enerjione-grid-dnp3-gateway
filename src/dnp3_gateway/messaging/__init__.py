@@ -1,17 +1,28 @@
 """Telemetri yayinlama modulu + persistent outbox.
 
-Primary publisher: JetStreamPublisher (NATS JetStream). Gateway 0.4.x ile
-RabbitMQ telemetri akisindan kaldirildi — alarm/notification icin backend
-tarafinda RabbitMQ kullanilmaya devam ediyor, gateway onunla ilgilenmez.
+Mimari (0.4.x cutover sonrasi):
 
-Modul export'lari:
-  * Outbox / OutboxFullError / OutboxRetrier — persistent SQLite outbox.
-  * JetStreamPublisher — primary publisher (NATS).
-  * ResilientPublisher — broker+outbox wrapping (at-least-once, retrier).
-RabbitPublisher modulu hala dosya-sistemde (geriye uyumluluk + rollback
-amacli) ama varsayilan import edilmiyor. Kullanmak isteyen explicit
-`from dnp3_gateway.messaging.rabbit_publisher import RabbitPublisher`
-yapabilir.
+    poller -> ResilientPublisher.publish()
+                 |
+                 v
+            JetStreamPublisher (NATS JetStream)  --basari--> done
+                 |                                              ^
+                 |  fail / NATS_unavailable                     |
+                 v                                              |
+              Outbox (SQLite, persistent, at-least-once)        |
+                 |                                              |
+                 v                                              |
+            OutboxRetrier (background thread, exponential       |
+                          backoff, dead-letter on poison) ------+
+
+* PRIMARY publisher: `JetStreamPublisher`. Gateway artik telemetriyi DIRECT
+  NATS JetStream subject'ine (`e1.telemetry.raw.<gateway_code>`) basar.
+* RabbitMQ desteği 0.4.x'te tamamen KALDIRILMISTIR (legacy
+  `rabbit_publisher.py` modulu silindi). Alarm/notification akisi backend
+  tarafinda RabbitMQ'da kalir; gateway onunla ilgilenmez.
+* `ResilientPublisher` broker'i `Outbox` ile sarar — broker fail edince
+  mesaj outbox'a yazilir, retrier baglanti gelince bosaltir. Mesaj kaybi
+  YOK; tag-engine idempotent oldugu icin at-least-once garanti yeterlidir.
 """
 
 from dnp3_gateway.messaging.jetstream_publisher import (

@@ -10,10 +10,10 @@ CLI:
         --code GW-001 \
         --token "32-karakter-token" \
         --name "Saha A SCADA" \
-        --backend-url https://hsl.formelektrik.com/api/v1 \
-        --nats-url nats://hsl-nats:4222 \
+        --backend-url https://api.enerjione.local/api/v1 \
+        --nats-url nats://nats.enerjione.local:4222 \
         --host-port 8020 \
-        --image ghcr.io/fikretsafak/enerjionegrid-dnp3-gateway:0.4.3 \
+        --image ghcr.io/fikretsafak/enerjionegrid-dnp3-gateway:0.4.6 \
         --output ./gw-001.yml
 
 Library:
@@ -148,7 +148,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--nats-url",
         required=True,
-        help="NATS JetStream URL (orn. nats://hsl-nats:4222 veya tls://nats.host:4222)",
+        help="NATS JetStream URL (orn. nats://enerjione-nats:4222 veya tls://nats.host:4222)",
     )
     p.add_argument(
         "--host-port",

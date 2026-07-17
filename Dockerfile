@@ -1,5 +1,5 @@
 # EnerjiOne DNP3 Gateway - container image
-# (Horstmann SN2 cihazlarindan DNP3 ile veri toplayip NATS JetStream'e basar.)
+# (Saha DNP3 outstation cihazlarindan veri toplayip NATS JetStream'e basar.)
 #
 # Calisma akisi:
 #   - Tek imaj, N container: her gateway icin ayri container, ayri .env.

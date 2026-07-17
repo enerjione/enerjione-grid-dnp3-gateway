@@ -1,13 +1,19 @@
 """Mock telemetri okuyucu.
 
-Gercek DNP3 cihazi olmadan gateway'in baski testleri, tag-engine ile integrasyon
-dogrulamasi ve frontend gelistirme icin kullanilabilir. Ureten degerler
-Horstmann SN 2.0 sinyallerine gore mantikli araliklarda kalir.
+Gercek DNP3 cihazi olmadan gateway'in baski testleri, tag-engine ile
+integrasyon dogrulamasi ve frontend gelistirme icin kullanilabilir.
+
+Ureten degerler tipik orta-gerilim sebeke sinyalleri icin makul araliklarda
+(voltaj, akim, ariza akimi, sayac, binary status) — `signal.key` icindeki
+anahtar kelimelere gore mantikli mock degerleri uretir. Saha tek tek sensor
+karakteristigi degildir; uretici kim olursa olsun sinyal isimlendirme
+konvansiyonuna gore eslesir.
 """
 
 from __future__ import annotations
 
 import random
+from typing import Any
 
 from dnp3_gateway.adapters.base import SignalReading, TelemetryReader
 from dnp3_gateway.backend import DeviceConfig, SignalConfig
@@ -25,6 +31,31 @@ class MockTelemetryReader(TelemetryReader):
     ) -> list[SignalReading]:
         _ = device
         return [self._generate(signal) for signal in signals]
+
+    def operate_device(
+        self,
+        *,
+        device: DeviceConfig,
+        index: int,
+        op_type: str = "pulse_on",
+        count: int = 1,
+        on_time_ms: int = 100,
+        off_time_ms: int = 100,
+        timeout_sec: float = 10.0,
+    ) -> dict[str, Any]:
+        # Gercek link yok; komutu her zaman basarili kabul et (test/dev).
+        return {
+            "ok": True,
+            "status": "ok",
+            "device_code": device.code,
+            "index": int(index),
+            "op_type": op_type,
+            "count": int(count),
+            "on_time_ms": int(on_time_ms),
+            "off_time_ms": int(off_time_ms),
+            "timeout_sec": float(timeout_sec),
+            "mock": True,
+        }
 
     # ------------------------------------------------------------------ impl
     def _generate(self, signal: SignalConfig) -> SignalReading:
@@ -50,7 +81,7 @@ class MockTelemetryReader(TelemetryReader):
         if data_type == "string":
             return 0.0, "good"
 
-        # analog / analog_output - Horstmann SN2 gergin araliklari
+        # analog / analog_output - tipik OG (orta gerilim) saha araliklari
         if "actual_current" in key or "average_current" in key:
             return self._rng.uniform(0, 1500), "good"
         if "fault_current" in key:

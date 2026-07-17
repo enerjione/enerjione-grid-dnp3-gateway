@@ -1,16 +1,17 @@
 """Backend `/gateways/{code}/config` endpoint'i icin kucuk HTTP client.
 
-Horstmann Smart Logger cati backend'i her gateway icin kendi cihaz listesini +
-standart sinyal katalogunu donmekle yukumludur. Bu modulun gorevi:
+EnerjiOne Grid backend'i her gateway icin kendi cihaz listesini + sinyal
+katalogunu donmekle yukumludur. Bu modulun gorevi:
 
-  - Endpoint'i periyodik olarak cagirmak
+  - Endpoint'i periyodik olarak cagirmak (her `CONFIG_REFRESH_SEC`)
   - JSON payload'unu tipli dataclass'lara (DeviceConfig / SignalConfig /
-    GatewayConfig) cevirmek
-  - Ag/Oturum/Token hatalarini `GatewayConfigError` ile raise etmek
+    GatewayConfig) cevirmek + defansif sema validasyonu uygulamak
+  - Opsiyonel `X-Config-Signature` HMAC dogrulamasi (MITM koruma)
+  - Ag / token / 5xx hatalarini `GatewayConfigError` ile raise etmek
 
-Backend'in `config_version` hash'i ayni kaldigi surece upstream'e gereksiz
-refresh yapilmaz. Degistiginde `GatewayState.update()` true doner ve log'a
-"configuration changed" satiri yazilir.
+Backend'in `config_version` hash'i ayni kaldigi surece state.update() True
+donmez ve gereksiz I/O yapilmaz. Degistiginde "configuration changed" log
+satiri dusurulur, disk cache de tazelenir.
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ from dnp3_gateway.auth import GatewayIdentity, build_config_request_headers
 
 @dataclass(frozen=True)
 class DeviceConfig:
-    """Tek bir Horstmann SN 2.0 cihazinin baglanti parametreleri.
+    """Tek bir DNP3 outstation cihazinin baglanti parametreleri.
 
     `dnp3_tcp_port` None ise gateway `.env` `DNP3_TCP_PORT` (varsayilan) kullanilir;
     aksi halde cihaz bazli TCP port (backend/frontend cihaz kaydi).
@@ -39,6 +40,10 @@ class DeviceConfig:
       - "listening" (default): cihaz dinler, gateway TCP client olarak baglanir
       - "initiating": cihaz master'a outbound baglanir (4G/SIM kart sahasi);
         gateway bu cihaz icin `master_ip_port` portunda TCP server acar
+
+    `signal_profile` backend tarafindan atanan sinyal seti adidir; gateway bu
+    string'i sadece tasir, anlamlandirmaz. Backend, gateway'e dondugu `signals`
+    listesini bu profile gore filtreler.
     """
 
     code: str
@@ -52,7 +57,7 @@ class DeviceConfig:
     poll_interval_sec: int = 5
     timeout_ms: int = 3000
     retry_count: int = 2
-    signal_profile: str = "horstmann_sn2_fixed"
+    signal_profile: str = "default"
 
 
 @dataclass(frozen=True)
@@ -65,7 +70,7 @@ class SignalConfig:
       - object_group 20 : counter
       - object_group 30 : analog input
       - object_group 40 : analog output
-      - object_group 110: string (Horstmann'da seri no, firmware vb.)
+      - object_group 110: octet string (seri no, firmware, custom etiketler)
     """
 
     key: str
@@ -254,6 +259,30 @@ class BackendConfigClient:
             err_text = _scrub_token_from_text(str(exc), self.identity.token)
             raise GatewayConfigError(f"config response read failed: {err_text}") from exc
 
+        # HMAC signature dogrulamasi (opsiyonel, geriye uyumlu).
+        #
+        # Backend response'a `X-Config-Signature: <hex sha256>` header
+        # eklerse: gateway HMAC-SHA256(gateway_token, body_bytes) hesabini
+        # `hmac.compare_digest` ile dogrular. Eslesmezse 403 raise.
+        # Backend bu header'i yollamazsa (eski backend veya feature kapali)
+        # gateway eskisi gibi devam eder — bu best-effort defense-in-depth,
+        # ozellikle HTTPS yokken MITM korumasi saglar.
+        sig_header = (response.headers.get("X-Config-Signature") or "").strip().lower()
+        if sig_header:
+            import hashlib as _hashlib
+            import hmac as _hmac
+
+            expected = _hmac.new(
+                self.identity.token.encode("utf-8"),
+                body_bytes,
+                _hashlib.sha256,
+            ).hexdigest()
+            if not _hmac.compare_digest(sig_header, expected):
+                raise GatewayConfigError(
+                    "config response signature mismatch — "
+                    "backend kompromize veya MITM olabilir, payload reddedildi"
+                )
+
         try:
             import json as _json
 
@@ -306,11 +335,10 @@ def _truncate(value: str, max_len: int) -> str:
 
 def _is_safe_device_ip(ip: str) -> bool:
     """Cihaz IP'sinin formati gecerli mi? Bos string TRUE (`initiating` modunda
-    IP yok). Gercek IP varsa ipaddress.ip_address ile parse edilebilir olmali
-    (hostname formatlari da `127.0.0.1` veya `192.168.x.x` veya FQDN'dir, ama
-    burada strict IP istemiyoruz cunku saha cihazlari hostname ile gelebilir).
-    Bu validator yalniz acik bozulmalari yakalamak icin — Backend kompromize
-    olunca 'http://attacker.com' gibi URL gelirse reddedilsin diye.
+    IP yok). Format-level kontrol: URL scheme, path, bosluk yasak.
+
+    Bu validator yalniz acik bozulmalari yakalamak icin. Network-level
+    allowlist icin `_is_device_ip_in_allowlist` kullanin.
     """
     if not ip or not ip.strip():
         return True
@@ -319,6 +347,71 @@ def _is_safe_device_ip(ip: str) -> bool:
     if "://" in s or "/" in s or "\\" in s or " " in s:
         return False
     return True
+
+
+def _parse_allowed_subnets(raw: str) -> list[Any]:
+    """`192.168.10.0/24,10.0.5.0/24` formatindaki CIDR listesini parse et.
+
+    Gecersiz/bos giris -> bos liste (allowlist devre disi, geriye uyumlu).
+    """
+    import ipaddress as _ip
+
+    out: list[Any] = []
+    for part in (raw or "").split(","):
+        s = part.strip()
+        if not s:
+            continue
+        try:
+            out.append(_ip.ip_network(s, strict=False))
+        except ValueError:
+            _logging.getLogger(__name__).warning(
+                "dnp3_device_allowed_subnets_parse_failed entry=%r — atlandi", s
+            )
+    return out
+
+
+# Modul-seviye cache: Settings'i her _parse_gateway_config cagrisinda yuklemek
+# yerine bir kez okuyup tutarız. Operator runtime'da degistirirse gateway
+# restart edilmeli (zaten env-bazli config restart gerektiriyor).
+_ALLOWED_NETWORKS_CACHE: list[Any] | None = None
+
+
+def _allowed_networks_cached() -> list[Any]:
+    global _ALLOWED_NETWORKS_CACHE
+    if _ALLOWED_NETWORKS_CACHE is not None:
+        return _ALLOWED_NETWORKS_CACHE
+    try:
+        from dnp3_gateway.config import settings as _settings
+
+        raw = _settings.dnp3_device_allowed_subnets or ""
+    except Exception:  # noqa: BLE001
+        raw = ""
+    _ALLOWED_NETWORKS_CACHE = _parse_allowed_subnets(raw)
+    if _ALLOWED_NETWORKS_CACHE:
+        _logging.getLogger(__name__).info(
+            "dnp3_device_allowed_subnets_loaded count=%d", len(_ALLOWED_NETWORKS_CACHE)
+        )
+    return _ALLOWED_NETWORKS_CACHE
+
+
+def _is_device_ip_in_allowlist(ip: str, allowed_networks: list[Any]) -> bool:
+    """IP allowlist kontrolu. Allowlist bos ise hepsi gecer (geriye uyumlu).
+
+    Hostname (FQDN) IP olmayan deger gelirse allowlist set'lendiginde reddedilir
+    (gateway DNS cozumlemesi yapmiyor; operator IP olarak yapilandirmali).
+    """
+    if not allowed_networks:
+        return True
+    if not ip or not ip.strip():
+        return True  # initiating mode, IP yok
+    import ipaddress as _ip
+
+    try:
+        addr = _ip.ip_address(ip.strip())
+    except ValueError:
+        # Hostname/FQDN — allowlist aktifken kabul edilmez
+        return False
+    return any(addr in net for net in allowed_networks)
 
 
 def _safe_int(value: Any, default: int, *, lo: int, hi: int) -> int:
@@ -392,6 +485,11 @@ def _parse_gateway_config(data: dict[str, Any], *, default_gateway_code: str) ->
         devices_raw = devices_raw[:_MAX_DEVICES_HARD_LIMIT]
     devices: list[DeviceConfig] = []
     rejected_ips = 0
+    # Allowlist konfigurasyon yoluyla okunur (Settings.dnp3_device_allowed_subnets).
+    # _parse_gateway_config kendi Settings instance'ini olusturmaz; modul-seviye
+    # cache ile lazy yuklenir (ilk cagrida parse edilir, sonraki call'larda
+    # ayni liste). Operator runtime'da env degistirir → restart sonrasi yuklenir.
+    allowed_networks = _allowed_networks_cached()
     for item in devices_raw:
         if not isinstance(item, dict) or not item.get("code"):
             continue
@@ -401,6 +499,15 @@ def _parse_gateway_config(data: dict[str, Any], *, default_gateway_code: str) ->
             _logging.getLogger(__name__).warning(
                 "config_device_rejected_unsafe_ip code=%r ip=%r — backend bozuk "
                 "veya kompromize, cihaz atlandi",
+                item.get("code"),
+                raw_ip[:80],
+            )
+            continue
+        if not _is_device_ip_in_allowlist(raw_ip, allowed_networks):
+            rejected_ips += 1
+            _logging.getLogger(__name__).warning(
+                "config_device_rejected_outside_allowlist code=%r ip=%r — "
+                "DNP3_DEVICE_ALLOWED_SUBNETS disinda, cihaz atlandi (SSRF/scan koruma)",
                 item.get("code"),
                 raw_ip[:80],
             )
@@ -444,7 +551,7 @@ def _parse_gateway_config(data: dict[str, Any], *, default_gateway_code: str) ->
                     timeout_ms=_safe_int(item.get("timeout_ms"), 3000, lo=100, hi=60000),
                     retry_count=_safe_int(item.get("retry_count"), 2, lo=0, hi=20),
                     signal_profile=_truncate(
-                        item.get("signal_profile") or "horstmann_sn2_fixed",
+                        item.get("signal_profile") or "default",
                         _MAX_CODE_LENGTH,
                     ),
                 )

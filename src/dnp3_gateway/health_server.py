@@ -20,10 +20,12 @@ rastgele bos port atar (frontend / supervisor portu instance_id ile keseyilir).
 from __future__ import annotations
 
 import hmac
+import ipaddress
 import json
 import logging
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from collections import defaultdict, deque
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from threading import Event, Lock, Thread
 from typing import Any
 
@@ -33,9 +35,111 @@ from dnp3_gateway.state import GatewayState
 logger = logging.getLogger(__name__)
 
 
+def _parse_trusted_proxies(raw: str) -> list[Any]:
+    """`10.0.0.0/8,192.168.1.5/32` formatindaki CIDR listesini parse et.
+
+    Gecersiz/bos giris -> bos liste. `_client_ip` bos liste durumunda
+    `X-Forwarded-For`'u TAMAMEN yok sayar (en guvenli default — attacker
+    XFF spoofing yapip rate-limit bypass edemez).
+    """
+    out: list[Any] = []
+    for part in (raw or "").split(","):
+        s = part.strip()
+        if not s:
+            continue
+        try:
+            out.append(ipaddress.ip_network(s, strict=False))
+        except ValueError:
+            logger.warning(
+                "health_trusted_proxies_parse_failed entry=%r — atlandi", s
+            )
+    return out
+
+
+def _ip_in_networks(ip: str, networks: list[Any]) -> bool:
+    """IP, networks listesindeki herhangi bir CIDR'a giriyor mu?"""
+    if not networks or not ip:
+        return False
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(addr in net for net in networks)
+
+
 # Config refresh basarisiz olduginda kac saniye gectikten sonra durumu degraded
 # kabul ederiz. config_refresh_sec * 5 makul; default 30s * 5 = 150s.
 DEFAULT_REFRESH_DEGRADED_THRESHOLD_SEC = 150
+
+
+# Rate-limit: per-IP sliding window. /health auth-suz oldugu icin yanlis
+# konfigure edilmis bir saha proxy'si flood gondermesin diye defansif limit.
+# /refresh-all ise auth'lu ama token leak senaryosunda gateway -> saha cihazi
+# DoS yontemi olmasin diye daha sıkı limit.
+#
+# Localhost (127.0.0.1, ::1) muaf — gateway ile ayni host'taki backend
+# proxy/cati paneli normal saglik probe'unu sinirsiz yapabilsin (kucuk-yuk
+# senaryo). Sınır yalnızca uzaktan gelen istekler icin.
+_HEALTH_RATE_LIMIT_PER_MIN = 120   # /health, /healthz, /info, /metrics
+_REFRESH_RATE_LIMIT_PER_MIN = 10   # POST /refresh-all
+_RATE_LIMIT_WINDOW_SEC = 60.0
+
+_LOCALHOST_IPS: frozenset[str] = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+class _SlidingWindowRateLimiter:
+    """Per-key (IP) sliding window sayaci.
+
+    Thread-safe; window suresi icindeki istekleri deque'ta tutar, yeni istek
+    geldiginde eskimisleri pop'lar. O(1) amortized; bellek tuketimi N farkli
+    IP × ortalama pencere boyu mesaj.
+
+    Saha gateway'inde tipik IP cesitliligi cok dusuk (cati paneli + birkac
+    operator host); bellek smaller sorun.
+    """
+
+    def __init__(self, *, max_per_window: int, window_sec: float) -> None:
+        self._max = max(1, int(max_per_window))
+        self._window = max(1.0, float(window_sec))
+        self._buckets: dict[str, deque[float]] = defaultdict(deque)
+        self._lock = Lock()
+
+    def allow(self, key: str) -> bool:
+        """True: istek izin verildi (sayac artirildi). False: rate-limited."""
+        if not key or key in _LOCALHOST_IPS:
+            return True  # localhost muaf
+        now = time.monotonic()
+        cutoff = now - self._window
+        with self._lock:
+            bucket = self._buckets[key]
+            while bucket and bucket[0] < cutoff:
+                bucket.popleft()
+            if len(bucket) >= self._max:
+                return False
+            bucket.append(now)
+            return True
+
+    def cleanup_stale(self) -> int:
+        """Eski IP entry'lerini temizle (memory growth onlemi).
+
+        Tipik kullanim: health_server'in shutdown / periyodik cagrisi.
+        Tek bir cagri ile expired bucket'lari kaldirir. Donus: temizlenen
+        IP sayisi.
+        """
+        now = time.monotonic()
+        cutoff = now - self._window
+        removed = 0
+        with self._lock:
+            stale_keys = []
+            for key, bucket in self._buckets.items():
+                while bucket and bucket[0] < cutoff:
+                    bucket.popleft()
+                if not bucket:
+                    stale_keys.append(key)
+            for key in stale_keys:
+                del self._buckets[key]
+                removed += 1
+        return removed
 
 
 class GatewayMetrics:
@@ -164,7 +268,11 @@ def _make_handler(
     publisher_provider: Any,
     reader_provider: Any = None,
     refresh_token: str = "",
+    command_token: str = "",
     info_metrics_auth_required: bool = True,
+    health_rate_limiter: _SlidingWindowRateLimiter | None = None,
+    refresh_rate_limiter: _SlidingWindowRateLimiter | None = None,
+    trusted_proxy_networks: list[Any] | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     """HTTP handler class'ini state'e + metrics'e bagli olarak dinamik ureten helper.
 
@@ -176,28 +284,98 @@ def _make_handler(
         `version`, `config_version`, `outbox_pending`, `dead_letter_count`
         gibi operasyonel sizinti veren bilgileri doner.
       * `POST /refresh-all`: HER ZAMAN Bearer auth; refresh_token bos ise 503.
+
+    Rate-limit:
+      * Tum GET endpoint'leri: `health_rate_limiter` (default 120 req/min/IP).
+        Bilinmeyen path'ler (404 doner) icin de uygulanir — fast-path bypass yok.
+      * POST /refresh-all: `refresh_rate_limiter` (default 10 req/min/IP).
+      * Localhost (127.0.0.1, ::1) muaf — saha proxy/cati paneli ayni host'ta
+        ise sinirsiz probe yapabilir.
+
+    `X-Forwarded-For` trust:
+      * `trusted_proxy_networks` bos ise XFF YOK SAYILIR (direkt TCP adresi).
+        Bu en guvenli default — attacker spoofing yapip rate-limit bypass
+        edemez.
+      * Reverse proxy arkasinda calistiriliyorsa proxy IP/subnet'i set edilir;
+        sadece proxy'den gelen XFF okunur, dogrudan gelen istekte XFF goz ardi.
     """
+    _trusted_networks = trusted_proxy_networks or []
 
     class _Handler(BaseHTTPRequestHandler):
-        def _check_bearer_auth(self) -> bool:
+        def _client_ip(self) -> str:
+            """Gercek client IP'sini doner.
+
+            Mantik:
+              1. Direkt TCP client adresini al.
+              2. Eger trusted_proxy_networks set edilmis VE direkt adres bu
+                 networks icindeyse, `X-Forwarded-For` header'inin ILK degerini
+                 al (proxy chain'in en disindaki client).
+              3. Aksi halde TCP adresi.
+
+            Bu trust model nginx/Caddy `real_ip` modulu mantigi ile aynidir.
+            """
+            direct_ip = (
+                self.client_address[0] if self.client_address else ""
+            ).strip()
+            if _trusted_networks and _ip_in_networks(direct_ip, _trusted_networks):
+                xff = self.headers.get("X-Forwarded-For", "").strip()
+                if xff:
+                    # `client, proxy1, proxy2` formati — ilki en disteki client
+                    return xff.split(",")[0].strip()
+            return direct_ip
+
+        def _check_rate_limit(
+            self, limiter: _SlidingWindowRateLimiter | None, *, label: str
+        ) -> bool:
+            """Returns True if request allowed. Otherwise sends 429 + logs."""
+            if limiter is None:
+                return True
+            ip = self._client_ip()
+            if limiter.allow(ip):
+                return True
+            # Rate-limited; 429 doner. Detayli mesaj VERILMEZ (recon malzemesi
+            # olmasin) — sadece Retry-After hint. Content-Length=0 HTTP/1.1
+            # spec uyumu (response framing); aksi halde bazi client'lar
+            # connection'i Half-close gorur, keep-alive bozulur.
+            self.send_response(429)
+            self.send_header("Retry-After", str(int(_RATE_LIMIT_WINDOW_SEC)))
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            logger.warning(
+                "rate_limit_exceeded endpoint=%s ip=%s label=%s",
+                self.path,
+                ip,
+                label,
+            )
+            return False
+
+        def _check_bearer_auth(self, expected_token: str = refresh_token) -> bool:
             """Returns True if request carries valid Bearer token.
             Otherwise sends 401/503 response and returns False.
 
-            Timing-safe karsilastirma (hmac.compare_digest); refresh_token
-            bos ise 503 (endpoint devre disi)."""
-            if not refresh_token:
+            Timing-safe karsilastirma (hmac.compare_digest); expected_token
+            bos ise 503 (endpoint devre disi). Default refresh_token; komut
+            endpoint'i command_token gecer. Content-Length=0 HTTP/1.1
+            framing icin gerekli."""
+            if not expected_token:
                 self.send_response(503)
+                self.send_header("Content-Length", "0")
                 self.end_headers()
                 return False
             auth = self.headers.get("Authorization", "")
-            expected = f"Bearer {refresh_token}"
+            expected = f"Bearer {expected_token}"
             if not hmac.compare_digest(auth.encode("utf-8"), expected.encode("utf-8")):
                 self.send_response(401)
+                self.send_header("Content-Length", "0")
                 self.end_headers()
                 return False
             return True
 
         def do_GET(self):  # noqa: N802
+            # Rate-limit: tum GET endpoint'leri ayni bucket'i paylasir.
+            # Localhost muaf (limiter.allow icinde). 429 doner ve early return.
+            if not self._check_rate_limit(health_rate_limiter, label="get"):
+                return
             # /health, /healthz: HER ZAMAN auth-suz. LB/orchestrator probe.
             if self.path in ("/health", "/healthz"):
                 body, status_code = _build_health_body(
@@ -243,7 +421,10 @@ def _make_handler(
                 }
                 self._respond_json(body)
                 return
+            # Bilinmeyen GET path — rate-limit ZATEN method girisinde yapildi,
+            # 404 fast-path bypass yok. Content-Length=0 HTTP/1.1 framing.
             self.send_response(404)
+            self.send_header("Content-Length", "0")
             self.end_headers()
 
         def do_POST(self):  # noqa: N802
@@ -258,8 +439,18 @@ def _make_handler(
             Backend bu endpoint'i proxy ederek operator'in 'tum sinyalleri
             yenile' butonunu uygular.
             """
+            # Rate-limit EN BASTA: hem /refresh-all hem bilinmeyen POST path'leri
+            # icin. /refresh-all icin sıkı (10/min), bilinmeyen path'ler icin de
+            # ayni bucket (saldirgan POST /random spam'le sunucuyu yoramaz).
+            # Auth fail olsa bile bu sayim devam eder (brute-force teyit).
+            if not self._check_rate_limit(refresh_rate_limiter, label="post"):
+                return
+            if self.path == "/operate":
+                self._handle_operate()
+                return
             if self.path != "/refresh-all":
                 self.send_response(404)
+                self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
             if not self._check_bearer_auth():
@@ -284,6 +475,95 @@ def _make_handler(
                 self._respond_json(
                     {"ok": False, "detail": str(exc)}, status_code=500
                 )
+
+        def _handle_operate(self) -> None:
+            """POST /operate — tek cihaza DNP3 binary output (CROB) komutu.
+
+            Auth: Bearer + command_token (refresh_token'dan AYRI). command_token
+            bos ise 503. Backend cihaz komut butonlarini (Trigger Download,
+            Config Update, Reset...) bu endpoint'e proxy eder.
+
+            Body (JSON): {device_code, index, op_type?, count?, on_time_ms?,
+            off_time_ms?, timeout_sec?}. index Horstmann SN2 binary output
+            index'i, op_type default 'pulse_on'.
+            """
+            if not self._check_bearer_auth(command_token):
+                return  # 401 veya 503 zaten gonderildi
+            try:
+                length = int(self.headers.get("Content-Length", "0") or "0")
+            except ValueError:
+                length = 0
+            # Komut body'si kucuk; buyuk payload'i reddet (DoS/hata onlemi).
+            if length <= 0 or length > 4096:
+                self._respond_json(
+                    {"ok": False, "detail": "gecersiz veya bos body"}, status_code=400
+                )
+                return
+            try:
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                self._respond_json(
+                    {"ok": False, "detail": "body JSON parse edilemedi"}, status_code=400
+                )
+                return
+            device_code = str(payload.get("device_code", "")).strip()
+            if not device_code or "index" not in payload:
+                self._respond_json(
+                    {"ok": False, "detail": "device_code ve index zorunlu"},
+                    status_code=400,
+                )
+                return
+            try:
+                index = int(payload["index"])
+            except (TypeError, ValueError):
+                self._respond_json(
+                    {"ok": False, "detail": "index tamsayi olmali"}, status_code=400
+                )
+                return
+            device = next(
+                (d for d in state.devices() if d.code == device_code), None
+            )
+            if device is None:
+                self._respond_json(
+                    {"ok": False, "detail": f"cihaz bulunamadi: {device_code}"},
+                    status_code=404,
+                )
+                return
+            reader = reader_provider() if reader_provider else None
+            if reader is None or not hasattr(reader, "operate_device"):
+                self._respond_json(
+                    {"ok": False, "detail": "Reader komut desteklemiyor"},
+                    status_code=503,
+                )
+                return
+            try:
+                result = reader.operate_device(
+                    device=device,
+                    index=index,
+                    op_type=str(payload.get("op_type", "pulse_on")),
+                    count=int(payload.get("count", 1)),
+                    on_time_ms=int(payload.get("on_time_ms", 100)),
+                    off_time_ms=int(payload.get("off_time_ms", 100)),
+                    timeout_sec=float(payload.get("timeout_sec", 10.0)),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "operate_failed device=%s index=%s", device_code, index
+                )
+                self._respond_json(
+                    {"ok": False, "detail": str(exc)}, status_code=500
+                )
+                return
+            ok = bool(result.get("ok"))
+            logger.info(
+                "operate_requested device=%s index=%s ok=%s status=%s",
+                device_code, index, ok, result.get("status"),
+            )
+            # Endpoint her zaman 200 doner; komut sonucu result.ok'ta. Cihaz
+            # reddettiyse (unsupported/inactive/timeout) ok=False + status kalir,
+            # backend buna bakip operator'a gosterir.
+            _ = ok
+            self._respond_json({"result": result})
 
         def _respond_json(self, body: dict[str, Any], *, status_code: int = 200) -> None:
             payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -373,6 +653,14 @@ def _build_health_body(
         status = "ok"
         http_code = 200
 
+    # /health auth-suz erisilebilir oldugundan cihaz detaylarini (IP + DNP3
+    # port + address) sizdirmayalim — recon icin yeterli bilgi. Sadece sayim
+    # ve durum bilgisi kalsin; tam detay /info ve /metrics (auth'lu)
+    # endpoint'lerinde tasinabilir.
+    cfg_safe = dict(cfg_snapshot)
+    cfg_safe.pop("devices", None)
+    cfg_safe.pop("devices_detail", None)
+
     body = {
         "status": status,
         "issues": issues,
@@ -383,7 +671,7 @@ def _build_health_body(
         "app_environment": app_environment,
         "worker_health_port": health_port,
         "mode": gateway_mode,
-        "config": cfg_snapshot,
+        "config": cfg_safe,
         "outbox": outbox_snap,
         "metrics": {
             "uptime_sec": metrics_snap["uptime_sec"],
@@ -413,7 +701,11 @@ def start_health_server(
     publisher_provider: Any = None,
     reader_provider: Any = None,
     refresh_token: str = "",
+    command_token: str = "",
     info_metrics_auth_required: bool = True,
+    health_rate_limit_per_min: int = _HEALTH_RATE_LIMIT_PER_MIN,
+    refresh_rate_limit_per_min: int = _REFRESH_RATE_LIMIT_PER_MIN,
+    trusted_proxies: str = "",
 ) -> tuple[HTTPServer, GatewayMetrics, int]:
     """Sunucuyu ayaga kaldirir.
 
@@ -435,6 +727,58 @@ def start_health_server(
     def _actual_port_provider() -> int:
         return actual_port_holder["port"]
 
+    # Per-IP rate limiter'lar — defansif DoS koruma. Localhost muaf (cati
+    # paneli/backend ayni host'tan sinirsiz probe yapabilir).
+    health_rl = _SlidingWindowRateLimiter(
+        max_per_window=health_rate_limit_per_min,
+        window_sec=_RATE_LIMIT_WINDOW_SEC,
+    )
+    refresh_rl = _SlidingWindowRateLimiter(
+        max_per_window=refresh_rate_limit_per_min,
+        window_sec=_RATE_LIMIT_WINDOW_SEC,
+    )
+    # Background cleanup thread: stale IP entry'lerini periyodik olarak siler.
+    # Bucket sayisi = unique-IP-per-window; saha gateway'inde tipik <10 ama
+    # uzak attacker spam'i ile binlerce IP birikebilir. cleanup_stale O(N) ama
+    # 5dk araliklarla calistigi icin amortize edilmis maliyet ihmal edilir.
+    # Thread daemon + stop_event ile temiz shutdown saglanir.
+    rl_cleanup_stop = Event()
+
+    def _rl_cleanup_loop() -> None:
+        # Window suresi kadar bekle; her uyaninca her iki limiter'i temizle.
+        # window_sec * 2 = 120s default — saglikli IP'lerin bucket'i hala
+        # ayakta kalir, tamamen eskimisler silinir.
+        interval = max(60.0, _RATE_LIMIT_WINDOW_SEC * 2.0)
+        while not rl_cleanup_stop.wait(interval):
+            try:
+                removed_h = health_rl.cleanup_stale()
+                removed_r = refresh_rl.cleanup_stale()
+                total = removed_h + removed_r
+                if total > 0:
+                    logger.debug(
+                        "rate_limit_cleanup removed=%d (health=%d refresh=%d)",
+                        total, removed_h, removed_r,
+                    )
+            except Exception:  # noqa: BLE001
+                # Cleanup hatasi server'i durdurmamali
+                logger.debug("rate_limit_cleanup_error", exc_info=True)
+
+    Thread(
+        target=_rl_cleanup_loop,
+        name="rate-limit-cleanup",
+        daemon=True,
+    ).start()
+
+    # Trusted proxy CIDR'lerini parse et. Bos liste = XFF yok sayilir
+    # (saldirgan spoofing yapamaz). Reverse proxy varsa operator buraya
+    # proxy IP/subnet'ini yazar.
+    trusted_networks = _parse_trusted_proxies(trusted_proxies)
+    if trusted_networks:
+        logger.info(
+            "health_trusted_proxies_loaded count=%d (X-Forwarded-For aktif)",
+            len(trusted_networks),
+        )
+
     handler_cls = _make_handler(
         state=state,
         gateway_code=gateway_code,
@@ -447,9 +791,17 @@ def start_health_server(
         publisher_provider=publisher_provider,
         reader_provider=reader_provider,
         refresh_token=refresh_token,
+        command_token=command_token,
         info_metrics_auth_required=info_metrics_auth_required,
+        health_rate_limiter=health_rl,
+        refresh_rate_limiter=refresh_rl,
+        trusted_proxy_networks=trusted_networks,
     )
-    server = HTTPServer((host, port), handler_cls)
+    # ThreadingHTTPServer: yavas client (slow-loris) tek istegi durdursa bile
+    # diger probe'lar bloklanmaz. HTTPServer single-threaded olsaydi cati
+    # paneli /health probe'u bir baska yavas baglanti yuzunden zaman asimina
+    # ugrar, gateway "down" goruntusu olusur.
+    server = ThreadingHTTPServer((host, port), handler_cls)
     actual_port = int(server.server_address[1])
     actual_port_holder["port"] = actual_port
     Thread(target=server.serve_forever, name="health-http", daemon=True).start()

@@ -102,6 +102,22 @@ class Outbox:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
+        # Outbox SQLite dosyasinda telemetri payload + correlation_id +
+        # cihaz IP'leri serialize halde durur. POSIX'te diger user'lar
+        # bunu okumasin diye chmod 600 (owner read/write only).
+        # Windows'ta NTFS ACL ayri; install.ps1'da GATEWAY_STATE_DIR'a
+        # `icacls` ile kisitlama yapilmali.
+        try:
+            import os as _os
+            if _os.name == "posix":
+                # Dosya henuz olusmamissa _init_db'den sonra chmod yapilacak;
+                # burada once mevcut dosya icin (idempotent boot) deneyelim.
+                if self.db_path.exists():
+                    _os.chmod(self.db_path, 0o600)
+        except OSError:
+            # chmod basarisiz oldu — log'a yazmiyoruz cunku logger henuz
+            # init olmamis olabilir. Kritik degil; defense-in-depth.
+            pass
         self._max_pending = max(1000, int(max_pending))
         # Persistent connection: her enqueue/fetch/delete cagrisinda yeni
         # sqlite3.connect() acmak yerine bir kez acip PRAGMA'lari uyguluyoruz.
@@ -116,14 +132,20 @@ class Outbox:
         # (worst case birkac mesaj fazla kabul edilebilir; broker recovery'de
         # zaten retrier hizla bosaltir).
         self._pending_estimate: int = 0
+        # `_init_db` DDL'i transaction icinde uygular; tablo olusturulduktan
+        # SONRA COUNT yapariz. Init asamasinda baska thread enqueue cagiramaz
+        # (Outbox henuz constructor'in icinde, publisher publisher_holder'a
+        # injekte edilmedi), ama defansif olarak yine de self._lock altinda
+        # yapiyoruz — gelecekte init sirasinda thread spawn'lanirsa garanti.
         self._init_db()
-        # Init sonrasi gerçek count'u oku — restart'ta outbox'ta birikmis
-        # mesajlar varsa estimate dogru baslar.
         try:
-            with self._lock, self._cached_connection() as c:
+            with self._lock:
+                c = self._cached_connection()
                 (n,) = c.execute("SELECT COUNT(*) FROM outbox").fetchone()
                 self._pending_estimate = int(n)
         except sqlite3.Error:
+            # Init asamasinda tablo erisilemediyse 0 ile basla; enqueue ilk
+            # cagri'da sayim yine kendi kendine duzelir (sadece estimate).
             self._pending_estimate = 0
 
     def _cached_connection(self) -> sqlite3.Connection:
@@ -161,6 +183,14 @@ class Outbox:
             conn.commit()
         finally:
             conn.close()
+        # POSIX'te chmod 600 — telemetri payload + cihaz IP'leri diger
+        # user'lara kapali kalsin.
+        try:
+            import os as _os
+            if _os.name == "posix" and self.db_path.exists():
+                _os.chmod(self.db_path, 0o600)
+        except OSError:
+            pass
 
     @property
     def max_pending(self) -> int:

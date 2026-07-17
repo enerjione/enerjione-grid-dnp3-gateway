@@ -1,138 +1,214 @@
 # Mimari
 
-`dnp3_gateway`, Horstmann Smart Logger cati yaziliminin **saha gateway**
-katmanidir. Her instance tek bir fiziksel/lojik gateway'i temsil eder ve o
-gateway'e atanmis (backend tarafinda tanimli) cihazlari DNP3 uzerinden poll
-eder.
+`dnp3_gateway`, EnerjiOne Grid platformunun **saha gateway** katmanidir. Her
+instance tek bir lojik gateway'i temsil eder; backend tarafinda kayitli ve o
+gateway'e atanmis DNP3 outstation cihazlari ile haberlesir.
 
-Ayni sunucu veya farkli sunucularda **yuk paylasimli** coklu instance icin
-token, instance ID ve TLS kurallari bkz. [SECURITY.md](./SECURITY.md).
+Ayni veya farkli sunucularda **yuk paylasimli** coklu instance icin token,
+multi-instance lock, TLS kurallari icin: [SECURITY.md](./SECURITY.md).
 
 ## Bilesen diyagrami
 
 ```
-                            +--------------------+
-                            |  backend-api       |
-                            |  FastAPI + Postgres|
-                            +----+----+----------+
-                                 ^    |
-      X-Gateway-Token, Code,     |    | GatewayConfigResponse
-      Instance-Id, Request-Id   |    |
-                                 |    v
-                         +-----------------+
-                         | BackendConfig-  |
-                         | Client (requests)|
-                         +--------+--------+
+                          +------------------------+
+                          |  backend-api (FastAPI) |
+                          |  Postgres + JetStream  |
+                          +-----+----+-------------+
+                                ^    |
+   X-Gateway-Token, Code,       |    | GatewayConfigResponse
+   Instance-Id, Request-Id,     |    | (+ X-Config-Signature)
+   User-Agent                   |    |
+                                |    v
+                       +----------------------+
+                       | BackendConfigClient  |
+                       | (requests, HMAC opt) |
+                       +----------+-----------+
                                   |
                                   v
-+----------------+         +---------------+          +---------------------+
-|                |         |               |          |                     |
-|  DNP3 adapter  |<--------+ GatewayState  +--------->| RabbitPublisher     |
-|  (mock / real) |  due    | (thread-safe) |  payload | (pika, confirms)    |
-|                | devices |               |          |                     |
-+-------+--------+         +-------+-------+          +----------+----------+
-        |                          ^                              |
-        | DNP3 TCP                 |                              | AMQP
-        v                          |                              v
-+-----------------+          +---------------+            +-----------------+
-|  Horstmann SN2  |          |  health HTTP  |            | RabbitMQ broker |
-|  outstation(s)  |          |  /health      |            | exchange:       |
-+-----------------+          +---------------+            | hsl.events      |
-                                                          | rk:             |
-                                                          | telemetry.raw_* |
-                                                          +-----------------+
++--------------------+     +---------------+        +-------------------+
+|                    |     |               |        |                   |
+|   DNP3 adapter     |<----+ GatewayState  +------->| ResilientPublisher|
+|   - yadnp3 (def.)  | due | (thread-safe, |payload | broker + outbox   |
+|   - nfm-dnp3       |dev. |  cache_path)  |        |                   |
+|   - mock           |     |               |        +---------+---------+
++----------+---------+     +-------+-------+                  |
+           |                       ^                          |
+           | DNP3 TCP              |                          v
+           v                       |                +-------------------+
++-------------------+         +----+-------+        |  JetStreamPub.    |
+|  Outstation(s)    |         | health HTTP|        |  (NATS, async)    |
+|  (saha cihazlari) |         | /health    |        +---------+---------+
++-------------------+         | /info      |                  |
+                              | /metrics   |                  | publish
+                              | /refresh-  |                  v
+                              |   all      |        +-------------------+
+                              +------------+        |  NATS JetStream   |
+                                                    |  e1.telemetry.    |
+                                                    |  raw.<GW_CODE>    |
+                                                    +---------+---------+
+                                                              |
+                                                              v
+                                                    tag-engine / alarm-svc
+                                                    iec104-outbound vs.
 ```
+
+## Veri akisi (basarili publish)
+
+```
+[DNP3 Master.read_device]
+       |
+       v
+SignalReading(key, source, raw, scaled, quality, value_string?)
+       |
+       v
+[poller.build_telemetry_payload]
+       |
+       v
++---------------------------------------------------+
+| {                                                 |
+|   "message_id": "<uuid>",                         |
+|   "correlation_id": "<uuid>",                     |
+|   "source_gateway": "GW-001",                     |
+|   "device_code": "DEV-001",                       |
+|   "signal_key": "master.actual_current",          |
+|   "signal_source": "master",                      |
+|   "signal_data_type": "analog",                   |
+|   "value": 1234.5,                                |
+|   "quality": "good",                              |
+|   "source_timestamp": "2026-05-13T08:00:00Z"      |
+| }                                                 |
++---------------------------------------------------+
+       |
+       v
+[ResilientPublisher.publish]
+       |
+       v
+[JetStreamPublisher.publish]
+       headers: {"Nats-Msg-Id": message_id, "X-Correlation-Id": ...}
+       subject: "e1.telemetry.raw.GW-001"
+       |
+       v
+[NATS JetStream Stream TELEMETRY_RAW]   <-- 2dk dedup window
+       (Nats-Msg-Id ile broker-side de-duplication)
+       |
+       v
+[tag-engine consumer]   (idempotent islem)
+```
+
+## Veri akisi (broker down — outbox at-least-once)
+
+```
+[poller] --publish()--> [JetStreamPublisher] -- JetStreamNotReadyError
+                                            \
+                                             +-> [ResilientPublisher catches]
+                                                       |
+                                                       v
+                                            [Outbox.enqueue]
+                                            SQLite: outbox_<CODE>.db
+                                                       |
+                                                       | NATS gelince
+                                                       v
+                                            [OutboxRetrier (bg thread)]
+                                            fetch_batch -> publish
+                                                       |
+                                            +---------+---------+
+                                            |                   |
+                                       basari (delete)    fail (retry++)
+                                                            |
+                                                            v
+                                                  retry_count >= MAX
+                                                            |
+                                                            v
+                                                     dead_letter table
+                                                     (manuel inceleme)
+```
+
+`JetStreamNotReadyError` TRANSIENT istisna — retry_count ARTIRMAZ. Aksi
+takdirde uzun NATS outage'inda 500K mesaj sessizce dead-letter'a duserdi.
 
 ## Thread modeli
 
 | Thread | Gorev |
 | --- | --- |
 | `main` | Poll dongusu (her `DEFAULT_POLL_INTERVAL_SEC`'de bir uyanir) |
-| `config-refresh` | `BACKEND_API_URL` cagrilarak config cekilir (daemon) |
-| `health-http` | `BaseHTTPServer.serve_forever` (daemon) |
-| `main -> signal` | SIGINT/SIGTERM'u stop_event'e cevirir |
+| `config-refresh` | Backend config endpoint cagrisi (exponential backoff fail durumunda) |
+| `health-http` | `ThreadingHTTPServer.serve_forever` (yavas client diger probe'lari bloklamaz) |
+| `outbox-retrier` | Outbox SQLite drenajı, exponential backoff |
+| `jetstream-<code>` | nats-py async event loop (sync facade) |
+| `signal handler` | SIGINT/SIGTERM/SIGBREAK -> `stop_event.set()` |
 
-`GatewayState` tek mutex ile korunur. `RabbitPublisher` icin de bir mutex
-vardir; boylece ayni kanal uzerinden yarisma olmaz.
+`GatewayState` tek mutex ile korunur (kucuk lock'lar lock-free dict lookup'a
+indirgenir; bkz. `_DeviceCache` double-check pattern).
 
-## Event akisi (ozet)
+## Recovery state machine (DNP3 cihaz haberlesmesi)
+
+`_DeviceCache._state`:
 
 ```
-[DNP3 Master]  --read-->  [Adapter.read_device]
-                                 |
-                                 v
-                         SignalReading(key, source, raw, scaled, quality)
-                                 |
-                                 v
-                     [poller.build_telemetry_payload]
-                                 |
-                                 v
-          +--------------------------------------------------+
-          | {                                                |
-          |   "message_id": "uuid",                          |
-          |   "correlation_id": "uuid",                      |
-          |   "source_gateway": "GW-001",                    |
-          |   "device_code": "DEV-001",                      |
-          |   "signal_key": "master.actual_current",         |
-          |   "signal_source": "master",                     |
-          |   "signal_data_type": "analog",                  |
-          |   "value": 1234.5,                               |
-          |   "quality": "good",                             |
-          |   "source_timestamp": "2026-04-24T08:00:00Z"     |
-          | }                                                |
-          +--------------------------------------------------+
-                                 |
-                                 v
-                       AMQP basic_publish()
-                           exchange=hsl.events
-                           routing_key=telemetry.raw_received
-                                 |
-                                 v
-                           [ tag-engine ]
+  +-----------+     baglanti acildi      +--------------+
+  |   lost    +------------------------->|  recovering  |
+  +-----+-----+   (begin_recovery)       +------+-------+
+        ^                                       |
+        | grace timeout                         | fresh frame
+        | (15sn)                                | (cache.set)
+        |                                       v
+        |                                +--------------+
+        +-(fail_recovery)----------------+   online     |
+                                         +--------------+
+                                                |
+                                                | link kopuk (OnClose)
+                                                v
+                                          (lost'a geri)
 ```
 
-Bu payload, `Horstman Smart Logger/packages/shared-contracts/telemetry-contract.json`
-semasi ile birebir uyumludur. Ek olarak `signal_source` ve `signal_data_type`
-alanlari tag-engine ve alarm-service'e master/sat01/sat02 ayrimini ve
-binary-counter ayrimini analamakta yardimci olur.
-
-## Hata yonetimi
-
-- **Backend erisimi yoksa**: `config-refresh` thread'i exception loglar ve
-  bir sonraki cevrimi bekler. Poll dongusu son bilinen state ile calismaya
-  devam eder (is_active False ise yayinlamaz).
-- **RabbitMQ bağlantisi kopmus**: `RabbitPublisher._force_close()` kanali
-  sifirlar; `poller` bir sonraki publish denemesinde adapter yeniden
-  baglanir. Aradan gecen sirada mesaj kaybedilir; kritik ise DNP3 event
-  class'indan gelen yeni event bir sonraki cycle'da tekrar yayinlanacaktir.
-  (Kalici kayip istemiyorsaniz local on-disk retry kuyruk eklenmelidir — bu
-  roadmap'tedir, bkz `Roadmap` bolumu.)
-- **Bir cihaz zaman asimina ugrarsa**: `poll_device` exception'i yakalar;
-  sadece o cihazin bu cycle'i kaybolur, digerleri devam eder. Birkaç cycle
-  sonra backend `communication_status` uzerinden bunu operator dashboard'da
-  `offline` olarak gosterir (bu hesaplama tag-engine/alarm-service'te
-  yapilir; gateway sadece raw event uretir).
+* **lost:** SCADA "comm_lost" gorur; gateway comm_lost yayini surdurur.
+* **recovering:** Link acik gozukuyor ama henuz fresh DNP3 frame gelmedi.
+  SCADA hala comm_lost goruyor — sahte online onlenir. 15sn grace icinde
+  frame gelirse `online`'a yukselir; gelmezse tekrar `lost`.
+* **online:** Normal event-driven yayin. Recovery confirmed olunca tek
+  seferlik `mark_all_dirty` ile son bilinen TUM degerler quality=good ile
+  yayinlanir (SCADA tarafi cihazi tekrar canli gorur).
 
 ## Konfigurasyon versiyonlama
 
 Backend `config_version` hash'i (sha1) doner. Gateway bu degeri takip eder;
-sadece degisince "configuration changed" log satiri dusurulur ve cihaz
-listesinin yeni hali tum state ile degistirilir. Boylece:
+degistiginde:
 
 - Yeni cihaz eklemesi anlik yansir (en fazla `CONFIG_REFRESH_SEC` gecikme).
-- Sinyal katalogu degisikligi (DNP3 adresi, scale) restart gerektirmez.
-- Gateway pasif hale getirildiginde (`is_active=False`) collector ayakta kalir,
-  sadece yayin durur.
+- Sinyal kataloğu degisikligi (DNP3 adresi, scale/offset) restart gerektirmez.
+- Backend `is_active=False` set ederse poller calismaya devam eder ama
+  publish durur.
+
+Disk cache: backend down olsa bile gateway diskteki son config ile polling'e
+devam eder. `CONFIG_CACHE_MAX_AGE_HOURS`'tan eski olursa `/health` issue
+listesinde `config_cache_stale` raporlanir.
+
+## Defansif sema validasyonu
+
+`BackendConfigClient._parse_gateway_config` icindeki kontroller — backend
+kompromize olsa bile gateway kontrolsuz buyume + DoS yememeli:
+
+| Kontrol | Limit | Davranis |
+| --- | --- | --- |
+| `devices` listesi | 1000 hard cap | Asimi truncate + ERROR log |
+| `signals` listesi | 5000 hard cap | Asimi truncate + ERROR log |
+| String alanlar | code 64ch, label 256ch, unit 32ch | Truncate + WARN |
+| Cihaz IP scheme | `://`, `/`, `\`, ` ` yasak | Cihaz reddedilir |
+| Cihaz IP allowlist | `DNP3_DEVICE_ALLOWED_SUBNETS` | Disindaki IP reddi |
+| `dnp3_address` | 0-65519 | Aralik disinda default'a clamp + WARN |
+| `dnp3_index` | 0-65535 (16-bit) | Aralik disinda default 0 |
+| `scale`, `offset` | finite float | inf/nan -> default + WARN |
+| Response Content-Length | 10MB hard cap | Stream sirasinda raise |
 
 ## Roadmap
 
-- **Event subscription (Class 1/2/3)**: Su an sadece integrity poll ile
-  cache okuyoruz. `opendnp3` klasik olarak class events'i push edebilir;
-  gerekirse adapter `push` callback'i ile `RabbitPublisher`'a dusurulebilir.
-- **Local retry queue**: RabbitMQ uzun sureli offline kalirsa lokal SQLite
-  tabanli outbox kurulup broker ayaga kalkinca drain edilebilir.
-- **Command downlink**: Backend'den gelen `binary_output` / `analog_output`
-  komutlari (`master.cmd_*` sinyalleri) icin ayri bir AMQP consumer
-  eklenip `Dnp3DeviceSession.operate()` akisi baglanabilir.
-- **TLS + PKI**: `DNP3 over TLS` yada site-to-site VPN icin transport
-  katmaninda sartli aktifligi destekleyecek ayarlar.
+- **JetStream cluster HA** — 3-node + `replicas: 3` stream config (operasyon
+  takimi karari).
+- **mTLS** — `dnp3_gateway` -> backend ve -> NATS arasinda kullanici
+  sertifikalari (uzun vade).
+- **Prometheus exporter** — `/metrics` JSON yerine `text/plain` Prometheus
+  format opsiyonel.
+- **Command downlink** — backend'den gelen `binary_output` / `analog_output`
+  komutlarini DNP3 outstation'a yazma akisi.
+- **Reproducible build** — `requirements-lock.txt` (`pip-compile
+  --generate-hashes`) + CI'da hash dogrulamasi.

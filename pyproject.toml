@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "enerjione-dnp3-gateway"
-version = "0.4.5"
-description = "EnerjiOne Grid Dashboard platformu icin standalone DNP3 gateway servisi (Horstmann SN2 cihazlari ile konusur)"
+version = "0.4.6"
+description = "EnerjiOne Grid platformu icin standalone DNP3 master gateway servisi (saha DNP3 outstation -> NATS JetStream)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Proprietary - Form Elektrik" }
@@ -18,11 +18,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Saf-Python DNP3 master (legacy / fallback). Default deployment yadnp3
+# (OpenDNP3 native) wheel'ini kullanir — bu sadece yadnp3 derlemesi
+# yapilamayan platformlar icin alternatif. yadnp3 PyPI'de wheel oldugu
+# icin requirements.txt'te direct kuruluyor (ekstrasyz).
 dnp3 = ["nfm-dnp3>=1.0.1,<2.0"]
-# LEGACY — pika sadece rollback senaryosunda (rabbit_publisher.py modulu)
-# gerekli; production gateway pika'ya bagli degil. Cutover'a guven gelince
-# tamamen kaldirilabilir.
-legacy-rabbit = ["pika>=1.3,<2.0"]
 dev = [
     "pytest>=7.4,<9.0",
     "pytest-cov>=4.1,<6.0",

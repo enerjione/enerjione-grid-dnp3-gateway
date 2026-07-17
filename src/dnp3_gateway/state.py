@@ -190,6 +190,14 @@ class GatewayState:
             self._gateway_name = str(data.get("gateway_name") or "")
             self._config_version = str(data.get("config_version") or "")
             self._config_loaded_at_unix = cached_at_unix  # cache zamani; refresh sonrasi update
+            # refresh_nonce — backend operator-trigger sayaci. Restart sonrasi
+            # 0'dan baslarsa backend ayni nonce'u tekrar yollasa bile
+            # `new_nonce > current` testi tetiklenir → gereksiz integrity poll.
+            # Cache'ten geri yukleyerek monotonic davranisi sagla.
+            try:
+                self._refresh_nonce = int(data.get("refresh_nonce", 0) or 0)
+            except (TypeError, ValueError):
+                self._refresh_nonce = 0
         logger.info(
             "config_cache_loaded path=%s devices=%d signals=%d version=%s age_hours=%s",
             self._cache_path,
@@ -219,6 +227,10 @@ class GatewayState:
                 "batch_interval_sec": config.batch_interval_sec,
                 "max_devices": config.max_devices,
                 "cached_at_unix": loaded_at_unix or time.time(),
+                # refresh_nonce'i persist et — restart sonrasi monotonic davranis.
+                # `_persist_unsafe` lock altinda cagrilir (_apply_config_unsafe icinden);
+                # _refresh_nonce'a guvenli erisim.
+                "refresh_nonce": self._refresh_nonce,
                 "devices": [asdict(d) for d in config.devices],
                 "signals": [asdict(s) for s in config.signals],
             }

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import Any
 
 from dnp3_gateway.backend import DeviceConfig, SignalConfig
 
@@ -47,6 +48,25 @@ class TelemetryReader(ABC):
         quality='offline' / 'invalid' olarak donebilir ya da exception raise
         edilebilir. Exception uygulama katmaninda tek cihaz bazinda try/except
         ile loglanir, dongu durmaz.
+        """
+
+    @abstractmethod
+    def operate_device(
+        self,
+        *,
+        device: DeviceConfig,
+        index: int,
+        op_type: str = "pulse_on",
+        count: int = 1,
+        on_time_ms: int = 100,
+        off_time_ms: int = 100,
+        timeout_sec: float = 10.0,
+    ) -> dict[str, Any]:
+        """Cihaza DNP3 binary output (CROB) komutu gonderir.
+
+        Horstmann SN2 komutlari binary output index'lerine PULSE_ON ile
+        tetiklenir. Doner: {ok: bool, status: str, ...}. Adapter destegi
+        yoksa {ok: False, status: 'unsupported'} donmeli, exception atmamali.
         """
 
     def forget_devices(self, active_device_codes: set[str]) -> int:

@@ -142,25 +142,18 @@ class _DeviceCache:
             if prev is None or prev[0] != raw or prev[1] != value_string:
                 self._dirty.add(key)
             # Recovery confirmation: cihaz "recovering" durumundaysa ve bu
-            # frame OnOpen/stale-edge anchor'indan sonra geldiyse, bu cihazin
-            # gercekten DNP3 cevapladiginin ispatidir → online'a yukselt ve
-            # **bu noktada tum bilinen sinyalleri dirty isaretle** ki bir
-            # sonraki read_device cycle'inda (en gec scan_interval_sec sonra)
-            # hepsi quality=good ile yayinlansin. Onceden burada sadece
-            # _pending_recovery_publish=True isaretliyordum ve read_device
-            # mark_all_dirty cagiriyordu; ama integrity poll cevap geldiginde
-            # binlerce sinyal pesi sira cache.set ile yazilir, herbiri sadece
-            # KENDI key'ini dirty yapar. Recovery confirm aninda mark_all_dirty
-            # cagrarak son bilinen TUM degerlerin yayinlanmasini garantiliyoruz
-            # (bazi sinyaller hala eski deger olabilir, integrity poll'un
-            # devami gelene kadar zaman gecmis olabilir).
+            # frame OnOpen/stale-edge anchor'indan sonra geldiyse, online'a
+            # yukselt ve _pending_recovery_publish=True ile read_device'a
+            # sinyal et. Eski impl. burada self._dirty.update(self._values.
+            # keys()) yapiyordu (O(N)); ama I/O thread'inde (yadnp3 callback)
+            # 600+ cihaz × 175 sinyal = 100K key icin lock altinda set.update
+            # yapilmasi GIL'i tutarak baska callback'leri bekletir. Tum dirty
+            # isaretlemesi yerine read_device 'in consume_recovery_publish
+            # tetigiyle mark_all_dirty cagirmasini bekleriz (poller thread'i
+            # zaten lock ister, bu sirada I/O thread'i serbest).
             if self._state == "recovering" and now >= self._recovery_anchor_at:
                 self._state = "online"
                 self._pending_recovery_publish = True
-                # Tum cache'i dirty isaretle. Boylece bir sonraki cycle'da
-                # (scan_interval_sec sonra) butun sinyaller yayinlanir; read_
-                # device'in mark_all_dirty cagirmasini beklemeye gerek yok.
-                self._dirty.update(self._values.keys())
 
     def get(self, group: int, index: int) -> tuple[float, str | None] | None:
         with self._lock:
@@ -400,6 +393,11 @@ class _ManagedMaster:
         self._manager = manager
         self._scan_interval_sec = max(1, int(scan_interval_sec))
         self._baseline_interval_sec = max(self._scan_interval_sec, int(baseline_interval_sec))
+        # Lifecycle flag: shutdown cagirildiktan sonra _master/_channel
+        # C++ objeleri freed; read_device/request_integrity_poll concurrent
+        # cagirilirsa SIGSEGV riski. shutdown() bunu False yapar; method'lar
+        # girise gore early-return ederler.
+        self._active: bool = True
 
         endpoint_type = (device.ip_endpoint_type or "listening").lower()
         channel_mode: str
@@ -496,6 +494,12 @@ class _ManagedMaster:
         )
 
     def shutdown(self) -> None:
+        # ONCE flag'i False yap — concurrent read_device/refresh_all/
+        # request_integrity_poll cagrilari early-return etsin. Aksi takdirde
+        # _master.Disable() ile freed olmus C++ objesini yine kullanmaya
+        # calisir ve SIGSEGV uretir (yadnp3 binding C++ ile yazilmis;
+        # GIL serbest birakilir).
+        self._active = False
         try:
             self._master.Disable()
         except Exception:  # noqa: BLE001
@@ -519,6 +523,10 @@ class _ManagedMaster:
 
         Returns: True = task kuyruga alindi, False = link kapali / hata.
         """
+        # shutdown sonrasi cagri _master freed olmus; SIGSEGV onlemek icin
+        # erken don.
+        if not self._active:
+            return False
         try:
             # ScanClasses imzasi: (field, soe_handler, config=Default).
             # SOE handler'i atlamak TypeError verir (bkz. ya nodp3 binding);
@@ -534,6 +542,89 @@ class _ManagedMaster:
         except Exception:  # noqa: BLE001
             logger.exception("yadnp3_integrity_poll_request_failed")
             return False
+
+    def operate_crob(
+        self,
+        *,
+        index: int,
+        op_type: str = "pulse_on",
+        count: int = 1,
+        on_time_ms: int = 100,
+        off_time_ms: int = 100,
+        timeout_sec: float = 10.0,
+    ) -> dict:
+        """Cihaza bir CROB (Control Relay Output Block) DirectOperate gonderir.
+
+        Horstmann SN2 komutlari (Index 0=Configuration Update, 10/11=Trigger
+        Config Download, ...) bu binary output index'lerine PULSE_ON ile
+        tetiklenir. DirectOperate select-fazi olmadan tek adimda gonderir.
+
+        DirectOperate callback'i opendnp3 IO thread'inde ASENKRON gelir; burada
+        threading.Event ile senkron sonuca ceviririz. Doner: {ok, status, error}.
+        """
+        if not self._active:
+            return {"ok": False, "status": "inactive", "error": "master shutdown"}
+
+        op_map = {
+            "pulse_on": opendnp3.OperationType.PULSE_ON,
+            "pulse_off": opendnp3.OperationType.PULSE_OFF,
+            "latch_on": opendnp3.OperationType.LATCH_ON,
+            "latch_off": opendnp3.OperationType.LATCH_OFF,
+        }
+        opt = op_map.get(op_type.lower())
+        if opt is None:
+            return {"ok": False, "status": "bad_request", "error": f"gecersiz op_type: {op_type!r}"}
+
+        try:
+            crob = opendnp3.ControlRelayOutputBlock(opt)
+            crob.count = int(count)
+            crob.onTimeMS = int(on_time_ms)
+            crob.offTimeMS = int(off_time_ms)
+        except Exception as exc:  # noqa: BLE001
+            # Bazi binding surumlerinde alan adlari farkli olabilir; ctor
+            # positional fallback.
+            try:
+                crob = opendnp3.ControlRelayOutputBlock(
+                    opt, opendnp3.TripCloseCode.NUL, False,
+                    int(count), int(on_time_ms), int(off_time_ms),
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("yadnp3_crob_build_failed")
+                return {"ok": False, "status": "error", "error": f"CROB olusturulamadi: {exc}"}
+
+        done = threading.Event()
+        holder: dict = {"status": "no_result"}
+
+        def _cb(result):  # opendnp3 IO thread
+            try:
+                summary = getattr(result, "summary", None)
+                # ICommandTaskResult.summary -> TaskCompletion enum. SUCCESS bekleriz.
+                holder["summary"] = str(summary)
+                points = []
+                try:
+                    for pr in result.to_list():
+                        points.append({"index": pr.index, "status": str(pr.status)})
+                except Exception:  # noqa: BLE001
+                    pass
+                holder["points"] = points
+                holder["status"] = "ok" if "SUCCESS" in str(summary).upper() else "failed"
+            except Exception as exc:  # noqa: BLE001
+                holder["status"] = "error"
+                holder["error"] = str(exc)
+            finally:
+                done.set()
+
+        try:
+            self._master.DirectOperate(crob, int(index), _cb, opendnp3.TaskConfig.Default())
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("yadnp3_direct_operate_failed device=%s index=%s", self.device.code, index)
+            return {"ok": False, "status": "error", "error": str(exc)}
+
+        if not done.wait(timeout=timeout_sec):
+            return {"ok": False, "status": "timeout", "error": f"{timeout_sec}s icinde cevap yok"}
+
+        ok = holder.get("status") == "ok"
+        return {"ok": ok, **holder}
 
 
 class Yadnp3TelemetryReader(TelemetryReader):
@@ -626,6 +717,24 @@ class Yadnp3TelemetryReader(TelemetryReader):
         signals: list[SignalConfig],
     ) -> list[SignalReading]:
         mm = self._ensure_master(device)
+        # Race koruma: ensure_master ve forget_devices/close paralel
+        # cagrilirsa mm shutdown edilmis olabilir. _active=False ise master
+        # C++ objesi freed; _master.X cagrilari SIGSEGV uretir. Bu durumda
+        # comm_lost yayini yapip cik (poller sonraki cycle'da yeniden
+        # _ensure_master ile fresh master alir).
+        if not mm._active:
+            return [
+                SignalReading(
+                    signal_key=s.key,
+                    source=s.source,
+                    data_type=s.data_type,
+                    raw_value=0.0,
+                    scaled_value=0.0,
+                    quality="comm_lost",
+                    value_string=None,
+                )
+                for s in signals
+            ]
         cache = mm.cache
         connected = cache.is_connected()
 
@@ -789,27 +898,68 @@ class Yadnp3TelemetryReader(TelemetryReader):
             cache.clear_dirty(s.dnp3_object_group, s.dnp3_index)
         return readings
 
+    def operate_device(
+        self,
+        *,
+        device: DeviceConfig,
+        index: int,
+        op_type: str = "pulse_on",
+        count: int = 1,
+        on_time_ms: int = 100,
+        off_time_ms: int = 100,
+        timeout_sec: float = 10.0,
+    ) -> dict[str, Any]:
+        # Var olan master'i kullan; yoksa ac (read akisiyla ayni cache paylasilir).
+        mm = self._ensure_master(device)
+        if not mm._active:
+            return {
+                "ok": False,
+                "status": "inactive",
+                "device_code": device.code,
+                "index": int(index),
+                "error": "master shutdown",
+            }
+        result = mm.operate_crob(
+            index=index,
+            op_type=op_type,
+            count=count,
+            on_time_ms=on_time_ms,
+            off_time_ms=off_time_ms,
+            timeout_sec=timeout_sec,
+        )
+        return {"device_code": device.code, "index": int(index), **result}
+
     def forget_devices(self, active_device_codes: set[str]) -> int:
         """Backend config'inden cikarilmis cihazlarin master/channel'larini kapat.
 
         Aksi halde silinen cihazlarin TCP baglanti deneme kanalı acik kalir;
         ayni IP+port'a baglanmaya calisip diger cihazlarla flap yapar (zombie
         master). Config refresh akisinda her seferinde cagirilir.
+
+        Sira:
+          1) Lock altinda master'lari dict'ten cikar VE _active=False isaretle.
+             Bu sayede paralel read_device cagrilari erken-return eder, shutdown
+             sirasinda yarisma olmaz.
+          2) Lock disinda shutdown'lari calistir — _channel.Shutdown() blocking
+             olabilir; lock'i bos tutmak gerek.
         """
-        cleaned = 0
+        cleaned: list[tuple[str, _ManagedMaster]] = []
         with self._lock:
             stale_codes = [c for c in self._masters if c not in active_device_codes]
             for code in stale_codes:
                 mm = self._masters.pop(code, None)
                 if mm is None:
                     continue
-                try:
-                    mm.shutdown()
-                except Exception:  # noqa: BLE001
-                    logger.debug("yadnp3_master_shutdown_error device=%s", code, exc_info=True)
-                cleaned += 1
-                logger.info("yadnp3_master_forgotten device=%s reason=removed_from_config", code)
-        return cleaned
+                mm._active = False  # paralel okuyuculari erken-return'e zorla
+                cleaned.append((code, mm))
+        # Shutdown'lari lock disinda calistir.
+        for code, mm in cleaned:
+            try:
+                mm.shutdown()
+            except Exception:  # noqa: BLE001
+                logger.debug("yadnp3_master_shutdown_error device=%s", code, exc_info=True)
+            logger.info("yadnp3_master_forgotten device=%s reason=removed_from_config", code)
+        return len(cleaned)
 
     def refresh_all_devices(self) -> tuple[int, int]:
         """Aktif tum cihazlara ANINDA full integrity poll (Class 0+1+2+3).
@@ -823,27 +973,39 @@ class Yadnp3TelemetryReader(TelemetryReader):
         akista cache'e yazilir.
         """
         ok = 0
+        # Lock altinda master listesini snapshot al; sonra lock'u birak ve
+        # integrity poll cagrilarini disarida yap — ScanClasses C++ tarafa
+        # kuyruga ekleme/IO blocking olabilir, ana lock'i tutmak diger
+        # _ensure_master ve forget_devices cagrilarini gereksiz bloklar.
         with self._lock:
-            total = len(self._masters)
-            for code, mm in list(self._masters.items()):
-                try:
-                    if mm.request_integrity_poll():
-                        ok += 1
-                        logger.info("yadnp3_integrity_poll_requested device=%s", code)
-                    else:
-                        logger.warning("yadnp3_integrity_poll_failed device=%s", code)
-                except Exception:  # noqa: BLE001
-                    logger.exception("yadnp3_integrity_poll_error device=%s", code)
+            snapshot = list(self._masters.items())
+            total = len(snapshot)
+        for code, mm in snapshot:
+            if not mm._active:
+                continue  # shutdown araliginda — atla
+            try:
+                if mm.request_integrity_poll():
+                    ok += 1
+                    logger.info("yadnp3_integrity_poll_requested device=%s", code)
+                else:
+                    logger.warning("yadnp3_integrity_poll_failed device=%s", code)
+            except Exception:  # noqa: BLE001
+                logger.exception("yadnp3_integrity_poll_error device=%s", code)
         return ok, total
 
     def close(self) -> None:
+        # Iki asama: lock altinda dict'ten cikar + _active=False, lock disinda
+        # shutdown. forget_devices ile ayni race-guard pattern'i.
         with self._lock:
-            for mm in list(self._masters.values()):
-                try:
-                    mm.shutdown()
-                except Exception:  # noqa: BLE001
-                    logger.debug("yadnp3_master_shutdown_error", exc_info=True)
+            to_shutdown = list(self._masters.values())
+            for mm in to_shutdown:
+                mm._active = False
             self._masters.clear()
+        for mm in to_shutdown:
+            try:
+                mm.shutdown()
+            except Exception:  # noqa: BLE001
+                logger.debug("yadnp3_master_shutdown_error", exc_info=True)
         try:
             self._manager.Shutdown()
         except Exception:  # noqa: BLE001
