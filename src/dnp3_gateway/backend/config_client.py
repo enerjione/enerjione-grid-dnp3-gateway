@@ -87,6 +87,26 @@ class SignalConfig:
 
 
 @dataclass(frozen=True)
+class PendingCommand:
+    """Backend'in gonderdigi bekleyen cihaz komutu (DNP3 CROB).
+
+    Gateway NAT arkasinda; komut config-poll ile gelir. Her komut icin
+    `reader.operate_device(device, index, ...)` cagirilir ve sonuc
+    `POST /gateways/{code}/command-results` ile backend'e bildirilir. `id`
+    idempotent — ayni id ikinci kez gelirse tekrar calistirilmaz (state dedup).
+    """
+
+    id: int
+    device_code: str
+    command: str
+    dnp3_index: int
+    op_type: str = "pulse_on"
+    count: int = 1
+    on_time_ms: int = 100
+    off_time_ms: int = 100
+
+
+@dataclass(frozen=True)
 class GatewayConfig:
     gateway_code: str
     gateway_name: str
@@ -99,6 +119,9 @@ class GatewayConfig:
     # Operator "tum cihazlara sorgu at" sayaci. Bir oncekiyle karsilastirilarak
     # integrity poll tetiklemesi yapilir; kalici state.py icinde tutulur.
     refresh_nonce: int = 0
+    # Backend'in gonderdigi bekleyen cihaz komutlari. Her poll'de gelir;
+    # state gorulmus id'leri dedup eder, poll loop calistirir + sonuc bildirir.
+    pending_commands: tuple[PendingCommand, ...] = ()
 
 
 class GatewayConfigError(RuntimeError):
@@ -296,6 +319,34 @@ class BackendConfigClient:
             )
 
         return _parse_gateway_config(data, default_gateway_code=self.gateway_code)
+
+    def report_command_results(self, results: list[dict]) -> None:
+        """Calistirilan komut sonuclarini backend'e bildirir (batch POST).
+
+        `results`: [{id, ok, status, error?}]. Backend ilgili device_commands
+        satirlarini ok/failed yapar. Auth config GET ile ayni (X-Gateway-Token).
+        Bos liste -> no-op. Hata raise eder (caller loglar, komut zaten calisti).
+        """
+        if not results:
+            return
+        url = f"{self.base_url}/gateways/{self.gateway_code}/command-results"
+        headers = build_config_request_headers(self.identity)
+        headers["Content-Type"] = "application/json"
+        try:
+            response = self._session.post(
+                url,
+                headers=headers,
+                json=results,
+                timeout=self.timeout_sec,
+            )
+        except requests.RequestException as exc:
+            raise GatewayConfigError(
+                _scrub_token_from_text(f"command-results POST failed: {exc}", self.identity.token)
+            ) from exc
+        if response.status_code >= 400:
+            raise GatewayConfigError(
+                f"command-results POST rejected: HTTP {response.status_code}"
+            )
 
 
 # Schema-defansif sabitler — backend kompromize olsa bile gateway'in
@@ -630,6 +681,35 @@ def _parse_gateway_config(data: dict[str, Any], *, default_gateway_code: str) ->
         refresh_nonce = int(data.get("refresh_nonce", 0) or 0)
     except (TypeError, ValueError):
         refresh_nonce = 0
+
+    # Bekleyen komutlar (opsiyonel; eski backend'de alan yok -> bos). Defensive
+    # parse: bozuk komut atlanir, dongu durmaz.
+    pending_commands: list[PendingCommand] = []
+    raw_cmds = data.get("pending_commands")
+    if isinstance(raw_cmds, list):
+        for item in raw_cmds:
+            if not isinstance(item, dict):
+                continue
+            try:
+                pending_commands.append(
+                    PendingCommand(
+                        id=int(item["id"]),
+                        device_code=str(item["device_code"]),
+                        command=str(item.get("command") or ""),
+                        dnp3_index=int(item["dnp3_index"]),
+                        op_type=str(item.get("op_type") or "pulse_on"),
+                        count=int(item.get("count", 1) or 1),
+                        on_time_ms=int(item.get("on_time_ms", 100) or 100),
+                        off_time_ms=int(item.get("off_time_ms", 100) or 100),
+                    )
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                _logging.getLogger(__name__).warning(
+                    "config_pending_command_parse_failed id=%r error=%s — komut atlandi",
+                    item.get("id"),
+                    exc,
+                )
+
     return GatewayConfig(
         gateway_code=str(data.get("gateway_code") or default_gateway_code),
         gateway_name=str(data.get("gateway_name") or ""),
@@ -640,4 +720,5 @@ def _parse_gateway_config(data: dict[str, Any], *, default_gateway_code: str) ->
         devices=devices,
         signals=signals,
         refresh_nonce=refresh_nonce,
+        pending_commands=tuple(pending_commands),
     )

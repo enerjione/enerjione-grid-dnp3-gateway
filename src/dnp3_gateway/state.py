@@ -28,7 +28,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 
-from dnp3_gateway.backend import DeviceConfig, GatewayConfig, SignalConfig
+from dnp3_gateway.backend import DeviceConfig, GatewayConfig, PendingCommand, SignalConfig
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +61,13 @@ class GatewayState:
         # bayrak doner ve poller integrity poll tetikler.
         self._refresh_nonce: int = 0
         self._refresh_pending: bool = False
+        # Bekleyen cihaz komutlari (config-poll ile gelir). update() yeni
+        # (gorulmemis id) komutlari kuyruga alir; poll loop take_pending_commands
+        # ile OKUYUP TEMIZLER, calistirir. _seen_command_ids idempotent dedup:
+        # ayni komut config'te tekrar gelirse (result bildirilene kadar) yeniden
+        # calistirilmaz.
+        self._pending_commands: list[PendingCommand] = []
+        self._seen_command_ids: set[int] = set()
         self._cache_path: Path | None = Path(cache_path) if cache_path else None
         self._cache_max_age_sec: float = max(60.0, float(cache_max_age_hours) * 3600.0)
         # Wall-clock zamanda son basarili config update timestamp'i (cache age
@@ -110,6 +117,14 @@ class GatewayState:
             elif new_nonce < self._refresh_nonce:
                 # backend reset yapmis olabilir (test) — sessizce takip et
                 self._refresh_nonce = new_nonce
+            # Bekleyen komutlar: gorulmemis id'leri kuyruga al (idempotent dedup).
+            # Ayni komut config'te tekrar gelirse (backend result bildirilene
+            # kadar 'sent' olarak tutar; ama ETag miss'te tekrar gonderebilir)
+            # yeniden calistirilmaz.
+            for cmd in getattr(config, "pending_commands", ()) or ():
+                if cmd.id not in self._seen_command_ids:
+                    self._seen_command_ids.add(cmd.id)
+                    self._pending_commands.append(cmd)
         # disk yazimi lock disinda — dosya I/O sirasinda okuyucular bloklanmasin
         if changed:
             self._persist_unsafe(config, loaded_at_unix=now_unix)
@@ -126,6 +141,18 @@ class GatewayState:
                 self._refresh_pending = False
                 return True
             return False
+
+    def take_pending_commands(self) -> list[PendingCommand]:
+        """Bekleyen komut kuyrugunu OKUYUP TEMIZLER (tek seferlik).
+
+        Poll loop her cycle cagirir; donen komutlari operate_device ile
+        calistirir ve sonuclari backend'e bildirir. Kuyruk temizlenir ama
+        _seen_command_ids KORUNUR (ayni id tekrar gelirse yeniden calistirilmaz).
+        """
+        with self._lock:
+            cmds = self._pending_commands
+            self._pending_commands = []
+            return cmds
 
     def record_refresh_error(self, error: str) -> None:
         """Config refresh denemesi basarisiz olursa caller cagirir.

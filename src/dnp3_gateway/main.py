@@ -98,6 +98,55 @@ def _mask_secret(value: str, *, keep: int = 2) -> str:
     return f"{v[:keep]}...{v[-keep:]}"
 
 
+def _execute_pending_commands(reader, state: GatewayState, pending) -> list[dict]:
+    """Bekleyen komutlari operate_device (CROB) ile calistirir, sonuc listesi doner.
+
+    Her sonuc: {id, ok, status, error?} — backend command-results endpoint'inin
+    bekledigi bicim. Cihaz bulunamaz/hata olursa ok=False + anlamli status.
+    Bir komutun hatasi digerlerini durdurmaz.
+    """
+    results: list[dict] = []
+    devices_by_code = {d.code: d for d in state.devices()}
+    for cmd in pending:
+        device = devices_by_code.get(cmd.device_code)
+        if device is None:
+            logger.warning(
+                "pending_command_device_not_found id=%s device=%s",
+                cmd.id, cmd.device_code,
+            )
+            results.append(
+                {"id": cmd.id, "ok": False, "status": "device_not_found",
+                 "error": f"cihaz config'te yok: {cmd.device_code}"}
+            )
+            continue
+        try:
+            res = reader.operate_device(
+                device=device,
+                index=cmd.dnp3_index,
+                op_type=cmd.op_type,
+                count=cmd.count,
+                on_time_ms=cmd.on_time_ms,
+                off_time_ms=cmd.off_time_ms,
+            )
+            ok = bool(res.get("ok"))
+            logger.info(
+                "pending_command_executed id=%s device=%s index=%s ok=%s status=%s",
+                cmd.id, cmd.device_code, cmd.dnp3_index, ok, res.get("status"),
+            )
+            results.append(
+                {"id": cmd.id, "ok": ok, "status": str(res.get("status", "unknown")),
+                 "error": res.get("error")}
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "pending_command_failed id=%s device=%s", cmd.id, cmd.device_code
+            )
+            results.append(
+                {"id": cmd.id, "ok": False, "status": "error", "error": str(exc)[:400]}
+            )
+    return results
+
+
 def _run_config_refresh(
     *,
     client: BackendConfigClient,
@@ -582,6 +631,23 @@ def run(current_settings: Settings | None = None) -> int:
                     )
             except Exception:  # noqa: BLE001
                 logger.exception("manual_refresh_all_dispatch_failed")
+
+            # Bekleyen cihaz komutlari (config-poll ile geldi): her birini
+            # operate_device (CROB) ile calistir, sonuclari backend'e bildir.
+            # Gateway NAT arkasinda oldugundan komut sadece bu pull kanaliyla
+            # gelebilir (backend gateway'e ulasamaz).
+            if not stop_event.is_set() and hasattr(reader, "operate_device"):
+                pending = state.take_pending_commands()
+                if pending:
+                    results = _execute_pending_commands(reader, state, pending)
+                    try:
+                        config_client.report_command_results(results)
+                    except Exception:  # noqa: BLE001
+                        # Bildirim basarisiz — komut CALISTI ama sonuc gitmedi.
+                        # Backend komutu 'sent' tutar; operator UI'da sonuc
+                        # gormezse tekrar tetikleyebilir. Bir sonraki poll'de
+                        # tekrar denemeyiz (kuyruk temizlendi) — kabul edilebilir.
+                        logger.exception("command_results_report_failed")
             due_count = len(state.due_devices(now_monotonic))
             published = run_poll_cycle(
                 gateway_code=identity.gateway_code,

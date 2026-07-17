@@ -5,6 +5,7 @@ from dnp3_gateway.backend.config_client import (
     DeviceConfig,
     GatewayConfig,
     GatewayConfigError,
+    PendingCommand,
     SignalConfig,
 )
 
@@ -13,5 +14,6 @@ __all__ = [
     "DeviceConfig",
     "GatewayConfig",
     "GatewayConfigError",
+    "PendingCommand",
     "SignalConfig",
 ]
