@@ -17,6 +17,7 @@ Varsayilan akis:
 JetStreamPublisher legacy/rollback icin durur; TELEMETRY_PUBLISHER=nats ile acilir.
 """
 
+from dnp3_gateway.messaging.command_ledger import CommandLedger
 from dnp3_gateway.messaging.http_publisher import (
     HttpTelemetryNotReadyError,
     HttpTelemetryPublisher,
@@ -31,6 +32,7 @@ from dnp3_gateway.messaging.outbox import Outbox, OutboxFullError, OutboxRetrier
 from dnp3_gateway.messaging.resilient_publisher import ResilientPublisher
 
 __all__ = [
+    "CommandLedger",
     "HttpTelemetryPublisher",
     "HttpTelemetryPublishError",
     "HttpTelemetryNotReadyError",

@@ -32,7 +32,7 @@ from dnp3_gateway.backend import BackendConfigClient, GatewayConfigError
 from dnp3_gateway.config import Settings, settings
 from dnp3_gateway.health_server import GatewayMetrics, start_health_server
 from dnp3_gateway.logging_setup import configure_logging, register_secret
-from dnp3_gateway.messaging import Outbox, OutboxRetrier
+from dnp3_gateway.messaging import CommandLedger, Outbox, OutboxRetrier
 from dnp3_gateway.messaging.resilient_publisher import ResilientPublisher
 from dnp3_gateway.poller import run_poll_cycle
 from dnp3_gateway.state import GatewayState
@@ -147,6 +147,87 @@ def _execute_pending_commands(reader, state: GatewayState, pending) -> list[dict
     return results
 
 
+def _run_command_poll(
+    *,
+    client: BackendConfigClient,
+    reader,
+    state: GatewayState,
+    ledger,
+    stop_event: Event,
+    poll_sec: int,
+    config_wake: Event,
+) -> None:
+    """Hafif komut-poll thread'i (config'ten AYRI, ~1sn).
+
+    Her dongu:
+      1. GET /pending -> komutlar + config_nonce + refresh_nonce (state'e uygula)
+      2. Bekleyen komutlari command_ledger ile IDEMPOTENT calistir:
+         start_dispatch(id) False -> zaten islendi, ATLA (restart-safe dedup);
+         True -> CROB gonder, record_result.
+      3. Sonuclari at-least-once teslim et (pending_results -> report ->
+         mark_delivered / dead_letter).
+      4. config_nonce arttiysa config thread'ini erken uyandir (config_wake.set).
+
+    Komut anlik gelsin diye kisa interval. Config'in agir serialize'i YOK.
+    """
+    while not stop_event.is_set():
+        try:
+            poll = client.fetch_pending_commands()
+            state.apply_pending_poll(poll)
+
+            # config degisti -> config thread'i hemen cek
+            if state.take_config_refresh_request():
+                config_wake.set()
+                logger.info("config_refresh_triggered_by_nonce gateway=%s", client.gateway_code)
+
+            # Komutlari idempotent calistir
+            pending = state.take_pending_commands()
+            fresh = []
+            for cmd in pending:
+                if ledger.start_dispatch(cmd.id):
+                    fresh.append(cmd)  # yeni -> calistir
+                # False -> zaten dispatch edilmis (restart/duplicate), atla
+            if fresh:
+                results = _execute_pending_commands(reader, state, fresh)
+                for res in results:
+                    ledger.record_result(res)
+
+            # At-least-once sonuc teslimi (bu turdaki + onceki turlardan kalanlar)
+            _deliver_ledger_results(client, ledger)
+        except GatewayConfigError as exc:
+            # /pending erisilemedi — bir sonraki turda tekrar denenir (komut
+            # ledger'da guvende; kaybolmaz).
+            logger.warning("command_poll_error gateway=%s error=%s", client.gateway_code, exc)
+        except Exception:  # noqa: BLE001
+            logger.exception("command_poll_unexpected gateway=%s", client.gateway_code)
+        stop_event.wait(timeout=max(1, poll_sec))
+
+
+def _deliver_ledger_results(client: BackendConfigClient, ledger) -> None:
+    """command_ledger'da teslim bekleyen sonuclari backend'e bildir (at-least-once).
+
+    Basarili -> mark_delivered. Bildirim hata verirse ledger'da 'pending' kalir,
+    bir sonraki turda tekrar denenir (dead_letter'a dusurmuyoruz — gecici ag
+    hatasi kalici olmasin; operator health'te pending_result_count gorur).
+    """
+    pending_results = ledger.pending_results()
+    if not pending_results:
+        return
+    try:
+        client.report_command_results(pending_results)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "command_result_delivery_failed count=%d error=%s — sonraki turda tekrar",
+            len(pending_results), exc,
+        )
+        return
+    for res in pending_results:
+        try:
+            ledger.mark_delivered(int(res["id"]))
+        except Exception:  # noqa: BLE001
+            logger.debug("ledger_mark_delivered_failed id=%r", res.get("id"), exc_info=True)
+
+
 def _run_config_refresh(
     *,
     client: BackendConfigClient,
@@ -154,9 +235,14 @@ def _run_config_refresh(
     config_ready: Event,
     stop_event: Event,
     refresh_sec: int,
+    config_wake: Event | None = None,
 ) -> None:
-    """Backend config refresh thread'i. Basarili durumda sabit interval;
+    """Backend config refresh thread'i. Basarili durumda sabit interval (5dk);
     hata durumunda exponential backoff (`refresh_sec → 2*refresh_sec → ... → 300s cap`).
+
+    `config_wake`: komut-poll config_nonce artisini gorunce bu Event'i set eder;
+    thread interval'i beklemeyi birakip config'i HEMEN ceker (cihaz IP/ayar
+    degisince ~1sn'de yansir, 5dk beklenmez).
 
     401/403/404 hatalarinda spesifik mesaj uretir; bu durumlar genelde manuel
     duzeltme gerektirir (token degismis, gateway code yanlis vs.) — health
@@ -198,8 +284,14 @@ def _run_config_refresh(
                         "gateway_polling_suspended gateway=%s (is_active=False)",
                         config.gateway_code,
                     )
-            # Saglikli refresh — sabit interval'a don
-            stop_event.wait(timeout=base_interval)
+            # Saglikli refresh — sabit interval bekle AMA config_nonce tetigi
+            # gelirse erken uyan (config degisti, hemen cek). config_wake
+            # komut-poll tarafindan set edilir; uyaninca temizlenir.
+            if config_wake is not None:
+                config_wake.wait(timeout=base_interval)
+                config_wake.clear()
+            else:
+                stop_event.wait(timeout=base_interval)
             continue
         except GatewayConfigError as exc:
             err = str(exc)
@@ -531,6 +623,20 @@ def run(current_settings: Settings | None = None) -> int:
     # yerine kontrollu duraklatma).
     outbox_path = Path(cfg.gateway_state_dir) / f"outbox_{identity.gateway_code}.db"
     outbox = Outbox(outbox_path, max_pending=cfg.outbox_max_pending)
+
+    # Komut ledger (restart-safe idempotency + at-least-once sonuc teslimi).
+    # start_dispatch duplicate CROB'u onler; acilista recover_unknown_results
+    # yarim kalmis komutlari backend'e 'unknown' bildirir.
+    ledger_path = Path(cfg.gateway_state_dir) / f"command_ledger_{identity.gateway_code}.db"
+    command_ledger = CommandLedger(ledger_path)
+    _recovered = command_ledger.recover_unknown_results()
+    if _recovered:
+        logger.warning(
+            "command_ledger_recovered count=%d — yarim kalmis komutlar 'unknown' bildirilecek",
+            len(_recovered),
+        )
+    # config degisince config thread'ini erken uyandirmak icin Event.
+    config_wake = Event()
     pending = outbox.pending_count()
     dead_letter_count = outbox.dead_letter_count()
     if pending:
@@ -595,11 +701,36 @@ def run(current_settings: Settings | None = None) -> int:
             "config_ready": config_ready,
             "stop_event": stop_event,
             "refresh_sec": cfg.config_refresh_sec,
+            "config_wake": config_wake,
         },
         name="config-refresh",
         daemon=True,
     )
     refresh_thread.start()
+
+    # Hafif komut-poll thread'i (config'ten AYRI, ~1sn). Komutlar burada gelir;
+    # config 5dk'da bir. reader operate_device destekliyorsa baslat.
+    command_thread: Thread | None = None
+    if hasattr(reader, "operate_device"):
+        command_thread = Thread(
+            target=_run_command_poll,
+            kwargs={
+                "client": config_client,
+                "reader": reader,
+                "state": state,
+                "ledger": command_ledger,
+                "stop_event": stop_event,
+                "poll_sec": cfg.command_poll_sec,
+                "config_wake": config_wake,
+            },
+            name="command-poll",
+            daemon=True,
+        )
+        command_thread.start()
+        logger.info(
+            "command_poll_started gateway=%s poll_sec=%d (config_refresh_sec=%d)",
+            identity.gateway_code, cfg.command_poll_sec, cfg.config_refresh_sec,
+        )
 
     _install_signal_handlers(stop_event)
 
@@ -637,22 +768,8 @@ def run(current_settings: Settings | None = None) -> int:
             except Exception:  # noqa: BLE001
                 logger.exception("manual_refresh_all_dispatch_failed")
 
-            # Bekleyen cihaz komutlari (config-poll ile geldi): her birini
-            # operate_device (CROB) ile calistir, sonuclari backend'e bildir.
-            # Gateway NAT arkasinda oldugundan komut sadece bu pull kanaliyla
-            # gelebilir (backend gateway'e ulasamaz).
-            if not stop_event.is_set() and hasattr(reader, "operate_device"):
-                pending = state.take_pending_commands()
-                if pending:
-                    results = _execute_pending_commands(reader, state, pending)
-                    try:
-                        config_client.report_command_results(results)
-                    except Exception:  # noqa: BLE001
-                        # Bildirim basarisiz — komut CALISTI ama sonuc gitmedi.
-                        # Backend komutu 'sent' tutar; operator UI'da sonuc
-                        # gormezse tekrar tetikleyebilir. Bir sonraki poll'de
-                        # tekrar denemeyiz (kuyruk temizlendi) — kabul edilebilir.
-                        logger.exception("command_results_report_failed")
+            # NOT: Komut calistirma artik AYRI _run_command_poll thread'inde
+            # (config'ten ayrildi, ~1sn). Ana dongu sadece DNP3 okuma/publish yapar.
             due_count = len(state.due_devices(now_monotonic))
             published = run_poll_cycle(
                 gateway_code=identity.gateway_code,
@@ -684,6 +801,18 @@ def run(current_settings: Settings | None = None) -> int:
         # adimda hata olursa sonraki adim yine calisir, tum kaynak temizlenir.
         logger.info("dnp3_gateway_shutdown_starting")
         stop_event.set()
+        config_wake.set()  # config thread wait()'ten erken uyansin
+
+        # 0) Komut-poll thread + ledger kapat.
+        try:
+            if command_thread is not None and command_thread.is_alive():
+                command_thread.join(timeout=5.0)
+        except Exception:  # noqa: BLE001
+            logger.debug("command_thread_join_error", exc_info=True)
+        try:
+            command_ledger.close()
+        except Exception:  # noqa: BLE001
+            logger.debug("command_ledger_close_error", exc_info=True)
 
         # 1) Config refresh thread: stop_event set, thread'in mevcut wait()
         # sonlanir; join ile gerçekten bittigini bekle. Daemon=True olsa bile

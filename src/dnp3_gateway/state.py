@@ -61,6 +61,11 @@ class GatewayState:
         # bayrak doner ve poller integrity poll tetikler.
         self._refresh_nonce: int = 0
         self._refresh_pending: bool = False
+        # Config degisiklik sayaci. Komut-poll (1sn) config_nonce'u okur; artmissa
+        # _config_refresh_pending=True -> config thread erken tetiklenir (5dk
+        # poll'u beklemez). Boylece cihaz IP/ayar degisince gateway ~1sn'de ceker.
+        self._config_nonce: int = 0
+        self._config_refresh_pending: bool = False
         # Bekleyen cihaz komutlari (config-poll ile gelir). update() yeni
         # (gorulmemis id) komutlari kuyruga alir; poll loop take_pending_commands
         # ile OKUYUP TEMIZLER, calistirir. _seen_command_ids idempotent dedup:
@@ -117,6 +122,15 @@ class GatewayState:
             elif new_nonce < self._refresh_nonce:
                 # backend reset yapmis olabilir (test) — sessizce takip et
                 self._refresh_nonce = new_nonce
+            # config_nonce senkron: config basariyla cekildi -> gateway artik
+            # guncel. Komut-poll'un tekrar "config degisti" tetiklemesini onle.
+            try:
+                cfg_nonce = int(getattr(config, "config_nonce", 0) or 0)
+            except (TypeError, ValueError):
+                cfg_nonce = 0
+            if cfg_nonce >= self._config_nonce:
+                self._config_nonce = cfg_nonce
+                self._config_refresh_pending = False
             # Bekleyen komutlar: gorulmemis id'leri kuyruga al (idempotent dedup).
             # Ayni komut config'te tekrar gelirse (backend result bildirilene
             # kadar 'sent' olarak tutar; ama ETag miss'te tekrar gonderebilir)
@@ -148,11 +162,59 @@ class GatewayState:
         Poll loop her cycle cagirir; donen komutlari operate_device ile
         calistirir ve sonuclari backend'e bildirir. Kuyruk temizlenir ama
         _seen_command_ids KORUNUR (ayni id tekrar gelirse yeniden calistirilmaz).
+
+        NOT: Yeni mimaride komutlar apply_pending_poll ile /pending'den gelir;
+        bu metod hala kuyrugu bosaltir (config-poll geriye uyum + pending-poll
+        ikisi de _pending_commands'a yazar).
         """
         with self._lock:
             cmds = self._pending_commands
             self._pending_commands = []
             return cmds
+
+    def apply_pending_poll(self, poll) -> None:
+        """Hafif komut-poll (/pending) yanitini isle: komut + nonce'lar.
+
+        Komut-poll thread'i her 1sn'de cagirir. `poll`: PendingPoll
+        (commands, config_nonce, refresh_nonce, is_active).
+          - Yeni (gorulmemis id) komutlari kuyruga al (idempotent dedup —
+            command_ledger otoritatif ama in-memory dedup da tutulur).
+          - config_nonce artmissa config-refresh tetigini isaretle (config
+            thread erken uyanir).
+          - refresh_nonce artmissa integrity poll tetigini isaretle.
+        """
+        with self._lock:
+            for cmd in getattr(poll, "commands", ()) or ():
+                if cmd.id not in self._seen_command_ids:
+                    self._seen_command_ids.add(cmd.id)
+                    self._pending_commands.append(cmd)
+            try:
+                cn = int(getattr(poll, "config_nonce", 0) or 0)
+            except (TypeError, ValueError):
+                cn = 0
+            if cn > self._config_nonce:
+                self._config_refresh_pending = True
+                self._config_nonce = cn
+            elif cn < self._config_nonce:
+                self._config_nonce = cn  # backend reset (test)
+            try:
+                rn = int(getattr(poll, "refresh_nonce", 0) or 0)
+            except (TypeError, ValueError):
+                rn = 0
+            if rn > self._refresh_nonce:
+                self._refresh_pending = True
+                self._refresh_nonce = rn
+            elif rn < self._refresh_nonce:
+                self._refresh_nonce = rn
+
+    def take_config_refresh_request(self) -> bool:
+        """config_nonce arttiysa (config degisti) True doner — config thread
+        erken uyanip config'i HEMEN ceker. Tek seferlik tuketilir."""
+        with self._lock:
+            if self._config_refresh_pending:
+                self._config_refresh_pending = False
+                return True
+            return False
 
     def record_refresh_error(self, error: str) -> None:
         """Config refresh denemesi basarisiz olursa caller cagirir.

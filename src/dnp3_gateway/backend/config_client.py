@@ -107,6 +107,21 @@ class PendingCommand:
 
 
 @dataclass(frozen=True)
+class PendingPoll:
+    """Hafif komut-poll yaniti (GET /gateways/{code}/pending).
+
+    Config'ten AYRI: komutlar + iki nonce. Gateway 1sn'de bir ceker; nonce'lar
+    degistiyse ilgili tetigi calistirir (config_nonce->config'i hemen cek,
+    refresh_nonce->integrity poll).
+    """
+
+    commands: tuple[PendingCommand, ...] = ()
+    config_nonce: int = 0
+    refresh_nonce: int = 0
+    is_active: bool = True
+
+
+@dataclass(frozen=True)
 class GatewayConfig:
     gateway_code: str
     gateway_name: str
@@ -119,8 +134,11 @@ class GatewayConfig:
     # Operator "tum cihazlara sorgu at" sayaci. Bir oncekiyle karsilastirilarak
     # integrity poll tetiklemesi yapilir; kalici state.py icinde tutulur.
     refresh_nonce: int = 0
-    # Backend'in gonderdigi bekleyen cihaz komutlari. Her poll'de gelir;
-    # state gorulmus id'leri dedup eder, poll loop calistirir + sonuc bildirir.
+    # Config degisiklik sayaci. config-poll'de senkronlanir (komut-poll otoritatif
+    # tetikler). state.py bunu izler; artmissa config erken cekilir.
+    config_nonce: int = 0
+    # DEPRECATED: komut artik /pending endpoint'inden gelir (config'ten ayrildi).
+    # Geriye uyum icin alan duruyor; yeni backend config'te BOS doner.
     pending_commands: tuple[PendingCommand, ...] = ()
 
 
@@ -319,6 +337,93 @@ class BackendConfigClient:
             )
 
         return _parse_gateway_config(data, default_gateway_code=self.gateway_code)
+
+    def fetch_pending_commands(self) -> "PendingPoll":
+        """Hafif komut-poll — GET /gateways/{code}/pending.
+
+        Config'ten AYRI: sadece bekleyen komutlar + config_nonce + refresh_nonce
+        (agir device/signal serialize YOK). Gateway 1sn'de bir cagirir. HMAC
+        imza fetch_config ile ayni sekilde dogrulanir (MITM/komut enjekte koruma).
+
+        Hata -> GatewayConfigError (caller loglar, bir sonraki poll'de tekrar dener).
+        """
+        import hashlib as _hashlib
+        import hmac as _hmac
+        import json as _json
+
+        url = f"{self.base_url}/gateways/{self.gateway_code}/pending"
+        headers = build_config_request_headers(self.identity)
+        try:
+            response = self._session.get(url, headers=headers, timeout=self.timeout_sec)
+        except requests.RequestException as exc:
+            err = _scrub_token_from_text(str(exc), self.identity.token)
+            raise GatewayConfigError(f"pending request failed: {err}") from exc
+
+        if response.status_code != 200:
+            preview = _scrub_token_from_text((response.text or "")[:200], self.identity.token)
+            raise GatewayConfigError(
+                f"pending request returned {response.status_code}: {preview}"
+            )
+
+        body_bytes = response.content
+        if len(body_bytes) > self._response_max_bytes:
+            raise GatewayConfigError("pending response too large")
+
+        # HMAC imza dogrulama (fetch_config ile ayni; best-effort, header varsa).
+        sig_header = (response.headers.get("X-Config-Signature") or "").strip().lower()
+        if sig_header:
+            expected = _hmac.new(
+                self.identity.token.encode("utf-8"), body_bytes, _hashlib.sha256
+            ).hexdigest()
+            if not _hmac.compare_digest(sig_header, expected):
+                raise GatewayConfigError(
+                    "pending response signature mismatch — MITM/kompromize, reddedildi"
+                )
+
+        try:
+            data: dict[str, Any] = _json.loads(body_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise GatewayConfigError(f"pending response is not json: {exc}") from exc
+        if not isinstance(data, dict):
+            raise GatewayConfigError("pending response root must be object")
+
+        # Komutlar (defansif parse; bozuk komut atlanir).
+        cmds: list[PendingCommand] = []
+        raw_cmds = data.get("commands")
+        if isinstance(raw_cmds, list):
+            for item in raw_cmds:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    cmds.append(
+                        PendingCommand(
+                            id=int(item["id"]),
+                            device_code=str(item["device_code"]),
+                            command=str(item.get("command") or ""),
+                            dnp3_index=int(item["dnp3_index"]),
+                            op_type=str(item.get("op_type") or "pulse_on"),
+                            count=int(item.get("count", 1) or 1),
+                            on_time_ms=int(item.get("on_time_ms", 100) or 100),
+                            off_time_ms=int(item.get("off_time_ms", 100) or 100),
+                        )
+                    )
+                except (KeyError, TypeError, ValueError) as exc:
+                    _logging.getLogger(__name__).warning(
+                        "pending_command_parse_failed id=%r error=%s", item.get("id"), exc
+                    )
+
+        def _int(key: str) -> int:
+            try:
+                return int(data.get(key, 0) or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        return PendingPoll(
+            commands=tuple(cmds),
+            config_nonce=_int("config_nonce"),
+            refresh_nonce=_int("refresh_nonce"),
+            is_active=bool(data.get("is_active", True)),
+        )
 
     def report_command_results(self, results: list[dict]) -> None:
         """Calistirilan komut sonuclarini backend'e bildirir (batch POST).
@@ -710,6 +815,11 @@ def _parse_gateway_config(data: dict[str, Any], *, default_gateway_code: str) ->
                     exc,
                 )
 
+    try:
+        config_nonce = int(data.get("config_nonce", 0) or 0)
+    except (TypeError, ValueError):
+        config_nonce = 0
+
     return GatewayConfig(
         gateway_code=str(data.get("gateway_code") or default_gateway_code),
         gateway_name=str(data.get("gateway_name") or ""),
@@ -720,5 +830,6 @@ def _parse_gateway_config(data: dict[str, Any], *, default_gateway_code: str) ->
         devices=devices,
         signals=signals,
         refresh_nonce=refresh_nonce,
+        config_nonce=config_nonce,
         pending_commands=tuple(pending_commands),
     )

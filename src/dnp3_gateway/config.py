@@ -173,7 +173,13 @@ class Settings(BaseSettings):
         default=None,
         description="TLS icin ozel CA bundle yolu; bos = sistem varsayilani + verify_ssl",
     )
-    config_refresh_sec: int = Field(default=30, ge=5, le=3600)
+    # Config nadir degisir -> seyrek cek (5dk). Config degisince backend
+    # config_nonce'u artirir; komut-poll bunu gorup config'i HEMEN ceker (5dk
+    # beklemez). Komut artik AYRI command_poll_sec kanaliyla gelir.
+    config_refresh_sec: int = Field(default=300, ge=5, le=3600)
+    # Hafif komut-poll araligi: pending komutlar + nonce'lar. Komut anlik gelsin
+    # diye kisa (1sn). GET /gateways/{code}/pending — agir config serialize yok.
+    command_poll_sec: int = Field(default=1, ge=1, le=60)
     config_timeout_sec: int = Field(default=5, ge=1, le=60)
     config_cache_max_age_hours: float = Field(
         default=24.0,
