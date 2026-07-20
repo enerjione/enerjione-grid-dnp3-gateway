@@ -292,19 +292,6 @@ def _make_soe_handler(cache: _DeviceCache, device_code: str) -> Any:
             if not values:
                 return
             first = values[0].value
-            # TESHIS (pasif, sifir-risk): gelen fragment'in tipini + eleman
-            # sayisini logla. OctetString (G110) gelip gelmedigini gormek icin.
-            # Yeni istek URETMEZ — sadece gozlem. String sorunu cozulunce kaldir.
-            try:
-                logger.info(
-                    "yadnp3_soe_fragment device=%s first_type=%s count=%s indexes=%s",
-                    device_code,
-                    type(first).__name__,
-                    len(values),
-                    [getattr(it, "index", "?") for it in values][:12],
-                )
-            except Exception:  # noqa: BLE001
-                pass
             try:
                 if isinstance(first, opendnp3.Binary):
                     for it in values:
@@ -499,6 +486,22 @@ class _ManagedMaster:
             self._soe,
             opendnp3.TaskConfig.Default(),
         )
+        # G110 (Octet String) DAR-RANGE scan. Teshis (2026-07-20) kanitladi:
+        # cihaz integrity poll'de (ClassField 0+1+2+3) G110 DONDURMUYOR — SOE
+        # fragment'larinda Binary/Analog/Counter/BinaryOutput/AnalogOutput var,
+        # OctetString YOK. "Not Class 0" oldugu icin explicit read gerek.
+        #
+        # KRITIK GUVENLIK (Mayis'ta cihazi bozan 0-65535 range'inden KACIN):
+        #   - SADECE var olan iki dar blok istenir: 3-23 ve 65000-65020.
+        #     (Katalog master G110 index'leri: 3,7,10,13,16,17,19-23,
+        #      65000-65003,65009-65014,65020 — iki kumede topli.)
+        #   - COK SEYREK: baseline * 10 (default 600s=10dk). String'ler statik
+        #     (seri no/IMEI/IP nadir degisir), modem'i surekli uyandirmaz.
+        #   - Ad-hoc Demand()/ScanRange fallback YOK (task queue doymasin).
+        #   - API yoksa sessizce atla; hata gateway'i bozmaz.
+        self._scan_g110_a = None
+        self._scan_g110_b = None
+        self._add_g110_range_scans()
         self._master.Enable()
         logger.info(
             "yadnp3_master_enabled device=%s mode=%s endpoint=%s remote=%s local=%s "
@@ -511,6 +514,61 @@ class _ManagedMaster:
             self._scan_interval_sec,
             self._baseline_interval_sec,
         )
+
+    def _g110_gvid(self):
+        """GroupVariationID(110, 0) — surum farki icin iki isim dener."""
+        for name in ("GroupVariationID", "GroupVariation"):
+            cls = getattr(opendnp3, name, None)
+            if cls is not None:
+                try:
+                    return cls(110, 0)
+                except Exception:  # noqa: BLE001
+                    continue
+        return None
+
+    def _add_g110_range_scans(self) -> None:
+        """Iki dar G110 range scan ekle (3-23, 65000-65020). COK seyrek period.
+
+        AddRangeScan yoksa (eski binding) sessizce atlanir. 0-65535 ASLA
+        istenmez — dagininik index'lerde retry firtinasi cihazi bozar (Mayis
+        2026 deneyimi, revert 1302b83)."""
+        gv = self._g110_gvid()
+        add_range = getattr(self._master, "AddRangeScan", None)
+        if gv is None or add_range is None:
+            logger.warning(
+                "yadnp3_g110_scan_unavailable device=%s — AddRangeScan/"
+                "GroupVariationID yok; string sinyaller okunamaz.",
+                self.device.code,
+            )
+            return
+        # baseline * 10, min 600s (10dk). String'ler statik; seyrek yeterli.
+        period = max(600, int(self._baseline_interval_sec) * 10)
+        # (start, stop) — SADECE var olan iki blok. Aralikta olmayan index'ler
+        # (orn 4,5,6 in 3-23) NULL doner; aralik dar oldugu icin retry firtinasi
+        # olmaz (0-65535'in aksine).
+        ranges = [(3, 23), (65000, 65020)]
+        scans = []
+        for start, stop in ranges:
+            try:
+                scan = add_range(
+                    gv, int(start), int(stop),
+                    opendnp3.TimeDuration.Seconds(period),
+                    self._soe,
+                    opendnp3.TaskConfig.Default(),
+                )
+                scans.append(scan)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "yadnp3_g110_range_scan_failed device=%s range=%s-%s",
+                    self.device.code, start, stop,
+                )
+        if scans:
+            self._scan_g110_a = scans[0] if len(scans) > 0 else None
+            self._scan_g110_b = scans[1] if len(scans) > 1 else None
+            logger.info(
+                "yadnp3_g110_scan_enabled device=%s ranges=%s period=%ss",
+                self.device.code, ranges, period,
+            )
 
     def shutdown(self) -> None:
         try:
