@@ -203,7 +203,7 @@ def _outbox_snapshot(publisher: Any) -> dict[str, Any]:
         "outbox_dead_letter": None,
         "outbox_max_pending": None,
         "last_outbox_error": None,
-        # Broker (NATS JetStream) telemetrisi
+        # Broker (HTTP/NATS) telemetrisi
         "broker_ready": None,
         "broker_publish_failures": None,
         "broker_publish_successes": None,
@@ -231,7 +231,7 @@ def _outbox_snapshot(publisher: Any) -> dict[str, Any]:
             snap["outbox_max_pending"] = int(publisher.outbox_max_pending)
         except Exception:  # noqa: BLE001
             pass
-        # Broker (JetStream) counters — `_broker` private attribute ama
+        # Broker (HTTP/NATS) counters — `_broker` private attribute ama
         # ResilientPublisher API'sinde public bir erişim yok; geçici olarak
         # buradan okuyoruz. Daha sonra ResilientPublisher.broker_status()
         # public method ile temizlenebilir.

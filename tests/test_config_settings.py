@@ -25,7 +25,8 @@ def test_settings_defaults_are_sensible() -> None:
     # Default FALSE — public host'a clear-text HTTP/nats:// validator
     # tarafindan reddedilir; bilincli opt-out gerekir.
     assert s.gateway_insecure_allow_plaintext is False
-    # 0.4.x: NATS publish timeout default 2.0sn (yerel/LAN icin makul)
+    # Varsayilan telemetri yolu: backend HTTP ingest. NATS legacy rollback.
+    assert s.telemetry_publisher == "http"
     assert s.nats_publish_timeout_sec == pytest.approx(2.0)
 
 
@@ -82,10 +83,11 @@ def test_prod_rejects_http_to_public_ip(monkeypatch: pytest.MonkeyPatch) -> None
 def test_prod_rejects_nats_clear_text_to_public_host(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Backend HTTPS, ama NATS hala public clear-text — yine reddedilmeli."""
+    """Legacy NATS publisher secilirse public clear-text reddedilmeli."""
     monkeypatch.setenv("APP_ENVIRONMENT", "production")
     monkeypatch.setenv("GATEWAY_TOKEN", _strong_token())
     monkeypatch.setenv("BACKEND_API_URL", "https://api.example.com/api/v1")
+    monkeypatch.setenv("TELEMETRY_PUBLISHER", "nats")
     monkeypatch.setenv("NATS_URL", "nats://nats.example.com:4222")
     with pytest.raises(ValueError, match="public NATS host"):
         Settings(_env_file=None)  # type: ignore[call-arg]
@@ -102,6 +104,16 @@ def test_prod_allows_public_http_when_insecure_opt_in(
     monkeypatch.setenv("GATEWAY_INSECURE_ALLOW_PLAINTEXT", "true")
     s = Settings(_env_file=None)  # type: ignore[call-arg]
     assert s.gateway_insecure_allow_plaintext is True
+
+
+def test_prod_http_publisher_ignores_nats_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default HTTP publisher icin NATS_URL rollback ayari validate edilmez."""
+    monkeypatch.setenv("APP_ENVIRONMENT", "production")
+    monkeypatch.setenv("GATEWAY_TOKEN", _strong_token())
+    monkeypatch.setenv("BACKEND_API_URL", "https://api.example.com/api/v1")
+    monkeypatch.setenv("NATS_URL", "nats://nats.example.com:4222")
+    s = Settings(_env_file=None)  # type: ignore[call-arg]
+    assert s.telemetry_publisher == "http"
 
 
 def test_prod_accepts_https_public(monkeypatch: pytest.MonkeyPatch) -> None:

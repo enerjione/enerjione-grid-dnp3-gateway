@@ -6,7 +6,7 @@ Calisma akisi:
        konfigurasyon ceker ve `GatewayState`'i gunceller.
     3. Ana thread `default_poll_interval_sec` araliginda uyanip okunma vakti
        gelen cihazlari `poller.run_poll_cycle` ile okur/yayinlar.
-       Telemetri NATS JetStream'e basilir (primary publisher).
+       Telemetri backend HTTP ingest'e yollanir (varsayilan publisher).
     4. SIGINT/SIGTERM/SIGBREAK alindiginda graceful shutdown:
          - config refresh thread durdurulur
          - poller kapanir
@@ -367,12 +367,13 @@ def run(current_settings: Settings | None = None) -> int:
             flush=True,
         )
     logger.info(
-        "dnp3_gateway_starting version=%s gateway=%s instance=%s env=%s mode=%s backend=%s",
+        "dnp3_gateway_starting version=%s gateway=%s instance=%s env=%s mode=%s publisher=%s backend=%s",
         __version__,
         identity.gateway_code,
         identity.instance_id,
         identity.app_environment,
         cfg.gateway_mode,
+        cfg.telemetry_publisher,
         cfg.backend_api_url,
     )
     # Deprecation uyarisi: nats_dual_publish_enabled artik anlamsiz (JetStream
@@ -493,33 +494,37 @@ def run(current_settings: Settings | None = None) -> int:
     # health_server start sonrasi yazdirilir.
     _print_console_banner(cfg=cfg, identity=identity, actual_health_port=actual_health_port)
 
-    # PRIMARY publisher: NATS JetStream. Gateway artik telemetriyi DIRECT
-    # JetStream'e basar. RabbitMQ telemetri akisindan kaldirildi (alarm.created
-    # icin backend tarafinda kalmaya devam ediyor — gateway onunla ilgilenmez).
-    #
-    # NATS server'a bagklanti ANINDA olmayabilir — JetStreamPublisher non-blocking
-    # baslar (background'da reconnect). O sirada publish() raise eder, mesajlar
-    # outbox'a yazilir ve baglanti gelince retrier bosaltir. Mesaj kaybi YOK.
-    from dnp3_gateway.messaging.jetstream_publisher import JetStreamPublisher
+    if cfg.telemetry_publisher == "nats":
+        # Legacy/rollback publisher: NATS JetStream.
+        from dnp3_gateway.messaging.jetstream_publisher import JetStreamPublisher
 
-    broker = JetStreamPublisher.create(
-        url=cfg.nats_url,
-        subject_prefix=cfg.nats_subject_prefix,
-        gateway_code=identity.gateway_code,
-        connect_timeout_sec=cfg.nats_connect_timeout_sec,
-        publish_timeout_sec=cfg.nats_publish_timeout_sec,
-        tls_ca_path=cfg.nats_tls_ca_path,
-        credentials_path=cfg.nats_credentials_path,
-    )
-    if broker is None:
-        # nats-py paketi yok (production'da requirements'ta; sadece dev koruma).
-        logger.error(
-            "jetstream_publisher_create_failed — nats-py paketi yuklu degil. "
-            "Gateway baslamiyor. requirements.txt + pip install -r"
+        broker = JetStreamPublisher.create(
+            url=cfg.nats_url,
+            subject_prefix=cfg.nats_subject_prefix,
+            gateway_code=identity.gateway_code,
+            connect_timeout_sec=cfg.nats_connect_timeout_sec,
+            publish_timeout_sec=cfg.nats_publish_timeout_sec,
+            tls_ca_path=cfg.nats_tls_ca_path,
+            credentials_path=cfg.nats_credentials_path,
         )
-        raise SystemExit(1)
+        if broker is None:
+            logger.error(
+                "jetstream_publisher_create_failed — nats-py paketi yuklu degil. "
+                "Gateway baslamiyor. requirements.txt + pip install -r"
+            )
+            raise SystemExit(1)
+    else:
+        # Varsayilan publisher: backend HTTP ingest. NAT arkasinda outbound HTTPS yeterli.
+        from dnp3_gateway.messaging.http_publisher import HttpTelemetryPublisher
 
-    # Outbox: JetStream'e (veya broker'a) yayinlanmamis mesajlari diske yazar,
+        broker = HttpTelemetryPublisher(
+            base_url=cfg.backend_api_url,
+            identity=identity,
+            timeout_sec=cfg.config_timeout_sec,
+            verify=_tls_verify_param(cfg),
+        )
+
+    # Outbox: broker'a yayinlanmamis mesajlari diske yazar,
     # retrier sonra gonderir. Process restart'a dayanikli (kalici SQLite);
     # at-least-once delivery. Disk-full koruma: max_pending asilirsa publisher
     # OutboxFullError raise eder, poller cycle'i durdurur (sessiz veri kaybi
@@ -707,7 +712,7 @@ def run(current_settings: Settings | None = None) -> int:
         except Exception:  # noqa: BLE001
             logger.debug("retrier_stop_error", exc_info=True)
 
-        # 4) Broker publisher (JetStream): drain + connection kapanir
+        # 4) Broker publisher (HTTP/NATS): connection kapanir
         try:
             publisher.close()
         except Exception:  # noqa: BLE001

@@ -187,14 +187,19 @@ class Settings(BaseSettings):
         ),
     )
 
-    # ----- NATS JetStream (PRIMARY — gateway'in tek telemetri yayinlama yolu) -
-    # Gateway artik tum telemetriyi DIRECT JetStream'e basar. RabbitMQ telemetri
-    # akisindan kaldirildi; sadece backend tarafindaki alarm.created akisi icin
-    # RabbitMQ kullaniliyor — gateway onunla ilgilenmez.
-    #
-    # NATS down olunca: publish hatasi -> outbox'a yazilir -> retrier baglanti
-    # gelince bosaltir. At-least-once garantisi outbox + Nats-Msg-Id broker-side
-    # dedup'i ile saglanir.
+    # ----- Telemetri yayinlama -----------------------------------------------
+    # Varsayilan yol: backend HTTP ingest (`/telemetry/gateway/{code}`). Gateway
+    # NAT arkasinda kalsa bile outbound HTTPS yeterli olur. JetStream yolu legacy
+    # rollback icin tutulur; `TELEMETRY_PUBLISHER=nats` set edilirse kullanilir.
+    telemetry_publisher: str = Field(
+        default="http",
+        description="Telemetri yayin yolu: http (backend ingest) | nats (JetStream legacy)",
+    )
+
+    # ----- NATS JetStream (LEGACY/ROLLBACK) -----------------------------------
+    # HTTP publish down olunca: publish hatasi -> outbox'a yazilir -> retrier
+    # backend gelince bosaltir. NATS yolu sadece TELEMETRY_PUBLISHER=nats ise
+    # kullanilir.
     nats_url: str = Field(
         default="nats://localhost:4222",
         description=(
@@ -546,6 +551,17 @@ class Settings(BaseSettings):
     )
 
     # ----- Validators ---------------------------------------------------------
+    @field_validator("telemetry_publisher")
+    @classmethod
+    def _validate_telemetry_publisher(cls, v: str) -> str:
+        valid = {"http", "nats"}
+        s = (v or "http").strip().lower()
+        if s not in valid:
+            raise ValueError(
+                f"TELEMETRY_PUBLISHER gecersiz: '{v}'. Gecerli: {sorted(valid)}"
+            )
+        return s
+
     @field_validator("dnp3_read_strategy")
     @classmethod
     def _validate_read_strategy(cls, v: str) -> str:
@@ -661,8 +677,8 @@ class Settings(BaseSettings):
           MITM riski.
 
         Sadece Production icin:
-        * NATS_URL bos olamaz; public host'a tls:// zorunlu, private host'a
-          nats:// kabul.
+        * TELEMETRY_PUBLISHER=nats ise NATS_URL bos olamaz; public host'a
+          tls:// zorunlu, private host'a nats:// kabul.
         * Token MIN length staging=16, production=32.
         * GATEWAY_TOKEN placeholder prefix ile baslayamaz (`change-me`,
           `gw-default`, `gw-001-token` vb. — `.env.example` kopyalanip token
@@ -706,35 +722,34 @@ class Settings(BaseSettings):
                     "ile bilincli opt-out yapabilirsiniz (boot'ta WARN log atilir)."
                 )
             if is_prod:
-                # NATS: prod'da bos olamaz. Public host'a TLS zorunlu, private
-                # host'a nats:// kabul. 0.4.x'te telemetri akisinin TEK yolu.
-                nats_url_raw = (self.nats_url or "").strip()
-                if not nats_url_raw:
-                    raise ValueError(
-                        "GUVENLIK: APP_ENVIRONMENT=production'da NATS_URL "
-                        "bos olamaz. Gateway telemetriyi JetStream'e basar; "
-                        "URL set edilmezse hicbir telemetri cati'ya iletilmez."
-                    )
-                nats_parsed = urlparse(nats_url_raw)
-                nats_scheme = nats_parsed.scheme.lower()
-                if nats_scheme not in ("tls", "nats"):
-                    raise ValueError(
-                        f"GUVENLIK: APP_ENVIRONMENT=production'da NATS_URL "
-                        f"tls:// veya nats:// scheme olmali (gelen: {self.nats_url!r})."
-                    )
-                nats_host_private = _host_is_private(nats_parsed.hostname)
-                if (
-                    nats_scheme == "nats"
-                    and not nats_host_private
-                    and not self.gateway_insecure_allow_plaintext
-                ):
-                    raise ValueError(
-                        f"GUVENLIK: APP_ENVIRONMENT=production'da public NATS host "
-                        f"icin tls:// olmali (gelen: {self.nats_url!r}). Clear-text "
-                        "nats:// yalnizca private/loopback ag icin izinlidir. "
-                        "TLS henuz kurulamiyorsa GATEWAY_INSECURE_ALLOW_PLAINTEXT=true "
-                        "ile bilincli opt-out yapabilirsiniz."
-                    )
+                # NATS sadece legacy/rollback publisher secilirse zorunlu.
+                if self.telemetry_publisher == "nats":
+                    nats_url_raw = (self.nats_url or "").strip()
+                    if not nats_url_raw:
+                        raise ValueError(
+                            "GUVENLIK: APP_ENVIRONMENT=production'da "
+                            "TELEMETRY_PUBLISHER=nats icin NATS_URL bos olamaz."
+                        )
+                    nats_parsed = urlparse(nats_url_raw)
+                    nats_scheme = nats_parsed.scheme.lower()
+                    if nats_scheme not in ("tls", "nats"):
+                        raise ValueError(
+                            f"GUVENLIK: APP_ENVIRONMENT=production'da NATS_URL "
+                            f"tls:// veya nats:// scheme olmali (gelen: {self.nats_url!r})."
+                        )
+                    nats_host_private = _host_is_private(nats_parsed.hostname)
+                    if (
+                        nats_scheme == "nats"
+                        and not nats_host_private
+                        and not self.gateway_insecure_allow_plaintext
+                    ):
+                        raise ValueError(
+                            f"GUVENLIK: APP_ENVIRONMENT=production'da public NATS host "
+                            f"icin tls:// olmali (gelen: {self.nats_url!r}). Clear-text "
+                            "nats:// yalnizca private/loopback ag icin izinlidir. "
+                            "TLS henuz kurulamiyorsa GATEWAY_INSECURE_ALLOW_PLAINTEXT=true "
+                            "ile bilincli opt-out yapabilirsiniz."
+                        )
                 if self.show_gateway_token_on_start:
                     raise ValueError(
                         "GUVENLIK: APP_ENVIRONMENT=production'da "
@@ -800,8 +815,8 @@ class Settings(BaseSettings):
                 if (self.rabbitmq_url or "").strip():
                     raise ValueError(
                         "GUVENLIK: APP_ENVIRONMENT=production'da RABBITMQ_URL "
-                        "set edilemez. Gateway 0.4.x ile telemetri NATS JetStream'e "
-                        "tasindi; gateway artik RabbitMQ'ya BAGLANMIYOR. "
+                        "set edilemez. Gateway telemetriyi HTTP ingest veya "
+                        "legacy JetStream ile yollar; RabbitMQ'ya BAGLANMIYOR. "
                         ".env dosyasindan RABBITMQ_URL satirini silin (alarm akisi "
                         "backend tarafinda RabbitMQ'da kalir, gateway'i ilgilendirmez)."
                     )
