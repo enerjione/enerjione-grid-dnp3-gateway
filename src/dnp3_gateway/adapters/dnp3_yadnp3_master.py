@@ -538,8 +538,15 @@ class _ManagedMaster:
             try:
                 scan_range(gv, int(start), int(stop), self._soe, opendnp3.TaskConfig.Default())
                 ok = True
+                # TESHIS: hangi range gonderildi (65000 blogu cihazdan cevap
+                # almiyor - task kuyruga girdi mi gormek icin). Sorun cozulunce
+                # debug'a indir/kaldir.
+                logger.info(
+                    "yadnp3_g110_scan_queued device=%s range=%s-%s",
+                    self.device.code, start, stop,
+                )
             except Exception:  # noqa: BLE001
-                logger.debug(
+                logger.warning(
                     "yadnp3_g110_scan_once_failed device=%s range=%s-%s",
                     self.device.code, start, stop, exc_info=True,
                 )
