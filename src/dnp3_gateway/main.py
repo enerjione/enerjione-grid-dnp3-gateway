@@ -276,6 +276,61 @@ def _run_config_refresh(
         stop_event.wait(timeout=wait_time)
 
 
+def _run_command_poll(
+    *,
+    client: BackendConfigClient,
+    state: GatewayState,
+    stop_event: Event,
+    poll_sec: float,
+) -> None:
+    """Bekleyen komutlari config refresh'ten bagimsiz poll eder."""
+    consecutive_failures = 0
+    interval = max(0.2, poll_sec)
+    while not stop_event.is_set():
+        try:
+            commands = client.fetch_pending_commands()
+            added = state.enqueue_pending_commands(commands)
+            if consecutive_failures:
+                logger.info(
+                    "command_poll_recovered gateway=%s after_failures=%d",
+                    client.gateway_code,
+                    consecutive_failures,
+                )
+                consecutive_failures = 0
+            if added:
+                logger.info(
+                    "pending_commands_received gateway=%s count=%d",
+                    client.gateway_code,
+                    added,
+                )
+            stop_event.wait(interval)
+        except GatewayConfigError as exc:
+            consecutive_failures += 1
+            if consecutive_failures in (1, 5, 30, 100, 1000):
+                logger.warning(
+                    "command_poll_error gateway=%s consecutive=%d error=%s",
+                    client.gateway_code,
+                    consecutive_failures,
+                    exc,
+                )
+            else:
+                logger.debug(
+                    "command_poll_error gateway=%s consecutive=%d error=%s",
+                    client.gateway_code,
+                    consecutive_failures,
+                    exc,
+                )
+            stop_event.wait(min(30.0, interval * (2 ** min(consecutive_failures - 1, 5))))
+        except Exception:  # noqa: BLE001
+            consecutive_failures += 1
+            logger.exception(
+                "command_poll_unexpected_error gateway=%s consecutive=%d",
+                client.gateway_code,
+                consecutive_failures,
+            )
+            stop_event.wait(min(30.0, interval * (2 ** min(consecutive_failures - 1, 5))))
+
+
 def _install_signal_handlers(stop_event: Event) -> None:
     def _handler(signum, _frame):  # type: ignore[no-untyped-def]
         logger.info("signal_received signum=%s shutdown=starting", signum)
@@ -600,6 +655,32 @@ def run(current_settings: Settings | None = None) -> int:
         daemon=True,
     )
     refresh_thread.start()
+    command_client = BackendConfigClient(
+        base_url=cfg.backend_api_url,
+        identity=identity,
+        timeout_sec=cfg.config_timeout_sec,
+        verify=_tls_verify_param(cfg),
+        response_max_bytes=cfg.backend_response_max_bytes,
+    )
+    command_results_client = BackendConfigClient(
+        base_url=cfg.backend_api_url,
+        identity=identity,
+        timeout_sec=cfg.config_timeout_sec,
+        verify=_tls_verify_param(cfg),
+        response_max_bytes=cfg.backend_response_max_bytes,
+    )
+    command_poll_thread = Thread(
+        target=_run_command_poll,
+        kwargs={
+            "client": command_client,
+            "state": state,
+            "stop_event": stop_event,
+            "poll_sec": cfg.command_poll_sec,
+        },
+        name="command-poll",
+        daemon=True,
+    )
+    command_poll_thread.start()
 
     _install_signal_handlers(stop_event)
 
@@ -646,7 +727,7 @@ def run(current_settings: Settings | None = None) -> int:
                 if pending:
                     results = _execute_pending_commands(reader, state, pending)
                     try:
-                        config_client.report_command_results(results)
+                        command_results_client.report_command_results(results)
                     except Exception:  # noqa: BLE001
                         # Bildirim basarisiz — komut CALISTI ama sonuc gitmedi.
                         # Backend komutu 'sent' tutar; operator UI'da sonuc
@@ -699,7 +780,19 @@ def run(current_settings: Settings | None = None) -> int:
         except Exception:  # noqa: BLE001
             logger.debug("refresh_thread_join_error", exc_info=True)
 
-        # 2) Reader: DNP3 master/channel kapanir, TCP RST gonderir
+        # 2) Command poll thread: config refresh ile ayni stop event'i kullanir.
+        try:
+            if command_poll_thread.is_alive():
+                command_poll_thread.join(timeout=5.0)
+                if command_poll_thread.is_alive():
+                    logger.warning(
+                        "command_poll_thread_join_timeout — thread 5s icinde sonlanmadi, "
+                        "shutdown'a devam ediliyor"
+                    )
+        except Exception:  # noqa: BLE001
+            logger.debug("command_poll_thread_join_error", exc_info=True)
+
+        # 3) Reader: DNP3 master/channel kapanir, TCP RST gonderir
         try:
             reader.close()
         except Exception:  # noqa: BLE001

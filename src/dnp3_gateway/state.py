@@ -26,7 +26,7 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 from threading import Lock
-from typing import Any
+from typing import Any, Iterable
 
 from dnp3_gateway.backend import DeviceConfig, GatewayConfig, PendingCommand, SignalConfig
 
@@ -117,18 +117,30 @@ class GatewayState:
             elif new_nonce < self._refresh_nonce:
                 # backend reset yapmis olabilir (test) — sessizce takip et
                 self._refresh_nonce = new_nonce
-            # Bekleyen komutlar: gorulmemis id'leri kuyruga al (idempotent dedup).
-            # Ayni komut config'te tekrar gelirse (backend result bildirilene
-            # kadar 'sent' olarak tutar; ama ETag miss'te tekrar gonderebilir)
-            # yeniden calistirilmaz.
-            for cmd in getattr(config, "pending_commands", ()) or ():
-                if cmd.id not in self._seen_command_ids:
-                    self._seen_command_ids.add(cmd.id)
-                    self._pending_commands.append(cmd)
+            # Bekleyen komutlar config response ile de gelebilir. Ayrı command
+            # poll ile gelenler de ayni dedup alanlarini kullanir.
+            self._enqueue_pending_commands_unsafe(
+                getattr(config, "pending_commands", ()) or ()
+            )
         # disk yazimi lock disinda — dosya I/O sirasinda okuyucular bloklanmasin
         if changed:
             self._persist_unsafe(config, loaded_at_unix=now_unix)
         return changed
+
+    def _enqueue_pending_commands_unsafe(self, commands: Iterable[PendingCommand]) -> int:
+        """Lock altinda yeni command ID'lerini kuyruklar."""
+        added = 0
+        for cmd in commands:
+            if cmd.id not in self._seen_command_ids:
+                self._seen_command_ids.add(cmd.id)
+                self._pending_commands.append(cmd)
+                added += 1
+        return added
+
+    def enqueue_pending_commands(self, commands: Iterable[PendingCommand]) -> int:
+        """Yeni komutlari idempotent olarak kuyruklar, eklenen sayiyi doner."""
+        with self._lock:
+            return self._enqueue_pending_commands_unsafe(commands)
 
     def take_refresh_request(self) -> bool:
         """Operator tetikli refresh-all bayragini OKUYUP TEMIZLER.

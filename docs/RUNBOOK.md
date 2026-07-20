@@ -180,6 +180,14 @@ calisiyor (lock: .gateway_state/instance_GW-001.lock).
 Operator dashboard'dan gateway'i enable'layin. Bir sonraki `CONFIG_REFRESH_SEC`
 cevriminde (default 30sn) yayina geri doner.
 
+### Bekleyen cihaz komutu gec geliyor
+
+Gateway komutlari `GET /gateways/{gateway_code}/commands/pending` ile config
+refresh'ten ayri cekilir. Varsayilan `COMMAND_POLL_SEC=1` ile komut 1-2sn
+icinde calisma kuyruguna girer. Backend endpoint'i 404/5xx donerse gateway
+komut thread'i kapanmaz; backoff ile yeniden dener. Yeni endpoint henuz yoksa
+config response icindeki `pending_commands` alanı geriye uyumluluk icin calisir.
+
 ### Production validator boot'ta SystemExit
 
 Saha cikisinda yaygin hatalar:

@@ -1,3 +1,4 @@
+from dnp3_gateway.backend import PendingCommand
 from dnp3_gateway.state import GatewayState
 
 from .conftest import make_device, make_gateway_config, make_signal
@@ -47,6 +48,18 @@ def test_removed_device_read_tracking_cleared() -> None:
     assert state.snapshot()["device_count"] == 1
     # A icin son okuma devam ediyor, due degil
     assert state.due_devices(12.0) == []
+
+
+def test_enqueue_pending_commands_deduplicates_ids() -> None:
+    state = GatewayState()
+    first = PendingCommand(id=1, device_code="DEV-1", command="reset", dnp3_index=0)
+    duplicate = PendingCommand(id=1, device_code="DEV-1", command="reset", dnp3_index=0)
+    second = PendingCommand(id=2, device_code="DEV-2", command="pulse", dnp3_index=1)
+
+    assert state.enqueue_pending_commands([first, duplicate, second]) == 2
+    assert [command.id for command in state.take_pending_commands()] == [1, 2]
+    assert state.enqueue_pending_commands([first, second]) == 0
+    assert state.take_pending_commands() == []
 
 
 def test_signals_returns_copy() -> None:

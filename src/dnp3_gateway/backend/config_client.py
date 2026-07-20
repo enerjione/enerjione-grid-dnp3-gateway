@@ -16,6 +16,7 @@ satiri dusurulur, disk cache de tazelenir.
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass, field
 from typing import Any
@@ -90,7 +91,7 @@ class SignalConfig:
 class PendingCommand:
     """Backend'in gonderdigi bekleyen cihaz komutu (DNP3 CROB).
 
-    Gateway NAT arkasinda; komut config-poll ile gelir. Her komut icin
+    Gateway NAT arkasinda; komut pending endpoint poll ile gelir. Her komut icin
     `reader.operate_device(device, index, ...)` cagirilir ve sonuc
     `POST /gateways/{code}/command-results` ile backend'e bildirilir. `id`
     idempotent — ayni id ikinci kez gelirse tekrar calistirilmaz (state dedup).
@@ -320,6 +321,68 @@ class BackendConfigClient:
 
         return _parse_gateway_config(data, default_gateway_code=self.gateway_code)
 
+    def fetch_pending_commands(self) -> tuple[PendingCommand, ...]:
+        """Bekleyen komutlari hafif endpoint'ten ceker.
+
+        Config yenilemeden bagimsiz calisir. Liste root veya
+        ``{"pending_commands": [...]}`` response formatini kabul eder.
+        """
+        url = f"{self.base_url}/gateways/{self.gateway_code}/commands/pending"
+        headers = build_config_request_headers(self.identity)
+        try:
+            response = self._session.get(
+                url,
+                headers=headers,
+                timeout=self.timeout_sec,
+                stream=True,
+            )
+        except requests.RequestException as exc:
+            err_text = _scrub_token_from_text(str(exc), self.identity.token)
+            raise GatewayConfigError(f"pending commands request failed: {err_text}") from exc
+
+        try:
+            content_length = int(response.headers.get("Content-Length", "0") or "0")
+        except (TypeError, ValueError):
+            content_length = 0
+        if content_length > self._response_max_bytes:
+            response.close()
+            raise GatewayConfigError(
+                f"pending commands response too large: content_length={content_length} bytes "
+                f"(limit={self._response_max_bytes})"
+            )
+        if response.status_code != 200:
+            preview = _scrub_token_from_text(response.text[:200], self.identity.token)
+            raise GatewayConfigError(
+                f"pending commands request returned {response.status_code}: {preview}"
+            )
+        try:
+            chunks: list[bytes] = []
+            total = 0
+            for chunk in response.iter_content(chunk_size=64 * 1024, decode_unicode=False):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > self._response_max_bytes:
+                    raise GatewayConfigError(
+                        f"pending commands response exceeded limit during streaming: "
+                        f"received={total} bytes limit={self._response_max_bytes}"
+                    )
+                chunks.append(chunk)
+            data = json.loads(b"".join(chunks).decode("utf-8"))
+        except GatewayConfigError:
+            raise
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise GatewayConfigError(f"pending commands response is not json: {exc}") from exc
+        except requests.RequestException as exc:
+            err_text = _scrub_token_from_text(str(exc), self.identity.token)
+            raise GatewayConfigError(f"pending commands response read failed: {err_text}") from exc
+        raw_commands = data.get("pending_commands") if isinstance(data, dict) else data
+        if not isinstance(raw_commands, list):
+            raise GatewayConfigError(
+                "pending commands response must be a list or object with pending_commands list"
+            )
+        return _parse_pending_commands(raw_commands)
+
     def report_command_results(self, results: list[dict]) -> None:
         """Calistirilan komut sonuclarini backend'e bildirir (batch POST).
 
@@ -364,6 +427,7 @@ _MAX_SIGNALS_HARD_LIMIT = 5000
 _MAX_CODE_LENGTH = 64
 _MAX_LABEL_LENGTH = 256
 _MAX_UNIT_LENGTH = 32
+_MAX_PENDING_COMMANDS_HARD_LIMIT = 1000
 
 
 def _truncate(value: str, max_len: int) -> str:
@@ -498,6 +562,52 @@ def _safe_finite_float(value: Any, default: float) -> float:
     if not math.isfinite(f):
         return default
     return f
+
+
+def _parse_pending_commands(raw_commands: list[Any]) -> tuple[PendingCommand, ...]:
+    """Bozuk komutlari atlayarak backend payload'unu parse et."""
+    if len(raw_commands) > _MAX_PENDING_COMMANDS_HARD_LIMIT:
+        import logging as _logging
+
+        _logging.getLogger(__name__).error(
+            "pending_commands_overflow received=%d hard_limit=%d — fazlasi atlandi",
+            len(raw_commands),
+            _MAX_PENDING_COMMANDS_HARD_LIMIT,
+        )
+        raw_commands = raw_commands[:_MAX_PENDING_COMMANDS_HARD_LIMIT]
+    commands: list[PendingCommand] = []
+    for item in raw_commands:
+        if not isinstance(item, dict):
+            continue
+        try:
+            command = PendingCommand(
+                id=int(item["id"]),
+                device_code=str(item["device_code"]),
+                command=str(item.get("command") or ""),
+                dnp3_index=int(item["dnp3_index"]),
+                op_type=str(item.get("op_type") or "pulse_on"),
+                count=int(item.get("count", 1) or 1),
+                on_time_ms=int(item.get("on_time_ms", 100) or 100),
+                off_time_ms=int(item.get("off_time_ms", 100) or 100),
+            )
+            if command.id < 1 or not command.device_code or not command.command:
+                raise ValueError("id, device_code and command are required")
+            if not 0 <= command.dnp3_index <= 65535:
+                raise ValueError("dnp3_index must be in range 0..65535")
+            if not 1 <= command.count <= 255:
+                raise ValueError("count must be in range 1..255")
+            if not 0 <= command.on_time_ms <= 65535 or not 0 <= command.off_time_ms <= 65535:
+                raise ValueError("on_time_ms and off_time_ms must be in range 0..65535")
+            commands.append(command)
+        except (KeyError, TypeError, ValueError) as exc:
+            import logging as _logging
+
+            _logging.getLogger(__name__).warning(
+                "pending_command_parse_failed id=%r error=%s — komut atlandi",
+                item.get("id"),
+                exc,
+            )
+    return tuple(commands)
 
 
 def _parse_gateway_config(data: dict[str, Any], *, default_gateway_code: str) -> GatewayConfig:
@@ -682,33 +792,9 @@ def _parse_gateway_config(data: dict[str, Any], *, default_gateway_code: str) ->
     except (TypeError, ValueError):
         refresh_nonce = 0
 
-    # Bekleyen komutlar (opsiyonel; eski backend'de alan yok -> bos). Defensive
-    # parse: bozuk komut atlanir, dongu durmaz.
-    pending_commands: list[PendingCommand] = []
+    # Eski backend uyumlulugu: config response icindeki komutlari da kabul et.
     raw_cmds = data.get("pending_commands")
-    if isinstance(raw_cmds, list):
-        for item in raw_cmds:
-            if not isinstance(item, dict):
-                continue
-            try:
-                pending_commands.append(
-                    PendingCommand(
-                        id=int(item["id"]),
-                        device_code=str(item["device_code"]),
-                        command=str(item.get("command") or ""),
-                        dnp3_index=int(item["dnp3_index"]),
-                        op_type=str(item.get("op_type") or "pulse_on"),
-                        count=int(item.get("count", 1) or 1),
-                        on_time_ms=int(item.get("on_time_ms", 100) or 100),
-                        off_time_ms=int(item.get("off_time_ms", 100) or 100),
-                    )
-                )
-            except (KeyError, TypeError, ValueError) as exc:
-                _logging.getLogger(__name__).warning(
-                    "config_pending_command_parse_failed id=%r error=%s — komut atlandi",
-                    item.get("id"),
-                    exc,
-                )
+    pending_commands = _parse_pending_commands(raw_cmds) if isinstance(raw_cmds, list) else ()
 
     return GatewayConfig(
         gateway_code=str(data.get("gateway_code") or default_gateway_code),

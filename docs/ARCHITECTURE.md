@@ -176,6 +176,10 @@ degistiginde:
 
 - Yeni cihaz eklemesi anlik yansir (en fazla `CONFIG_REFRESH_SEC` gecikme).
 - Sinyal kataloğu degisikligi (DNP3 adresi, scale/offset) restart gerektirmez.
+- Bekleyen cihaz komutlari ayri `/commands/pending` endpoint'inden
+  `COMMAND_POLL_SEC` araliginda cekilir (varsayilan 1sn). Config refresh
+  varsayilani 30sn kalir; command endpoint yoksa config response icindeki
+  `pending_commands` geriye uyumluluk icin yine kabul edilir.
 - Backend `is_active=False` set ederse poller calismaya devam eder ama
   publish durur.
 

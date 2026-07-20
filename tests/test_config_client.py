@@ -212,3 +212,75 @@ def test_fetch_config_ignores_missing_items() -> None:
     cfg = client.fetch_config()
     assert [d.code for d in cfg.devices] == ["OK"]
     assert [s.key for s in cfg.signals] == ["master.test"]
+
+
+def test_fetch_pending_commands_parses_object_response() -> None:
+    payload = {
+        "pending_commands": [
+            {
+                "id": 17,
+                "device_code": "DEV-1",
+                "command": "trigger_download",
+                "dnp3_index": 5,
+                "op_type": "pulse_on",
+                "count": 1,
+                "on_time_ms": 1000,
+                "off_time_ms": 500,
+            }
+        ]
+    }
+    session = _DummySession(_DummyResponse(200, payload))
+    client = BackendConfigClient(
+        base_url="http://api/api/v1",
+        identity=_dev_identity(token="tok"),
+        session=session,  # type: ignore[arg-type]
+    )
+
+    commands = client.fetch_pending_commands()
+
+    assert len(commands) == 1
+    assert commands[0].id == 17
+    assert commands[0].device_code == "DEV-1"
+    assert commands[0].dnp3_index == 5
+    assert session.last_url == "http://api/api/v1/gateways/GW-001/commands/pending"
+    assert session.last_headers is not None
+    assert session.last_headers["X-Gateway-Token"] == "tok"
+
+
+def test_fetch_pending_commands_accepts_list_and_skips_invalid_items() -> None:
+    payload = [
+        {"id": 1, "device_code": "DEV-1", "command": "reset", "dnp3_index": 0},
+        {"id": 2, "device_code": "DEV-2", "command": "reset", "dnp3_index": 70000},
+        {"id": "bad", "device_code": "DEV-3", "command": "reset", "dnp3_index": 0},
+    ]
+    client = BackendConfigClient(
+        base_url="http://api/api/v1",
+        identity=_dev_identity(),
+        session=_DummySession(_DummyResponse(200, payload)),  # type: ignore[arg-type]
+    )
+
+    assert [command.id for command in client.fetch_pending_commands()] == [1]
+
+
+def test_fetch_pending_commands_rejects_oversized_response() -> None:
+    payload = {"pending_commands": [], "padding": "x" * (65 * 1024)}
+    client = BackendConfigClient(
+        base_url="http://api/api/v1",
+        identity=_dev_identity(),
+        session=_DummySession(_DummyResponse(200, payload)),  # type: ignore[arg-type]
+        response_max_bytes=64 * 1024,
+    )
+
+    with pytest.raises(GatewayConfigError, match="response too large"):
+        client.fetch_pending_commands()
+
+
+def test_fetch_pending_commands_rejects_wrong_response_shape() -> None:
+    client = BackendConfigClient(
+        base_url="http://api/api/v1",
+        identity=_dev_identity(),
+        session=_DummySession(_DummyResponse(200, {"pending_commands": {}})),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(GatewayConfigError, match="pending_commands list"):
+        client.fetch_pending_commands()

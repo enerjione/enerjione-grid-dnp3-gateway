@@ -174,6 +174,7 @@ class Settings(BaseSettings):
         description="TLS icin ozel CA bundle yolu; bos = sistem varsayilani + verify_ssl",
     )
     config_refresh_sec: int = Field(default=30, ge=5, le=3600)
+    command_poll_sec: float = Field(default=1.0, ge=0.2, le=60.0)
     config_timeout_sec: int = Field(default=5, ge=1, le=60)
     config_cache_max_age_hours: float = Field(
         default=24.0,
