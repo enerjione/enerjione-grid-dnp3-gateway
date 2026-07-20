@@ -292,6 +292,19 @@ def _make_soe_handler(cache: _DeviceCache, device_code: str) -> Any:
             if not values:
                 return
             first = values[0].value
+            # TESHIS (pasif, sifir-risk): gelen fragment'in tipini + eleman
+            # sayisini logla. OctetString (G110) gelip gelmedigini gormek icin.
+            # Yeni istek URETMEZ — sadece gozlem. String sorunu cozulunce kaldir.
+            try:
+                logger.info(
+                    "yadnp3_soe_fragment device=%s first_type=%s count=%s indexes=%s",
+                    device_code,
+                    type(first).__name__,
+                    len(values),
+                    [getattr(it, "index", "?") for it in values][:12],
+                )
+            except Exception:  # noqa: BLE001
+                pass
             try:
                 if isinstance(first, opendnp3.Binary):
                     for it in values:
@@ -316,6 +329,10 @@ def _make_soe_handler(cache: _DeviceCache, device_code: str) -> Any:
                             raw = b""
                         # Bos/bos-baslangic byte'lari NUL'lardan temizle, UTF-8 dene
                         text = raw.rstrip(b"\x00").decode("utf-8", errors="replace") or None
+                        logger.info(
+                            "yadnp3_g110_string device=%s index=%s text=%r",
+                            device_code, it.index, text,
+                        )
                         cache.set(_OBJECT_GROUP_STRING, it.index, 0.0, value_string=text)
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
