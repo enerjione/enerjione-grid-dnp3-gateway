@@ -42,6 +42,7 @@ class MockTelemetryReader(TelemetryReader):
         on_time_ms: int = 0,
         off_time_ms: int = 0,
         timeout_sec: float = 10.0,
+        mode: str = "direct",
     ) -> dict[str, Any]:
         # Gercek link yok; komutu her zaman basarili kabul et (test/dev).
         return {

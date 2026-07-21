@@ -1083,6 +1083,7 @@ class Dnp3TelemetryReader(TelemetryReader):
         on_time_ms: int = 0,
         off_time_ms: int = 0,
         timeout_sec: float = 10.0,
+        mode: str = "direct",
     ) -> dict[str, Any]:
         # dnp3py adapter'i CROB gonderimi desteklemiyor; komut icin yadnp3 gerek.
         _ = index, op_type, count, on_time_ms, off_time_ms, timeout_sec

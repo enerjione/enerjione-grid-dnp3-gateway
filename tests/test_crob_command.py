@@ -143,14 +143,15 @@ def yadnp3_master(monkeypatch):
 
     class _FakeMaster:
         def SelectAndOperate(self, crob, index, cb, cfg):
-            calls["sbo_crob"] = crob
-            calls["sbo_index"] = index
+            calls["crob"] = crob
+            calls["index"] = index
             calls["sbo_called"] = True
-            # Testin ayarladigi sonucu callback'e ver
             cb(calls["result"])
 
         def DirectOperate(self, crob, index, cb, cfg):
-            calls["direct_called"] = True  # KULLANILMAMALI
+            calls["crob"] = crob
+            calls["index"] = index
+            calls["direct_called"] = True
             cb(calls["result"])
 
     mm._master = _FakeMaster()
@@ -170,7 +171,7 @@ def test_default_op_type_is_latch_on(yadnp3_master):
     mm, calls, fake, _ = yadnp3_master
     calls["result"] = _success_result(fake)
     mm.operate_crob(index=0)  # op_type verilmedi -> default
-    assert calls["sbo_crob"].opType == fake.OperationType.LATCH_ON
+    assert calls["crob"].opType == fake.OperationType.LATCH_ON
 
 
 def test_pulse_not_used_by_default(yadnp3_master):
@@ -178,15 +179,28 @@ def test_pulse_not_used_by_default(yadnp3_master):
     mm, calls, fake, _ = yadnp3_master
     calls["result"] = _success_result(fake)
     mm.operate_crob(index=0)
-    assert calls["sbo_crob"].opType != fake.OperationType.PULSE_ON
-    assert calls["sbo_crob"].opType != fake.OperationType.PULSE_OFF
+    assert calls["crob"].opType != fake.OperationType.PULSE_ON
+    assert calls["crob"].opType != fake.OperationType.PULSE_OFF
 
 
-def test_select_and_operate_used_not_direct(yadnp3_master):
-    """Test: SelectAndOperate (SBO) cagriliyor, DirectOperate DEGIL."""
+def test_direct_operate_used_by_default(yadnp3_master):
+    """Test: default mode=direct -> DirectOperate cagrilir, SBO DEGIL.
+
+    Saha testi: bu cihaz SBO SELECT fazinda NOT_SUPPORTED donuyor; DirectOperate
+    calisiyor (alarm fiziksel resetleniyor). Bu yuzden default DirectOperate.
+    """
     mm, calls, fake, _ = yadnp3_master
     calls["result"] = _success_result(fake)
-    mm.operate_crob(index=0)
+    mm.operate_crob(index=0)  # mode verilmedi -> default direct
+    assert calls.get("direct_called") is True
+    assert calls.get("sbo_called") is not True
+
+
+def test_sbo_mode_uses_select_and_operate(yadnp3_master):
+    """mode='sbo' verilince SelectAndOperate cagrilir (opsiyonel)."""
+    mm, calls, fake, _ = yadnp3_master
+    calls["result"] = _success_result(fake)
+    mm.operate_crob(index=0, mode="sbo")
     assert calls.get("sbo_called") is True
     assert calls.get("direct_called") is not True
 
@@ -196,7 +210,7 @@ def test_count_is_one(yadnp3_master):
     mm, calls, fake, _ = yadnp3_master
     calls["result"] = _success_result(fake)
     mm.operate_crob(index=0)
-    assert calls["sbo_crob"].count == 1
+    assert calls["crob"].count == 1
 
 
 def test_index_zero_used(yadnp3_master):
@@ -204,7 +218,7 @@ def test_index_zero_used(yadnp3_master):
     mm, calls, fake, _ = yadnp3_master
     calls["result"] = _success_result(fake, index=0)
     mm.operate_crob(index=0)
-    assert calls["sbo_index"] == 0
+    assert calls["index"] == 0
 
 
 def test_success_when_task_and_point_success(yadnp3_master):
@@ -255,7 +269,8 @@ def test_offline_device_command_not_sent(yadnp3_master):
     res = mm.operate_crob(index=0)
     assert res["ok"] is False
     assert res["status"] == "offline"
-    assert calls.get("sbo_called") is not True  # SBO hic cagrilmadi
+    assert calls.get("direct_called") is not True  # komut hic gonderilmedi
+    assert calls.get("sbo_called") is not True
 
 
 def test_recovering_device_command_not_sent(yadnp3_master):
@@ -293,7 +308,7 @@ def test_select_and_operate_use_same_crob(yadnp3_master):
     mm, calls, fake, _ = yadnp3_master
     calls["result"] = _success_result(fake)
     mm.operate_crob(index=0, op_type="latch_on", count=1, on_time_ms=0, off_time_ms=0)
-    crob = calls["sbo_crob"]
+    crob = calls["crob"]
     assert crob.opType == fake.OperationType.LATCH_ON
     assert crob.count == 1
     assert crob.onTimeMS == 0
@@ -301,9 +316,10 @@ def test_select_and_operate_use_same_crob(yadnp3_master):
 
 
 def test_bad_op_type_rejected(yadnp3_master):
-    """Gecersiz op_type -> bad_request, SBO cagrilmaz."""
+    """Gecersiz op_type -> bad_request, komut gonderilmez."""
     mm, calls, fake, _ = yadnp3_master
     calls["result"] = _success_result(fake)
     res = mm.operate_crob(index=0, op_type="explode")
     assert res["status"] == "bad_request"
+    assert calls.get("direct_called") is not True
     assert calls.get("sbo_called") is not True

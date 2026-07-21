@@ -61,6 +61,7 @@ class TelemetryReader(ABC):
         on_time_ms: int = 0,
         off_time_ms: int = 0,
         timeout_sec: float = 10.0,
+        mode: str = "direct",
     ) -> dict[str, Any]:
         """Cihaza DNP3 binary output (CROB) komutu gonderir.
 

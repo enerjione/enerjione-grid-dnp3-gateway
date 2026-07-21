@@ -617,25 +617,27 @@ class _ManagedMaster:
         on_time_ms: int = 0,
         off_time_ms: int = 0,
         timeout_sec: float = 10.0,
+        mode: str = "direct",
     ) -> dict:
-        """Cihaza bir CROB (Control Relay Output Block) SELECT-before-OPERATE ile
-        gonderir.
+        """Cihaza bir CROB (Control Relay Output Block) gonderir.
 
-        SBO (SelectAndOperate): binding once SELECT gonderir, cihazin SELECT
-        cevabini bekler, SUCCESS ise ayni CROB ile OPERATE gonderir. Tek adim
-        DirectOperate YERINE bu kullanilir — Horstmann SN2 hem SBO hem
-        DirectOperate destekler; SBO daha guvenli (cihaz komutu iki asamada
-        dogrular).
+        mode:
+          - "direct" (VARSAYILAN): DirectOperate — tek adimda OPERATE. Bu
+            cihazda (Horstmann SN2, saha testi) SELECT-before-OPERATE SELECT
+            fazinda NOT_SUPPORTED donuyor; DirectOperate ise gercekten calisiyor
+            (alarm fiziksel resetleniyor). Bu yuzden default DirectOperate.
+          - "sbo": SelectAndOperate — once SELECT, cevabini bekler, SUCCESS ise
+            ayni CROB ile OPERATE. Bazi cihazlar/index'ler bunu ister; opsiyonel.
 
-        Default op_type=latch_on (Device Profile PULSE desteklemez).
-        Default on/off time=0 (LATCH'te sure anlamsiz).
+        Default op_type=latch_on (Device Profile PULSE desteklemez — pulse
+        gonderilirse cihaz NOT_SUPPORTED doner). Default on/off time=0 (LATCH'te
+        sure anlamsiz).
 
         Donen dict (detayli DNP3 status):
           ok, status (ok|failed|timeout|offline|error|bad_request),
           dnp3_task (TaskCompletion), dnp3_status (per-point CommandStatus),
-          dnp3_state (CommandPointState), control (op_type), points[],
-          select_operate zamanlari _cb icinde tutulamaz (binding SBO'yu tek
-          callback'te doner) — toplam sure operate_device'da olculur.
+          dnp3_state (CommandPointState), control (op_type), mode, points[].
+          Toplam sure operate_device'da olculur.
         """
         # ---- Baglanti fail-fast: cihaz online degilse komut GONDERME ----
         # (offline'da DirectOperate/SBO 10s bloklar sonra timeout doner; erken
@@ -672,8 +674,12 @@ class _ManagedMaster:
                 logger.exception("yadnp3_crob_build_failed")
                 return {"ok": False, "status": "error", "error": f"CROB olusturulamadi: {exc}", "control": op_type}
 
+        mode_l = (mode or "direct").lower()
+        if mode_l not in ("direct", "sbo"):
+            mode_l = "direct"
+
         done = threading.Event()
-        holder: dict = {"status": "no_result", "control": op_type}
+        holder: dict = {"status": "no_result", "control": op_type, "mode": mode_l}
 
         def _cb(result):  # opendnp3 IO thread
             try:
@@ -726,19 +732,25 @@ class _ManagedMaster:
             finally:
                 done.set()
 
-        # SELECT-before-OPERATE. Binding SELECT + OPERATE'i tek cagrida yurutur;
-        # SELECT cevabi SUCCESS degilse OPERATE gondermez (protokol garantisi).
+        # Komut gonder. mode=direct -> DirectOperate (tek adim OPERATE; bu cihazda
+        # calisan yontem). mode=sbo -> SelectAndOperate (SELECT sonra OPERATE).
         try:
-            self._master.SelectAndOperate(crob, int(index), _cb, opendnp3.TaskConfig.Default())
+            if mode_l == "sbo":
+                self._master.SelectAndOperate(crob, int(index), _cb, opendnp3.TaskConfig.Default())
+            else:
+                self._master.DirectOperate(crob, int(index), _cb, opendnp3.TaskConfig.Default())
         except Exception as exc:  # noqa: BLE001
-            logger.exception("yadnp3_select_operate_failed device=%s index=%s", self.device.code, index)
-            return {"ok": False, "status": "error", "error": str(exc), "control": op_type}
+            logger.exception(
+                "yadnp3_operate_failed device=%s index=%s mode=%s",
+                self.device.code, index, mode_l,
+            )
+            return {"ok": False, "status": "error", "error": str(exc), "control": op_type, "mode": mode_l}
 
         if not done.wait(timeout=timeout_sec):
             return {
                 "ok": False, "status": "timeout",
-                "error": f"{timeout_sec}s icinde SELECT/OPERATE cevabi yok",
-                "control": op_type,
+                "error": f"{timeout_sec}s icinde komut cevabi yok",
+                "control": op_type, "mode": mode_l,
             }
 
         ok = holder.get("status") == "ok"
@@ -1008,15 +1020,16 @@ class Yadnp3TelemetryReader(TelemetryReader):
         on_time_ms: int = 0,
         off_time_ms: int = 0,
         timeout_sec: float = 10.0,
+        mode: str = "direct",
     ) -> dict[str, Any]:
-        """Var olan master uzerinden DNP3 CROB komutu SELECT-before-OPERATE ile
-        gonderir.
+        """Var olan master uzerinden DNP3 CROB komutu gonderir.
 
         Okuma/recovery davranisina dokunmaz; _ensure_master ile mevcut master'i
-        alir (yoksa read path ile ayni sekilde acilir) ve operate_crob (SBO)
-        cagirir. Default LATCH_ON (Device Profile PULSE desteklemez).
+        alir (yoksa read path ile ayni sekilde acilir) ve operate_crob cagirir.
+        Default LATCH_ON + DirectOperate (Device Profile PULSE desteklemez; bu
+        cihazda SBO SELECT fazinda NOT_SUPPORTED donuyor, DirectOperate calisiyor).
 
-        Toplam islem suresi (SELECT+OPERATE) burada olculup sonuca eklenir.
+        Toplam islem suresi burada olculup sonuca eklenir.
         """
         import time as _t
 
@@ -1029,6 +1042,7 @@ class Yadnp3TelemetryReader(TelemetryReader):
             on_time_ms=on_time_ms,
             off_time_ms=off_time_ms,
             timeout_sec=timeout_sec,
+            mode=mode,
         )
         elapsed_ms = int((_t.monotonic() - t0) * 1000)
         out = {
@@ -1043,10 +1057,10 @@ class Yadnp3TelemetryReader(TelemetryReader):
         # Detayli komut logu (basarili/basarisiz — gercek DNP3 status ile).
         logger.info(
             "dnp3_command_result device=%s outstation=%s object=12 variation=1 "
-            "index=%s control=%s ok=%s status=%s dnp3_task=%s dnp3_status=%s "
+            "index=%s control=%s mode=%s ok=%s status=%s dnp3_task=%s dnp3_status=%s "
             "dnp3_state=%s duration_ms=%s error=%s",
             device.code, device.dnp3_address, index,
-            out.get("control"), out.get("ok"), out.get("status"),
+            out.get("control"), out.get("mode"), out.get("ok"), out.get("status"),
             out.get("dnp3_task"), out.get("dnp3_status"),
             out.get("dnp3_state"), elapsed_ms, out.get("error"),
         )
