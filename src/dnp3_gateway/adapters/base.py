@@ -56,10 +56,10 @@ class TelemetryReader(ABC):
         *,
         device: DeviceConfig,
         index: int,
-        op_type: str = "pulse_on",
+        op_type: str = "latch_on",
         count: int = 1,
-        on_time_ms: int = 100,
-        off_time_ms: int = 100,
+        on_time_ms: int = 0,
+        off_time_ms: int = 0,
         timeout_sec: float = 10.0,
     ) -> dict[str, Any]:
         """Cihaza DNP3 binary output (CROB) komutu gonderir.

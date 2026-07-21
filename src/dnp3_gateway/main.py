@@ -109,12 +109,24 @@ def _execute_pending_commands(reader, state: GatewayState, pending) -> list[dict
             )
             ok = bool(res.get("ok"))
             logger.info(
-                "pending_command_executed id=%s device=%s index=%s ok=%s status=%s",
-                cmd.id, cmd.device_code, cmd.dnp3_index, ok, res.get("status"),
+                "pending_command_executed id=%s device=%s index=%s control=%s ok=%s "
+                "status=%s dnp3_status=%s dnp3_state=%s",
+                cmd.id, cmd.device_code, cmd.dnp3_index, res.get("control"),
+                ok, res.get("status"), res.get("dnp3_status"), res.get("dnp3_state"),
             )
             results.append(
-                {"id": cmd.id, "ok": ok, "status": str(res.get("status", "unknown")),
-                 "error": res.get("error")}
+                {
+                    "id": cmd.id,
+                    "ok": ok,
+                    "status": str(res.get("status", "unknown")),
+                    "error": res.get("error"),
+                    # Detayli DNP3 status (backend device_commands'a kaydedilir).
+                    "dnp3_status": res.get("dnp3_status"),
+                    "dnp3_state": res.get("dnp3_state"),
+                    "dnp3_task": res.get("dnp3_task"),
+                    "control": res.get("control"),
+                    "duration_ms": res.get("duration_ms"),
+                }
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception(

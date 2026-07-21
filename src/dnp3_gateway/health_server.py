@@ -540,7 +540,7 @@ def _make_handler(
                 result = reader.operate_device(
                     device=device,
                     index=index,
-                    op_type=str(payload.get("op_type", "pulse_on")),
+                    op_type=str(payload.get("op_type", "latch_on")),
                     count=int(payload.get("count", 1)),
                     on_time_ms=int(payload.get("on_time_ms", 100)),
                     off_time_ms=int(payload.get("off_time_ms", 100)),

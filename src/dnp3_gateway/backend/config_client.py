@@ -100,10 +100,10 @@ class PendingCommand:
     device_code: str
     command: str
     dnp3_index: int
-    op_type: str = "pulse_on"
+    op_type: str = "latch_on"
     count: int = 1
-    on_time_ms: int = 100
-    off_time_ms: int = 100
+    on_time_ms: int = 0
+    off_time_ms: int = 0
 
 
 @dataclass(frozen=True)
@@ -401,10 +401,10 @@ class BackendConfigClient:
                             device_code=str(item["device_code"]),
                             command=str(item.get("command") or ""),
                             dnp3_index=int(item["dnp3_index"]),
-                            op_type=str(item.get("op_type") or "pulse_on"),
+                            op_type=str(item.get("op_type") or "latch_on"),
                             count=int(item.get("count", 1) or 1),
-                            on_time_ms=int(item.get("on_time_ms", 100) or 100),
-                            off_time_ms=int(item.get("off_time_ms", 100) or 100),
+                            on_time_ms=int(item.get("on_time_ms", 0) or 0),
+                            off_time_ms=int(item.get("off_time_ms", 0) or 0),
                         )
                     )
                 except (KeyError, TypeError, ValueError) as exc:
@@ -802,10 +802,10 @@ def _parse_gateway_config(data: dict[str, Any], *, default_gateway_code: str) ->
                         device_code=str(item["device_code"]),
                         command=str(item.get("command") or ""),
                         dnp3_index=int(item["dnp3_index"]),
-                        op_type=str(item.get("op_type") or "pulse_on"),
+                        op_type=str(item.get("op_type") or "latch_on"),
                         count=int(item.get("count", 1) or 1),
-                        on_time_ms=int(item.get("on_time_ms", 100) or 100),
-                        off_time_ms=int(item.get("off_time_ms", 100) or 100),
+                        on_time_ms=int(item.get("on_time_ms", 0) or 0),
+                        off_time_ms=int(item.get("off_time_ms", 0) or 0),
                     )
                 )
             except (KeyError, TypeError, ValueError) as exc:

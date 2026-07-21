@@ -592,24 +592,68 @@ class _ManagedMaster:
             logger.exception("yadnp3_integrity_poll_request_failed")
             return False
 
+    # CROB operation code eslemesi. Horstmann SN2 Device Profile'i PULSE
+    # DESTEKLEMEZ (yalnizca LATCH_ON/LATCH_OFF). Bu yuzden default LATCH_ON;
+    # pulse_* verilse bile calisir ama cihaz reddeder — dogru kullanim latch.
+    _OP_MAP_LAZY: dict[str, Any] | None = None
+
+    @classmethod
+    def _op_map(cls) -> dict[str, Any]:
+        if cls._OP_MAP_LAZY is None:
+            cls._OP_MAP_LAZY = {
+                "latch_on": opendnp3.OperationType.LATCH_ON,
+                "latch_off": opendnp3.OperationType.LATCH_OFF,
+                "pulse_on": opendnp3.OperationType.PULSE_ON,
+                "pulse_off": opendnp3.OperationType.PULSE_OFF,
+            }
+        return cls._OP_MAP_LAZY
+
     def operate_crob(
         self,
         *,
         index: int,
-        op_type: str = "pulse_on",
+        op_type: str = "latch_on",
         count: int = 1,
-        on_time_ms: int = 100,
-        off_time_ms: int = 100,
+        on_time_ms: int = 0,
+        off_time_ms: int = 0,
         timeout_sec: float = 10.0,
     ) -> dict:
-        """Cihaza bir CROB (Control Relay Output Block) DirectOperate gonderir."""
-        op_map = {
-            "pulse_on": opendnp3.OperationType.PULSE_ON,
-            "pulse_off": opendnp3.OperationType.PULSE_OFF,
-            "latch_on": opendnp3.OperationType.LATCH_ON,
-            "latch_off": opendnp3.OperationType.LATCH_OFF,
-        }
-        opt = op_map.get(op_type.lower())
+        """Cihaza bir CROB (Control Relay Output Block) SELECT-before-OPERATE ile
+        gonderir.
+
+        SBO (SelectAndOperate): binding once SELECT gonderir, cihazin SELECT
+        cevabini bekler, SUCCESS ise ayni CROB ile OPERATE gonderir. Tek adim
+        DirectOperate YERINE bu kullanilir — Horstmann SN2 hem SBO hem
+        DirectOperate destekler; SBO daha guvenli (cihaz komutu iki asamada
+        dogrular).
+
+        Default op_type=latch_on (Device Profile PULSE desteklemez).
+        Default on/off time=0 (LATCH'te sure anlamsiz).
+
+        Donen dict (detayli DNP3 status):
+          ok, status (ok|failed|timeout|offline|error|bad_request),
+          dnp3_task (TaskCompletion), dnp3_status (per-point CommandStatus),
+          dnp3_state (CommandPointState), control (op_type), points[],
+          select_operate zamanlari _cb icinde tutulamaz (binding SBO'yu tek
+          callback'te doner) — toplam sure operate_device'da olculur.
+        """
+        # ---- Baglanti fail-fast: cihaz online degilse komut GONDERME ----
+        # (offline'da DirectOperate/SBO 10s bloklar sonra timeout doner; erken
+        # kesip net "offline" don.) cache.state(): online|recovering|lost.
+        state = self.cache.state()
+        if state != "online":
+            logger.warning(
+                "yadnp3_operate_skipped_offline device=%s index=%s state=%s — komut GONDERILMEDI",
+                self.device.code, index, state,
+            )
+            return {
+                "ok": False,
+                "status": "offline",
+                "error": f"cihaz online degil (state={state}); komut gonderilmedi",
+                "control": op_type,
+            }
+
+        opt = self._op_map().get(op_type.lower())
         if opt is None:
             return {"ok": False, "status": "bad_request", "error": f"gecersiz op_type: {op_type!r}"}
 
@@ -626,37 +670,76 @@ class _ManagedMaster:
                 )
             except Exception:  # noqa: BLE001
                 logger.exception("yadnp3_crob_build_failed")
-                return {"ok": False, "status": "error", "error": f"CROB olusturulamadi: {exc}"}
+                return {"ok": False, "status": "error", "error": f"CROB olusturulamadi: {exc}", "control": op_type}
 
         done = threading.Event()
-        holder: dict = {"status": "no_result"}
+        holder: dict = {"status": "no_result", "control": op_type}
 
         def _cb(result):  # opendnp3 IO thread
             try:
+                # summary = TaskCompletion enum (transport/link seviyesi):
+                #   SUCCESS / FAILURE_NO_COMMS / FAILURE_RESPONSE_TIMEOUT /
+                #   FAILURE_MESSAGE_FORMAT_ERROR / FAILURE_BAD_RESPONSE / ...
                 summary = getattr(result, "summary", None)
-                holder["summary"] = str(summary)
+                holder["dnp3_task"] = str(summary)
+                task_ok = summary == getattr(opendnp3.TaskCompletion, "SUCCESS", None)
+
+                # Per-point sonuc: gercek DNP3 CommandStatus (SUCCESS/NO_SELECT/
+                # FORMAT_ERROR/NOT_SUPPORTED/...) + CommandPointState (SBO fazi:
+                # SELECT_SUCCESS/SELECT_FAIL/SELECT_MISMATCH/OPERATE_FAIL/SUCCESS).
                 points = []
+                all_points_ok = True
+                first_status = None
+                first_state = None
                 try:
-                    for pr in result.to_list():
-                        points.append({"index": pr.index, "status": str(pr.status)})
+                    plist = result.to_list()
                 except Exception:  # noqa: BLE001
-                    pass
+                    plist = []
+                if not plist:
+                    all_points_ok = False  # cevapta point yok -> basarisiz say
+                for pr in plist:
+                    st = getattr(pr, "status", None)
+                    stt = getattr(pr, "state", None)
+                    points.append({
+                        "index": getattr(pr, "index", None),
+                        "status": str(st),
+                        "state": str(stt),
+                    })
+                    if first_status is None:
+                        first_status = st
+                        first_state = stt
+                    if st != getattr(opendnp3.CommandStatus, "SUCCESS", None):
+                        all_points_ok = False
+
                 holder["points"] = points
-                holder["status"] = "ok" if "SUCCESS" in str(summary).upper() else "failed"
+                holder["dnp3_status"] = str(first_status)
+                holder["dnp3_state"] = str(first_state)
+                # BASARI KARARI: hem transport (TaskCompletion.SUCCESS) HEM
+                # her point CommandStatus.SUCCESS olmali. Eskiden yalniz summary
+                # string'ine bakiliyordu -> outstation transport-SUCCESS ama point
+                # NO_SELECT/NOT_SUPPORTED ise yanlis-pozitif olabiliyordu.
+                ok = task_ok and all_points_ok
+                holder["status"] = "ok" if ok else "failed"
             except Exception as exc:  # noqa: BLE001
                 holder["status"] = "error"
                 holder["error"] = str(exc)
             finally:
                 done.set()
 
+        # SELECT-before-OPERATE. Binding SELECT + OPERATE'i tek cagrida yurutur;
+        # SELECT cevabi SUCCESS degilse OPERATE gondermez (protokol garantisi).
         try:
-            self._master.DirectOperate(crob, int(index), _cb, opendnp3.TaskConfig.Default())
+            self._master.SelectAndOperate(crob, int(index), _cb, opendnp3.TaskConfig.Default())
         except Exception as exc:  # noqa: BLE001
-            logger.exception("yadnp3_direct_operate_failed device=%s index=%s", self.device.code, index)
-            return {"ok": False, "status": "error", "error": str(exc)}
+            logger.exception("yadnp3_select_operate_failed device=%s index=%s", self.device.code, index)
+            return {"ok": False, "status": "error", "error": str(exc), "control": op_type}
 
         if not done.wait(timeout=timeout_sec):
-            return {"ok": False, "status": "timeout", "error": f"{timeout_sec}s icinde cevap yok"}
+            return {
+                "ok": False, "status": "timeout",
+                "error": f"{timeout_sec}s icinde SELECT/OPERATE cevabi yok",
+                "control": op_type,
+            }
 
         ok = holder.get("status") == "ok"
         return {"ok": ok, **holder}
@@ -920,19 +1003,25 @@ class Yadnp3TelemetryReader(TelemetryReader):
         *,
         device: DeviceConfig,
         index: int,
-        op_type: str = "pulse_on",
+        op_type: str = "latch_on",
         count: int = 1,
-        on_time_ms: int = 100,
-        off_time_ms: int = 100,
+        on_time_ms: int = 0,
+        off_time_ms: int = 0,
         timeout_sec: float = 10.0,
     ) -> dict[str, Any]:
-        """Var olan master uzerinden DNP3 CROB komutu gonderir.
+        """Var olan master uzerinden DNP3 CROB komutu SELECT-before-OPERATE ile
+        gonderir.
 
-        Okuma/recovery davranisina dokunmaz; sadece _ensure_master ile mevcut
-        master'i alir (yoksa read path ile ayni sekilde acilir) ve DirectOperate
-        cagirir.
+        Okuma/recovery davranisina dokunmaz; _ensure_master ile mevcut master'i
+        alir (yoksa read path ile ayni sekilde acilir) ve operate_crob (SBO)
+        cagirir. Default LATCH_ON (Device Profile PULSE desteklemez).
+
+        Toplam islem suresi (SELECT+OPERATE) burada olculup sonuca eklenir.
         """
+        import time as _t
+
         mm = self._ensure_master(device)
+        t0 = _t.monotonic()
         result = mm.operate_crob(
             index=index,
             op_type=op_type,
@@ -941,7 +1030,27 @@ class Yadnp3TelemetryReader(TelemetryReader):
             off_time_ms=off_time_ms,
             timeout_sec=timeout_sec,
         )
-        return {"device_code": device.code, "index": int(index), **result}
+        elapsed_ms = int((_t.monotonic() - t0) * 1000)
+        out = {
+            "device_code": device.code,
+            "index": int(index),
+            "outstation": device.dnp3_address,
+            "object_group": 12,
+            "variation": 1,
+            "duration_ms": elapsed_ms,
+            **result,
+        }
+        # Detayli komut logu (basarili/basarisiz — gercek DNP3 status ile).
+        logger.info(
+            "dnp3_command_result device=%s outstation=%s object=12 variation=1 "
+            "index=%s control=%s ok=%s status=%s dnp3_task=%s dnp3_status=%s "
+            "dnp3_state=%s duration_ms=%s error=%s",
+            device.code, device.dnp3_address, index,
+            out.get("control"), out.get("ok"), out.get("status"),
+            out.get("dnp3_task"), out.get("dnp3_status"),
+            out.get("dnp3_state"), elapsed_ms, out.get("error"),
+        )
+        return out
 
     def forget_devices(self, active_device_codes: set[str]) -> int:
         """Backend config'inden cikarilmis cihazlarin master/channel'larini kapat.
