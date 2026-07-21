@@ -149,10 +149,20 @@ def _run_command_poll(
 
     Komut anlik gelsin diye kisa interval. Config'in agir serialize'i YOK.
     """
+    # Hata log dedup: komut-poll 1sn'de bir calistigi icin backend restart
+    # penceresinde (502/timeout) her saniye WARNING = log spam. Art arda ayni
+    # hatada SADECE ilkini logla; duzelince "recovered" de.
+    consecutive_errors = 0
     while not stop_event.is_set():
         try:
             poll = client.fetch_pending_commands()
             state.apply_pending_poll(poll)
+            if consecutive_errors:
+                logger.info(
+                    "command_poll_recovered gateway=%s after_errors=%d",
+                    client.gateway_code, consecutive_errors,
+                )
+                consecutive_errors = 0
 
             # config degisti -> config thread'i hemen cek
             if state.take_config_refresh_request():
@@ -175,10 +185,21 @@ def _run_command_poll(
             _deliver_ledger_results(client, ledger)
         except GatewayConfigError as exc:
             # /pending erisilemedi — bir sonraki turda tekrar denenir (komut
-            # ledger'da guvende; kaybolmaz).
-            logger.warning("command_poll_error gateway=%s error=%s", client.gateway_code, exc)
+            # ledger'da guvende; kaybolmaz). Art arda hatada SADECE ilkini logla
+            # (backend restart penceresinde spam onle).
+            consecutive_errors += 1
+            if consecutive_errors == 1:
+                logger.warning("command_poll_error gateway=%s error=%s", client.gateway_code, exc)
+            elif consecutive_errors % 60 == 0:
+                # Uzun sureli kesintide ~1dk'da bir hatirlatma (tamamen susmasin).
+                logger.warning(
+                    "command_poll_error gateway=%s suruyor (%d ardisik) error=%s",
+                    client.gateway_code, consecutive_errors, exc,
+                )
         except Exception:  # noqa: BLE001
-            logger.exception("command_poll_unexpected gateway=%s", client.gateway_code)
+            consecutive_errors += 1
+            if consecutive_errors == 1:
+                logger.exception("command_poll_unexpected gateway=%s", client.gateway_code)
         stop_event.wait(timeout=max(1, poll_sec))
 
 
