@@ -56,33 +56,12 @@ def _print_console_banner(
     health_url = f"http://{display_host}:{port}/health"
     config_path = f"{cfg.backend_api_url.rstrip('/')}/gateways/{identity.gateway_code}/config"
     print("", flush=True)
-    print("  --- EnerjiOne DNP3 Gateway ---", flush=True)
-    print(f"  Surum ............ {__version__}", flush=True)
-    print(f"  GATEWAY_CODE ..... {identity.gateway_code}", flush=True)
-    print(f"  Instance id ...... {identity.instance_id}", flush=True)
-    print(f"  Saglik (HTTP) .... {health_url}   <- bu portta dinler (WORKER_HEALTH_PORT)", flush=True)
-    print(
-        f"  DNP3 (cihaz) ...... varsayilan TCP {cfg.dnp3_tcp_port} (.env DNP3_TCP_PORT); "
-        "IP/port/DNP3 adresi asil kaynak: backend config `devices[]`",
-        flush=True,
-    )
-    print(f"  Backend config ... GET {config_path}", flush=True)
-    print(
-        "  Token ............ .env icinde GATEWAY_TOKEN; backend `gateways.token` ile AYNI olmali.",
-        flush=True,
-    )
-    print(
-        "  Coklu proses ..... Ayni GATEWAY_CODE+token ile iki kopya ACMAYIN. "
-        "Ikinci sunucu/servis -> yeni kod (orn. GW-002), arayuzden yeni gateway + yeni token + ayri .env.",
-        flush=True,
-    )
+    print("  EnerjiOne DNP3 Gateway", flush=True)
+    print(f"  surum {__version__}  |  gateway {identity.gateway_code}", flush=True)
+    print(f"  health   {health_url}", flush=True)
+    print(f"  backend  {cfg.backend_api_url.rstrip('/')}", flush=True)
     if cfg.is_mock_mode:
-        print(
-            "  *** UYARI: GATEWAY_MODE=mock  ->  SAHADAN DNP3 ILE OKUMA YOK; "
-            "degerler ureticidir. Gercek cihaz icin .env: GATEWAY_MODE=dnp3 (+ pip install nfm-dnp3).",
-            flush=True,
-        )
-    print("  ------------------------------", flush=True)
+        print("  UYARI: GATEWAY_MODE=mock — sahadan okuma YOK, degerler ureticidir.", flush=True)
     print("", flush=True)
 
 
@@ -541,13 +520,16 @@ def run(current_settings: Settings | None = None) -> int:
     # bos olunca 503 doner). Eski fallback "GATEWAY_TOKEN'a dus" kaldirildi —
     # CHANGELOG ile tutarsizdi ve token leak'i tum gateway'e yayan attack
     # surface yaratiyordu.
+    # /refresh-all ve /operate HTTP endpoint'leri: backend'in gateway'e PUSH
+    # yaptigi opsiyonel yol (NAT arkasi gateway'de erisilemez). Refresh-all +
+    # komutlar ZATEN pull kanaliyla calisir (config-poll refresh_nonce +
+    # /pending komut-poll). Bu token'lar SADECE dogrudan HTTP push isteniyorsa
+    # gerekir — normal kurulumda gerekmez. Bos olmalari sorun DEGIL; INFO.
     refresh_endpoint_token = (cfg.gateway_refresh_token or "").strip()
     if not refresh_endpoint_token:
-        logger.warning(
-            "refresh_all_endpoint_disabled gateway=%s — GATEWAY_REFRESH_TOKEN "
-            ".env'de bos. Backend operator tetigi (`/refresh-all`) cagrildiginda "
-            "503 doner. Operator paneli bu ozelligi kullanacaksa .env'e yuksek-entropy "
-            "GATEWAY_REFRESH_TOKEN atayin.",
+        logger.info(
+            "refresh_push_endpoint_off gateway=%s (GATEWAY_REFRESH_TOKEN bos) — "
+            "refresh-all pull kanaliyla calisir; HTTP push kapali.",
             identity.gateway_code,
         )
 
@@ -555,11 +537,9 @@ def run(current_settings: Settings | None = None) -> int:
     if command_endpoint_token:
         register_secret(command_endpoint_token)
     else:
-        logger.warning(
-            "operate_endpoint_disabled gateway=%s — GATEWAY_COMMAND_TOKEN "
-            ".env'de bos. Backend cihaz komut proxy'si (`/operate`) cagrildiginda "
-            "503 doner. Komut butonlari kullanilacaksa .env'e yuksek-entropy "
-            "GATEWAY_COMMAND_TOKEN atayin.",
+        logger.info(
+            "operate_push_endpoint_off gateway=%s (GATEWAY_COMMAND_TOKEN bos) — "
+            "komutlar pull kanaliyla (/pending komut-poll) calisir; HTTP push kapali.",
             identity.gateway_code,
         )
 

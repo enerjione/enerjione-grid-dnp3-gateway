@@ -316,7 +316,7 @@ def _make_soe_handler(cache: _DeviceCache, device_code: str) -> Any:
                             raw = b""
                         # Bos/bos-baslangic byte'lari NUL'lardan temizle, UTF-8 dene
                         text = raw.rstrip(b"\x00").decode("utf-8", errors="replace") or None
-                        logger.info(
+                        logger.debug(
                             "yadnp3_g110_string device=%s index=%s text=%r",
                             device_code, it.index, text,
                         )
@@ -538,10 +538,7 @@ class _ManagedMaster:
             try:
                 scan_range(gv, int(start), int(stop), self._soe, opendnp3.TaskConfig.Default())
                 ok = True
-                # TESHIS: hangi range gonderildi (65000 blogu cihazdan cevap
-                # almiyor - task kuyruga girdi mi gormek icin). Sorun cozulunce
-                # debug'a indir/kaldir.
-                logger.info(
+                logger.debug(
                     "yadnp3_g110_scan_queued device=%s range=%s-%s",
                     self.device.code, start, stop,
                 )
