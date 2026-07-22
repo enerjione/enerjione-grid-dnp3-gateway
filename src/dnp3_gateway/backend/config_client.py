@@ -54,7 +54,7 @@ class DeviceConfig:
     master_address: int | None = None
     ip_endpoint_type: str = "listening"
     master_ip_port: int | None = None
-    poll_interval_sec: int = 5
+    poll_interval_sec: int = 2
     timeout_ms: int = 3000
     retry_count: int = 2
     signal_profile: str = "default"
@@ -702,7 +702,7 @@ def _parse_gateway_config(data: dict[str, Any], *, default_gateway_code: str) ->
                     # Reasonable defaults + clamping (poll_interval cok kucuk
                     # ise gateway cycle'i tikar; cok buyuk ise hic okumaz).
                     poll_interval_sec=_safe_int(
-                        item.get("poll_interval_sec"), 5, lo=1, hi=3600
+                        item.get("poll_interval_sec"), 2, lo=1, hi=3600
                     ),
                     timeout_ms=_safe_int(item.get("timeout_ms"), 3000, lo=100, hi=60000),
                     retry_count=_safe_int(item.get("retry_count"), 2, lo=0, hi=20),
