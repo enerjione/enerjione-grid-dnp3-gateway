@@ -706,6 +706,18 @@ def run(current_settings: Settings | None = None) -> int:
         response_max_bytes=cfg.backend_response_max_bytes,
     )
 
+    # Command-poll icin AYRI client + session. Config-refresh thread'i 5dk'da
+    # bir agir config fetch yapar; ayni session paylasilirsa 1sn'lik command
+    # poll o fetch'e takilip "Read timed out" alirdi. Ayri session + kisa
+    # (connect, read) timeout ile poll bagimsiz kalir.
+    command_client = BackendConfigClient(
+        base_url=cfg.backend_api_url,
+        identity=identity,
+        timeout_sec=(3, cfg.command_poll_timeout_sec),
+        verify=_tls_verify_param(cfg),
+        response_max_bytes=cfg.backend_response_max_bytes,
+    )
+
     refresh_thread = Thread(
         target=_run_config_refresh,
         kwargs={
@@ -728,7 +740,7 @@ def run(current_settings: Settings | None = None) -> int:
         command_thread = Thread(
             target=_run_command_poll,
             kwargs={
-                "client": config_client,
+                "client": command_client,
                 "reader": reader,
                 "state": state,
                 "ledger": command_ledger,

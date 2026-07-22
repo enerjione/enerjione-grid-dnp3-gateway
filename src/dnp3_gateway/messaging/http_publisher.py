@@ -14,6 +14,7 @@ from typing import Any
 import requests
 
 from dnp3_gateway.auth import GatewayIdentity, build_config_request_headers
+from dnp3_gateway.backend.http_session import build_http_session
 
 logger = logging.getLogger(__name__)
 
@@ -48,11 +49,15 @@ class HttpTelemetryPublisher:
         self.identity = identity
         self.timeout_sec = float(timeout_sec)
         self.url = f"{self.base_url}/telemetry/gateway/{identity.gateway_code}"
-        self._session = session or requests.Session()
-        if session is None:
-            self._session.verify = verify  # type: ignore[assignment]
+        # Connection-pooled session: poller paralel worker'lari + retrier ayni
+        # host'a es zamanli POST atar. Default pool (maxsize=10) doyunca
+        # baglantilar bloke olur; buyuk pool ile paralel akis serbest kalir.
+        self._session = session or build_http_session(pool_maxsize=32, verify=verify)
         self._ready = True
         self._closed = False
+        # Lock SADECE _closed/_ready gibi kucuk state'i korur; HTTP POST lock
+        # DISINDA yapilir (requests.Session connection pool ile thread-safe).
+        # Boylece bir yavas POST digerlerini kilitlemez.
         self._lock = threading.Lock()
         self._counter_lock = threading.Lock()
         self._publish_failures = 0

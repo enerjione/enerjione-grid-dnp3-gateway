@@ -181,6 +181,10 @@ class Settings(BaseSettings):
     # diye kisa (1sn). GET /gateways/{code}/pending — agir config serialize yok.
     command_poll_sec: int = Field(default=1, ge=1, le=60)
     config_timeout_sec: int = Field(default=5, ge=1, le=60)
+    # Command-poll READ timeout (sn). Config fetch'ten AYRI: poll kisa read
+    # timeout ile hizli hata verip bir sonraki turda yeniden dener, uzun
+    # takilmaz. Connect timeout sabit 3sn (bkz main.py command_client).
+    command_poll_timeout_sec: float = Field(default=4.0, ge=1.0, le=30.0)
     config_cache_max_age_hours: float = Field(
         default=24.0,
         ge=1.0,

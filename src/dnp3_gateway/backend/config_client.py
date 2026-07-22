@@ -23,6 +23,7 @@ from typing import Any
 import requests
 
 from dnp3_gateway.auth import GatewayIdentity, build_config_request_headers
+from dnp3_gateway.backend.http_session import build_http_session
 
 
 @dataclass(frozen=True)
@@ -219,7 +220,10 @@ class BackendConfigClient:
         *,
         base_url: str,
         identity: GatewayIdentity,
-        timeout_sec: int = 5,
+        # int/float tek deger VEYA (connect, read) tuple — requests ikisini de
+        # kabul eder. Command-poll icin (connect, read) ayrimi kisa read timeout
+        # verip agir config fetch'in poll'u bloke etmesini onler.
+        timeout_sec: float | tuple[float, float] = 5,
         session: requests.Session | None = None,
         verify: bool | str = True,
         response_max_bytes: int = DEFAULT_RESPONSE_MAX_BYTES,
@@ -229,9 +233,9 @@ class BackendConfigClient:
         self.gateway_code = identity.gateway_code
         self.timeout_sec = timeout_sec
         self._response_max_bytes = max(64 * 1024, int(response_max_bytes))
-        self._session = session or requests.Session()
-        if session is None:
-            self._session.verify = verify  # type: ignore[assignment]
+        # Connection-pooled session: config-refresh ve (ayri client ornegindeki)
+        # command-poll thread'leri kendi session'iyla baglanti yarisi yasamaz.
+        self._session = session or build_http_session(pool_maxsize=8, verify=verify)
 
     def fetch_config(self) -> GatewayConfig:
         url = f"{self.base_url}/gateways/{self.gateway_code}/config"
