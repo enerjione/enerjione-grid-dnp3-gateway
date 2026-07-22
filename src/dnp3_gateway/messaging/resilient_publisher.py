@@ -193,6 +193,71 @@ class ResilientPublisher:
                     self._consecutive_failures,
                 )
 
+    def publish_batch(self, items: list[dict[str, Any]]) -> None:
+        """Bir cihazin tum degisen sinyallerini TEK broker cagrisiyla yayinla.
+
+        `items`: her biri {"payload", "message_id", "correlation_id", "headers"}.
+        Broker `publish_batch` destekliyorsa (HTTP) tek POST; desteklemiyorsa
+        (JetStream — mesaj-basina) tek tek `publish`'e duser.
+
+        Basari -> outbox-full temizle. Hata -> TUM batch item'lari tek tek
+        outbox'a yazilir (retrier mevcut satir-bazli mantikla bosaltir; sira
+        ve at-least-once korunur). Outbox dolu -> OutboxFullError raise (breaker).
+        """
+        if not items:
+            return
+        batch_fn = getattr(self._broker, "publish_batch", None)
+        if not callable(batch_fn):
+            # Broker batch desteklemiyor -> tekli publish'e dus (mevcut davranis).
+            for it in items:
+                self.publish(
+                    it["payload"],
+                    message_id=it["message_id"],
+                    correlation_id=it.get("correlation_id"),
+                    headers=it.get("headers"),
+                )
+            return
+        try:
+            batch_fn(items)
+            if self._consecutive_failures:
+                logger.info("resilient_publisher_recovered after_failures=%s", self._consecutive_failures)
+                self._consecutive_failures = 0
+            if self._outbox_full:
+                self._clear_outbox_full()
+        except Exception as exc:  # noqa: BLE001
+            # Batch POST basarisiz -> her item'i tek tek outbox'a yaz. Ilk
+            # OutboxFullError'da breaker tetiklenir ve raise edilir (poller durur).
+            self._consecutive_failures += 1
+            for it in items:
+                try:
+                    self._outbox.enqueue(
+                        message_id=it["message_id"],
+                        correlation_id=it.get("correlation_id"),
+                        headers=it.get("headers"),
+                        payload=it["payload"],
+                        last_error=str(exc),
+                    )
+                except OutboxFullError as full_exc:
+                    self._set_outbox_full(str(full_exc))
+                    logger.error(
+                        "outbox_full_circuit_breaker (batch) pending=%d limit=%d error=%s",
+                        self._outbox.pending_count(),
+                        self._outbox.max_pending,
+                        exc,
+                    )
+                    raise full_exc
+                except Exception as enq_exc:  # noqa: BLE001
+                    self._set_outbox_full(f"outbox_io_error: {enq_exc}")
+                    logger.error("outbox_enqueue_failed_batch error=%s outbox_error=%s", exc, enq_exc)
+                    raise enq_exc
+            if self._consecutive_failures in (1, 5, 50, 500):
+                logger.warning(
+                    "publish_batch_failed_outboxed count=%d error=%s consecutive=%s",
+                    len(items),
+                    exc,
+                    self._consecutive_failures,
+                )
+
     def close(self) -> None:
         self._broker.close()
         if self._secondary is not None:

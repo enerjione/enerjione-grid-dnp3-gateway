@@ -84,6 +84,44 @@ def test_http_publisher_posts_legacy_telemetry_list() -> None:
     assert publisher.is_ready is True
 
 
+def test_http_publisher_batch_single_post() -> None:
+    """publish_batch tum payload'lari TEK POST'ta (json=[p1,p2,...]) gonderir."""
+    session = _Session(_Response(202, '{"accepted":3}'))
+    publisher = HttpTelemetryPublisher(
+        base_url="http://backend/api/v1",
+        identity=_identity(),
+        session=session,  # type: ignore[arg-type]
+    )
+    p1 = {"message_id": "m1", "device_code": "D1", "signal_key": "s1", "value": 1.0}
+    p2 = {"message_id": "m2", "device_code": "D1", "signal_key": "s2", "value": 2.0}
+    p3 = {"message_id": "m3", "device_code": "D1", "signal_key": "s3", "value": 3.0}
+    items = [
+        {"payload": p1, "message_id": "m1", "correlation_id": "c1", "headers": {}},
+        {"payload": p2, "message_id": "m2", "correlation_id": "c1", "headers": {}},
+        {"payload": p3, "message_id": "m3", "correlation_id": "c1", "headers": {}},
+    ]
+
+    publisher.publish_batch(items)
+
+    assert session.last_json == [p1, p2, p3]     # tek POST, 3 payload
+    assert session.last_headers["X-Correlation-Id"] == "c1"
+    # 3 basari sayilir
+    assert publisher.counters_snapshot() == {"publish_failures": 0, "publish_successes": 3}
+
+
+def test_http_publisher_batch_transient_failure_raises() -> None:
+    """Batch POST gecici hata verirse NotReady raise (caller outbox'a yazar)."""
+    publisher = HttpTelemetryPublisher(
+        base_url="http://backend/api/v1",
+        identity=_identity(),
+        session=_Session(requests.Timeout("boom")),  # type: ignore[arg-type]
+    )
+    items = [{"payload": {"message_id": "m1"}, "message_id": "m1", "correlation_id": None, "headers": {}}]
+    with pytest.raises(HttpTelemetryNotReadyError):
+        publisher.publish_batch(items)
+    assert publisher.is_ready is False
+
+
 def test_http_publisher_raises_not_ready_for_transient_failure() -> None:
     publisher = HttpTelemetryPublisher(
         base_url="http://backend/api/v1",

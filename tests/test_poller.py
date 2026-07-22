@@ -33,6 +33,23 @@ class _StubPublisher:
         pass
 
 
+class _BatchStubPublisher:
+    """publish_batch destekleyen stub — HTTP publisher gibi tek cagride toplar."""
+
+    def __init__(self) -> None:
+        self.batches: list[list[dict]] = []
+        self.single_calls: list[_RecordedPublish] = []
+
+    def publish_batch(self, items):  # type: ignore[no-untyped-def]
+        self.batches.append(list(items))
+
+    def publish(self, payload, *, message_id, correlation_id=None, headers=None):  # type: ignore[no-untyped-def]
+        self.single_calls.append(_RecordedPublish(payload, message_id, correlation_id, headers))
+
+    def close(self) -> None:
+        pass
+
+
 class _StubReader(TelemetryReader):
     def __init__(self, readings: list[SignalReading]) -> None:
         self._readings = readings
@@ -112,6 +129,33 @@ def test_poll_device_publishes_each_reading() -> None:
     # Her mesaj ayni correlation_id paylasmali
     corr_ids = {call.correlation_id for call in publisher.calls}
     assert len(corr_ids) == 1
+
+
+def test_poll_device_uses_batch_when_supported() -> None:
+    """publish_batch destekleyen publisher'da tum sinyaller TEK batch cagrisiyla
+    gonderilir (N POST yerine 1). Fallback publish cagrilmaz."""
+    device = make_device("DEV-1")
+    signal = make_signal("master.actual_current")
+    readings = [
+        SignalReading(signal.key, signal.source, signal.data_type, 1.0, 1.0, "good"),
+        SignalReading("sat01.voltage", "sat01", "analog", 2.0, 2.0, "good"),
+        SignalReading("sat02.temp", "sat02", "analog", 3.0, 3.0, "good"),
+    ]
+    publisher = _BatchStubPublisher()
+    published = poll_device(
+        gateway_code="GW-001",
+        device=device,
+        signals=[signal],
+        reader=_StubReader(readings),
+        publisher=publisher,
+    )
+    assert published == 3
+    assert len(publisher.batches) == 1          # tek batch cagrisi
+    assert len(publisher.batches[0]) == 3       # 3 item icinde
+    assert not publisher.single_calls           # tekli publish'e dusmedi
+    # Her item beklenen alanlari icermeli
+    for item in publisher.batches[0]:
+        assert set(item) >= {"payload", "message_id", "correlation_id", "headers"}
 
 
 def test_poll_device_swallows_reader_errors() -> None:

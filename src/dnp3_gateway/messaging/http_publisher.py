@@ -111,6 +111,69 @@ class HttpTelemetryPublisher:
             f"backend ingest rejected: HTTP {response.status_code}: {preview}"
         )
 
+    def publish_batch(self, items: list[dict[str, Any]]) -> None:
+        """Birden fazla telemetri payload'unu TEK HTTP POST ile gonderir.
+
+        Backend `/telemetry/gateway/{code}` endpoint'i `list[TelemetryIn]`
+        kabul ettigi icin (mesaj-basina-POST yerine) tum dalgayi tek istekte
+        yollariz — 300 cihaz recovery/refresh dalgalarinda throughput'u
+        buyuk olcude artirir. Hata semantigi tekli publish ile ayni: gecici
+        hata -> HttpTelemetryNotReadyError (caller/ResilientPublisher tum
+        batch'i outbox'a tek tek yazar).
+
+        `items`: her biri {"payload": {...}, "correlation_id": str|None} dict'i.
+        """
+        if not items:
+            return
+        with self._lock:
+            if self._closed:
+                self._mark_failure()
+                raise HttpTelemetryNotReadyError("backend ingest not ready: publisher closed")
+
+        payloads = [it["payload"] for it in items]
+        # Correlation id: batch'in ilkini kullan (backend per-item id'yi
+        # payload icinden de okuyabiliyor; header tek deger olabilir).
+        first_corr = items[0].get("correlation_id")
+        request_headers = build_config_request_headers(self.identity)
+        request_headers["Content-Type"] = "application/json"
+        if first_corr:
+            request_headers["X-Correlation-Id"] = str(first_corr)
+
+        try:
+            response = self._session.post(
+                self.url,
+                headers=request_headers,
+                json=payloads,
+                timeout=self.timeout_sec,
+            )
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            self._set_ready(False)
+            self._mark_failure()
+            err = _scrub_token(str(exc), self.identity.token)
+            raise HttpTelemetryNotReadyError(f"backend ingest not ready: {err}") from exc
+        except requests.RequestException as exc:
+            self._set_ready(False)
+            self._mark_failure()
+            err = _scrub_token(str(exc), self.identity.token)
+            raise HttpTelemetryNotReadyError(f"backend ingest not ready: {err}") from exc
+
+        if 200 <= response.status_code < 300:
+            self._set_ready(True)
+            with self._counter_lock:
+                self._publish_successes += len(payloads)
+            return
+
+        preview = _scrub_token((response.text or "")[:500], self.identity.token)
+        self._mark_failure()
+        if response.status_code == 429 or response.status_code >= 500:
+            self._set_ready(False)
+            raise HttpTelemetryNotReadyError(
+                f"backend ingest not ready: HTTP {response.status_code}: {preview}"
+            )
+        raise HttpTelemetryPublishError(
+            f"backend ingest rejected: HTTP {response.status_code}: {preview}"
+        )
+
     def close(self) -> None:
         with self._lock:
             if self._closed:

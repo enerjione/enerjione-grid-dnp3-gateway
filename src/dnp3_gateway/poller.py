@@ -40,12 +40,6 @@ from dnp3_gateway.state import GatewayState
 
 logger = logging.getLogger(__name__)
 
-# Tek cihazin sinyallerini paralel yayinlarken kullanilacak max thread sayisi.
-# Publish I/O-bound (WAN ack bekleme) oldugu icin cekirdek sayisindan bagimsiz;
-# 8 makul: ariza aninda onlarca sinyali birkac dalga halinde hizli gonderir,
-# ama broker'i/thread'i asiri yormaz.
-_MAX_PUBLISH_WORKERS = 8
-
 
 # Module-level thread pool: her cycle'da yeniden create/destroy etmek yerine
 # tek pool'u tekrar kullaniriz. 100 cihaz × 5sn cycle = saniyede 12 cycle, eski
@@ -185,69 +179,56 @@ def poll_device(
     if not to_publish:
         return 0
 
-    def _publish_one(reading: SignalReading) -> str | None:
-        """Tek sinyali yayinla. Basari -> None; OutboxFull -> 'outbox_full';
-        diger hata -> loglanir, 'error' doner (breaker tetiklemez)."""
-        payload = build_telemetry_payload(
-            gateway_code=gateway_code,
-            device=device,
-            reading=reading,
-            correlation_id=correlation_id,
-            now_iso=now_iso,
-        )
+    # BATCH: bir cihazin tum degisen sinyalleri TEK broker cagrisiyla yayinlanir.
+    # HTTP publisher bunu tek POST'a cevirir (json=[p1,p2,...]) -> 300 cihaz
+    # recovery/refresh dalgalarinda N POST yerine 1 POST. Broker batch
+    # desteklemiyorsa (JetStream) ResilientPublisher tek tek publish'e duser.
+    # OutboxFullError -> caller (cycle) yakalar, disk-full breaker.
+    items = [
+        {
+            "payload": (
+                p := build_telemetry_payload(
+                    gateway_code=gateway_code,
+                    device=device,
+                    reading=reading,
+                    correlation_id=correlation_id,
+                    now_iso=now_iso,
+                )
+            ),
+            "message_id": p["message_id"],
+            "correlation_id": correlation_id,
+            "headers": {
+                "source_gateway": gateway_code,
+                "device_code": device.code,
+                "signal_key": reading.signal_key,
+            },
+        }
+        for reading in to_publish
+    ]
+    batch_fn = getattr(publisher, "publish_batch", None)
+    if callable(batch_fn):
+        # publish_batch hata durumunda outbox'a yazar (raise etmez), sadece
+        # OutboxFullError yayar -> cycle breaker. Basari = tum item yayinlandi.
+        batch_fn(items)
+        return len(items)
+    # Fallback: batch yok -> tek tek publish (eski davranis).
+    published = 0
+    for it in items:
         try:
             publisher.publish(
-                payload,
-                message_id=payload["message_id"],
-                correlation_id=correlation_id,
-                headers={
-                    "source_gateway": gateway_code,
-                    "device_code": device.code,
-                    "signal_key": reading.signal_key,
-                },
+                it["payload"],
+                message_id=it["message_id"],
+                correlation_id=it["correlation_id"],
+                headers=it["headers"],
             )
-            return None
+            published += 1
         except OutboxFullError:
-            return "outbox_full"
+            raise
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "poll_device_publish_failed gateway=%s device=%s signal=%s error=%s",
-                gateway_code,
-                device.code,
-                reading.signal_key,
-                exc,
+                "poll_device_publish_failed gateway=%s device=%s error=%s",
+                gateway_code, device.code, exc,
             )
-            return "error"
-
-    # Tek cihazin sinyalleri SERI degil PARALEL yayinlanir: WAN'da her publish
-    # ack bekledigi icin (~50-500ms), ariza aninda onlarca sinyal seri gonderilince
-    # o cihaz cycle'i kilitleniyordu. Publisher thread-safe -> paralel guvenli.
-    # Az sinyalde (<=1) thread pool acmaya gerek yok.
-    published = 0
-    if len(to_publish) <= 1:
-        result = _publish_one(to_publish[0])
-        if result == "outbox_full":
-            raise OutboxFullError("outbox full during single-signal publish")
-        if result is None:
-            published = 1
-        return published
-
-    max_pub_workers = min(len(to_publish), _MAX_PUBLISH_WORKERS)
-    with ThreadPoolExecutor(max_workers=max_pub_workers, thread_name_prefix="pub") as pool:
-        futures = [pool.submit(_publish_one, r) for r in to_publish]
-        outbox_full_hit = False
-        for fut in futures:
-            try:
-                res = fut.result()
-            except Exception:  # noqa: BLE001 — _publish_one zaten yutuyor; ekstra emniyet
-                res = "error"
-            if res == "outbox_full":
-                outbox_full_hit = True
-            elif res is None:
-                published += 1
-        if outbox_full_hit:
-            # Disk-full circuit breaker: en az bir publish outbox-full aldi -> cycle dursun.
-            raise OutboxFullError("outbox full during parallel signal publish")
     return published
 
 
