@@ -28,7 +28,12 @@ from dnp3_gateway import __version__
 from dnp3_gateway.adapters import TelemetryReader, build_adapter
 from dnp3_gateway.auth import GatewayIdentity, bootstrap_gateway_identity
 from dnp3_gateway.auth.instance_lock import acquire_instance_lock
-from dnp3_gateway.backend import BackendConfigClient, GatewayConfigError
+from dnp3_gateway.backend import (
+    BackendConfigClient,
+    GatewayConfigError,
+    _log_allowlist_state,
+    parse_device_ip_allowlist,
+)
 from dnp3_gateway.config import Settings, settings
 from dnp3_gateway.health_server import GatewayMetrics, start_health_server
 from dnp3_gateway.logging_setup import configure_logging, register_secret
@@ -698,12 +703,27 @@ def run(current_settings: Settings | None = None) -> int:
             cfg.dnp3_tcp_port,
         )
 
+    # Cihaz IP allowlist'i ETKIN Settings'ten cozumlenir (import-time singleton
+    # degil) — boylece `--env-file .env.GW-002` ile baslatilan instance kendi
+    # allowlist'ini kullanir. Gecersiz CIDR girisleri burada bir kez, net sekilde
+    # loglanir; hepsi gecersizse fail-closed davranilir (tum cihazlar reddedilir).
+    device_ip_allowlist = parse_device_ip_allowlist(cfg.dnp3_device_allowed_subnets)
+    _log_allowlist_state(device_ip_allowlist)
+    if device_ip_allowlist.fail_closed:
+        raise SystemExit(
+            "DNP3_DEVICE_ALLOWED_SUBNETS tanimli ama tek bir gecerli CIDR yok "
+            f"(gecersiz girisler: {', '.join(device_ip_allowlist.invalid_entries)}). "
+            "Bu haliyle gateway hicbir cihaza baglanamaz. Ayari duzeltin, "
+            "ornek: DNP3_DEVICE_ALLOWED_SUBNETS=192.168.10.0/24,10.0.5.0/24"
+        )
+
     config_client = BackendConfigClient(
         base_url=cfg.backend_api_url,
         identity=identity,
         timeout_sec=cfg.config_timeout_sec,
         verify=_tls_verify_param(cfg),
         response_max_bytes=cfg.backend_response_max_bytes,
+        device_ip_allowlist=device_ip_allowlist,
     )
 
     # Command-poll icin AYRI client + session. Config-refresh thread'i 5dk'da
@@ -716,6 +736,7 @@ def run(current_settings: Settings | None = None) -> int:
         timeout_sec=(3, cfg.command_poll_timeout_sec),
         verify=_tls_verify_param(cfg),
         response_max_bytes=cfg.backend_response_max_bytes,
+        device_ip_allowlist=device_ip_allowlist,
     )
 
     refresh_thread = Thread(

@@ -16,6 +16,7 @@ satiri dusurulur, disk cache de tazelenir.
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass, field
 from typing import Any
@@ -24,6 +25,17 @@ import requests
 
 from dnp3_gateway.auth import GatewayIdentity, build_config_request_headers
 from dnp3_gateway.backend.http_session import build_http_session
+
+# Modul-seviye logger. ONEMLI: eskiden bazi fonksiyonlar `import logging as
+# _logging` satirini KENDI govdesinde yapiyor, baska fonksiyonlar ise ayni
+# `_logging` adini import etmeden kullaniyordu. Python'da fonksiyon-lokal
+# import global isim alanina girmedigi icin bu, uc ayri kod yolunda
+# `NameError: name '_logging' is not defined` uretiyordu:
+#   * fetch_pending_commands bozuk komut parse yolu -> TUM komut kanali olur
+#   * _parse_allowed_subnets gecersiz CIDR yolu     -> config HIC cekilemez
+#   * _allowed_networks_cached allowlist dolu yolu  -> ilk config fetch duser
+# Tek bir modul-seviye logger ile bu sinif hata kalici olarak kapatildi.
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -227,12 +239,19 @@ class BackendConfigClient:
         session: requests.Session | None = None,
         verify: bool | str = True,
         response_max_bytes: int = DEFAULT_RESPONSE_MAX_BYTES,
+        # Cihaz IP allowlist'i ARTIK DISARIDAN gecirilir. Eskiden modul-seviye
+        # bir cache import-time `settings` singleton'ini okuyordu; bu, `--env-file
+        # .env.GW-002` ile baslatilan instance'larda YANLIS dosyadan (kok `.env`)
+        # okumaya yol aciyordu. main.py artik etkin Settings'ten cozumleyip
+        # buraya enjekte eder.
+        device_ip_allowlist: DeviceIpAllowlist | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.identity = identity
         self.gateway_code = identity.gateway_code
         self.timeout_sec = timeout_sec
         self._response_max_bytes = max(64 * 1024, int(response_max_bytes))
+        self._device_ip_allowlist = device_ip_allowlist
         # Connection-pooled session: config-refresh ve (ayri client ornegindeki)
         # command-poll thread'leri kendi session'iyla baglanti yarisi yasamaz.
         self._session = session or build_http_session(pool_maxsize=8, verify=verify)
@@ -340,7 +359,21 @@ class BackendConfigClient:
                 f"config response root must be object, got {type(data).__name__}"
             )
 
-        return _parse_gateway_config(data, default_gateway_code=self.gateway_code)
+        # Beklenmedik parse hatalari sozlesmeyi bozmasin: caller (config-refresh
+        # thread'i) GatewayConfigError bekliyor. Ciplak bir NameError/TypeError
+        # generic except'e duserdi ve teshis edilemez hale gelirdi.
+        try:
+            return _parse_gateway_config(
+                data,
+                default_gateway_code=self.gateway_code,
+                allowlist=self._device_ip_allowlist,
+            )
+        except GatewayConfigError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise GatewayConfigError(
+                f"config parse failed: {type(exc).__name__}: {exc}"
+            ) from exc
 
     def fetch_pending_commands(self) -> "PendingPoll":
         """Hafif komut-poll — GET /gateways/{code}/pending.
@@ -412,7 +445,7 @@ class BackendConfigClient:
                         )
                     )
                 except (KeyError, TypeError, ValueError) as exc:
-                    _logging.getLogger(__name__).warning(
+                    logger.warning(
                         "pending_command_parse_failed id=%r error=%s", item.get("id"), exc
                     )
 
@@ -483,8 +516,7 @@ def _truncate(value: str, max_len: int) -> str:
     s = str(value)
     if len(s) <= max_len:
         return s
-    import logging as _logging
-    _logging.getLogger(__name__).warning(
+    logger.warning(
         "config_field_truncated len=%d max=%d preview=%r",
         len(s),
         max_len,
@@ -509,34 +541,117 @@ def _is_safe_device_ip(ip: str) -> bool:
     return True
 
 
-def _parse_allowed_subnets(raw: str) -> list[Any]:
-    """`192.168.10.0/24,10.0.5.0/24` formatindaki CIDR listesini parse et.
+@dataclass(frozen=True)
+class DeviceIpAllowlist:
+    """Cihaz IP allowlist'inin cozumlenmis hali (SSRF / ic-ag tarama korumasi).
 
-    Gecersiz/bos giris -> bos liste (allowlist devre disi, geriye uyumlu).
+    Uc durum ayirt edilir — bu ayrim GUVENLIK acisindan kritiktir:
+
+      * `configured=False`            -> operator allowlist tanimlamadi.
+        Geriye uyumlu davranis: tum IP'ler kabul edilir.
+      * `configured=True, networks>0` -> normal calisma; sadece bu CIDR'ler.
+      * `configured=True, networks=0` -> operator allowlist tanimladi AMA
+        HICBIRI parse edilemedi (yazim hatasi). Bu durumda FAIL-CLOSED
+        davraniriz: tum cihazlar reddedilir. Eski davranis "sessizce herkesi
+        kabul et" idi — yani bir yazim hatasi guvenlik kontrolunu tamamen
+        devre disi birakiyordu ve kimse fark etmiyordu.
+    """
+
+    networks: tuple[Any, ...] = ()
+    configured: bool = False
+    invalid_entries: tuple[str, ...] = ()
+
+    @property
+    def fail_closed(self) -> bool:
+        """Allowlist istendi ama tek bir gecerli giris yok -> her seyi reddet."""
+        return self.configured and not self.networks
+
+    def allows(self, ip: str) -> bool:
+        """IP bu allowlist'ten geciyor mu?
+
+        Hostname (FQDN) gibi IP olmayan degerler allowlist aktifken reddedilir;
+        gateway DNS cozumlemesi yapmaz, operator IP olarak yapilandirmalidir.
+        """
+        if self.fail_closed:
+            return False
+        if not self.configured or not self.networks:
+            return True
+        if not ip or not ip.strip():
+            return True  # initiating mode: cihaz bize baglanir, IP'si yok
+        import ipaddress as _ip
+
+        try:
+            addr = _ip.ip_address(ip.strip())
+        except ValueError:
+            return False
+        return any(addr in net for net in self.networks)
+
+
+def parse_device_ip_allowlist(raw: str | None) -> DeviceIpAllowlist:
+    """`192.168.10.0/24,10.0.5.0/24` formatindaki CIDR listesini cozumler.
+
+    Gecersiz girisler `invalid_entries` icinde raporlanir; sessizce yutulmaz.
+    Bos/None giris -> `configured=False` (allowlist kapali, geriye uyumlu).
     """
     import ipaddress as _ip
 
-    out: list[Any] = []
-    for part in (raw or "").split(","):
+    text = (raw or "").strip()
+    if not text:
+        return DeviceIpAllowlist()
+
+    nets: list[Any] = []
+    invalid: list[str] = []
+    for part in text.split(","):
         s = part.strip()
         if not s:
             continue
         try:
-            out.append(_ip.ip_network(s, strict=False))
+            nets.append(_ip.ip_network(s, strict=False))
         except ValueError:
-            _logging.getLogger(__name__).warning(
-                "dnp3_device_allowed_subnets_parse_failed entry=%r — atlandi", s
-            )
-    return out
+            invalid.append(s)
+
+    return DeviceIpAllowlist(
+        networks=tuple(nets),
+        configured=True,
+        invalid_entries=tuple(invalid),
+    )
 
 
-# Modul-seviye cache: Settings'i her _parse_gateway_config cagrisinda yuklemek
-# yerine bir kez okuyup tutarız. Operator runtime'da degistirirse gateway
-# restart edilmeli (zaten env-bazli config restart gerektiriyor).
-_ALLOWED_NETWORKS_CACHE: list[Any] | None = None
+def _log_allowlist_state(allowlist: DeviceIpAllowlist) -> None:
+    """Allowlist durumunu bir kez, operatorun anlayacagi netlikte logla."""
+    for entry in allowlist.invalid_entries:
+        logger.error(
+            "dnp3_device_allowed_subnets_invalid entry=%r — gecersiz CIDR; "
+            "DNP3_DEVICE_ALLOWED_SUBNETS degerini duzeltin "
+            "(ornek: 192.168.10.0/24,10.0.5.0/24)",
+            entry,
+        )
+    if allowlist.fail_closed:
+        logger.error(
+            "dnp3_device_allowlist_fail_closed — DNP3_DEVICE_ALLOWED_SUBNETS "
+            "tanimli ama tek bir gecerli CIDR yok. GUVENLIK icin TUM cihazlar "
+            "reddediliyor. Ayari duzeltip gateway'i yeniden baslatin."
+        )
+    elif allowlist.configured:
+        logger.info(
+            "dnp3_device_allowed_subnets_loaded count=%d invalid=%d",
+            len(allowlist.networks),
+            len(allowlist.invalid_entries),
+        )
 
 
-def _allowed_networks_cached() -> list[Any]:
+# Geriye uyum: eski kod `_parse_allowed_subnets` bekliyordu.
+def _parse_allowed_subnets(raw: str) -> list[Any]:
+    return list(parse_device_ip_allowlist(raw).networks)
+
+
+# Modul-seviye cache — SADECE allowlist enjekte edilmediginde kullanilan
+# fallback (eski cagri sekli / testler). Uretimde main.py etkin Settings'ten
+# cozumleyip BackendConfigClient'a gecirir, bu yol calismaz.
+_ALLOWED_NETWORKS_CACHE: DeviceIpAllowlist | None = None
+
+
+def _allowed_networks_cached() -> DeviceIpAllowlist:
     global _ALLOWED_NETWORKS_CACHE
     if _ALLOWED_NETWORKS_CACHE is not None:
         return _ALLOWED_NETWORKS_CACHE
@@ -546,32 +661,18 @@ def _allowed_networks_cached() -> list[Any]:
         raw = _settings.dnp3_device_allowed_subnets or ""
     except Exception:  # noqa: BLE001
         raw = ""
-    _ALLOWED_NETWORKS_CACHE = _parse_allowed_subnets(raw)
-    if _ALLOWED_NETWORKS_CACHE:
-        _logging.getLogger(__name__).info(
-            "dnp3_device_allowed_subnets_loaded count=%d", len(_ALLOWED_NETWORKS_CACHE)
-        )
+    allowlist = parse_device_ip_allowlist(raw)
+    _log_allowlist_state(allowlist)
+    _ALLOWED_NETWORKS_CACHE = allowlist
     return _ALLOWED_NETWORKS_CACHE
 
 
-def _is_device_ip_in_allowlist(ip: str, allowed_networks: list[Any]) -> bool:
-    """IP allowlist kontrolu. Allowlist bos ise hepsi gecer (geriye uyumlu).
-
-    Hostname (FQDN) IP olmayan deger gelirse allowlist set'lendiginde reddedilir
-    (gateway DNS cozumlemesi yapmiyor; operator IP olarak yapilandirmali).
-    """
-    if not allowed_networks:
-        return True
-    if not ip or not ip.strip():
-        return True  # initiating mode, IP yok
-    import ipaddress as _ip
-
-    try:
-        addr = _ip.ip_address(ip.strip())
-    except ValueError:
-        # Hostname/FQDN — allowlist aktifken kabul edilmez
-        return False
-    return any(addr in net for net in allowed_networks)
+def _is_device_ip_in_allowlist(ip: str, allowed_networks: Any) -> bool:
+    """Geriye uyum sarmalayicisi (eski imza: (ip, list[network]))."""
+    if isinstance(allowed_networks, DeviceIpAllowlist):
+        return allowed_networks.allows(ip)
+    nets = list(allowed_networks or ())
+    return DeviceIpAllowlist(networks=tuple(nets), configured=bool(nets)).allows(ip)
 
 
 def _safe_int(value: Any, default: int, *, lo: int, hi: int) -> int:
@@ -609,7 +710,12 @@ def _safe_finite_float(value: Any, default: float) -> float:
     return f
 
 
-def _parse_gateway_config(data: dict[str, Any], *, default_gateway_code: str) -> GatewayConfig:
+def _parse_gateway_config(
+    data: dict[str, Any],
+    *,
+    default_gateway_code: str,
+    allowlist: DeviceIpAllowlist | None = None,
+) -> GatewayConfig:
     """Bos/bozuk alanlari varsayilanlarla doldurarak GatewayConfig ureten helper.
 
     Defansif schema validation:
@@ -624,7 +730,6 @@ def _parse_gateway_config(data: dict[str, Any], *, default_gateway_code: str) ->
     # host.docker.internal'a cevir. Tipik kurulum (cati yazilim + simulator
     # ayni Windows host'unda) icin gerekli; ozel saha kurulumlarinda
     # kapatilabilir (REWRITE_LOOPBACK_TO_HOST=false).
-    import logging as _logging
     import os as _os
 
     rewrite = (_os.environ.get("REWRITE_LOOPBACK_TO_HOST", "true").strip().lower()
@@ -636,7 +741,7 @@ def _parse_gateway_config(data: dict[str, Any], *, default_gateway_code: str) ->
             f"config response 'devices' list olmali (gelen tip: {type(devices_raw).__name__})"
         )
     if len(devices_raw) > _MAX_DEVICES_HARD_LIMIT:
-        _logging.getLogger(__name__).error(
+        logger.error(
             "config_devices_overflow received=%d hard_limit=%d — fazlasi yok sayilacak. "
             "Backend kompromize olmus olabilir; INSTALLER'i bilgilendirin.",
             len(devices_raw),
@@ -645,27 +750,25 @@ def _parse_gateway_config(data: dict[str, Any], *, default_gateway_code: str) ->
         devices_raw = devices_raw[:_MAX_DEVICES_HARD_LIMIT]
     devices: list[DeviceConfig] = []
     rejected_ips = 0
-    # Allowlist konfigurasyon yoluyla okunur (Settings.dnp3_device_allowed_subnets).
-    # _parse_gateway_config kendi Settings instance'ini olusturmaz; modul-seviye
-    # cache ile lazy yuklenir (ilk cagrida parse edilir, sonraki call'larda
-    # ayni liste). Operator runtime'da env degistirir → restart sonrasi yuklenir.
-    allowed_networks = _allowed_networks_cached()
+    # Allowlist caller tarafindan (main.py -> BackendConfigClient) enjekte edilir.
+    # Gecirilmediyse (eski cagri sekli / testler) modul cache'ine duseriz.
+    effective_allowlist = allowlist if allowlist is not None else _allowed_networks_cached()
     for item in devices_raw:
         if not isinstance(item, dict) or not item.get("code"):
             continue
         raw_ip = str(item.get("ip_address") or "")
         if not _is_safe_device_ip(raw_ip):
             rejected_ips += 1
-            _logging.getLogger(__name__).warning(
+            logger.warning(
                 "config_device_rejected_unsafe_ip code=%r ip=%r — backend bozuk "
                 "veya kompromize, cihaz atlandi",
                 item.get("code"),
                 raw_ip[:80],
             )
             continue
-        if not _is_device_ip_in_allowlist(raw_ip, allowed_networks):
+        if not effective_allowlist.allows(raw_ip):
             rejected_ips += 1
-            _logging.getLogger(__name__).warning(
+            logger.warning(
                 "config_device_rejected_outside_allowlist code=%r ip=%r — "
                 "DNP3_DEVICE_ALLOWED_SUBNETS disinda, cihaz atlandi (SSRF/scan koruma)",
                 item.get("code"),
@@ -679,7 +782,7 @@ def _parse_gateway_config(data: dict[str, Any], *, default_gateway_code: str) ->
             if item.get("dnp3_address") not in (None, "") and dnp3_addr != int(
                 item.get("dnp3_address") or 0
             ):
-                _logging.getLogger(__name__).warning(
+                logger.warning(
                     "config_dnp3_address_out_of_range code=%r received=%r clamped=%d",
                     item.get("code"),
                     item.get("dnp3_address"),
@@ -717,13 +820,13 @@ def _parse_gateway_config(data: dict[str, Any], *, default_gateway_code: str) ->
                 )
             )
         except (TypeError, ValueError) as exc:
-            _logging.getLogger(__name__).warning(
+            logger.warning(
                 "config_device_parse_failed code=%r error=%s — cihaz atlandi",
                 item.get("code"),
                 exc,
             )
     if rejected_ips:
-        _logging.getLogger(__name__).error(
+        logger.error(
             "config_rejected_devices count=%d — schema validation",
             rejected_ips,
         )
@@ -734,7 +837,7 @@ def _parse_gateway_config(data: dict[str, Any], *, default_gateway_code: str) ->
             f"config response 'signals' list olmali (gelen tip: {type(signals_raw).__name__})"
         )
     if len(signals_raw) > _MAX_SIGNALS_HARD_LIMIT:
-        _logging.getLogger(__name__).error(
+        logger.error(
             "config_signals_overflow received=%d hard_limit=%d — fazlasi yok sayilacak.",
             len(signals_raw),
             _MAX_SIGNALS_HARD_LIMIT,
@@ -757,7 +860,7 @@ def _parse_gateway_config(data: dict[str, Any], *, default_gateway_code: str) ->
             # Default'a indirilen anlamli bir degerse log atalim (saldiri /
             # backend bozulmasi sinyali).
             if raw_scale not in (None, "", 1.0, "1.0") and scale_val == 1.0:
-                _logging.getLogger(__name__).warning(
+                logger.warning(
                     "config_signal_scale_invalid key=%r received=%r -> default 1.0",
                     item.get("key"),
                     raw_scale,
@@ -780,7 +883,7 @@ def _parse_gateway_config(data: dict[str, Any], *, default_gateway_code: str) ->
                 )
             )
         except (TypeError, ValueError) as exc:
-            _logging.getLogger(__name__).warning(
+            logger.warning(
                 "config_signal_parse_failed key=%r error=%s — sinyal atlandi",
                 item.get("key"),
                 exc,
@@ -813,7 +916,7 @@ def _parse_gateway_config(data: dict[str, Any], *, default_gateway_code: str) ->
                     )
                 )
             except (KeyError, TypeError, ValueError) as exc:
-                _logging.getLogger(__name__).warning(
+                logger.warning(
                     "config_pending_command_parse_failed id=%r error=%s — komut atlandi",
                     item.get("id"),
                     exc,
