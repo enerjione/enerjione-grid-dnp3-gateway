@@ -143,7 +143,19 @@ class GatewayConfig:
     is_active: bool
     config_version: str
     devices: list[DeviceConfig] = field(default_factory=list)
+    # DUZ liste — profil bilgisi olmayan/eski backend'ler icin. Tum cihazlara
+    # ayni set uygulanir; bu yalnizca TEK modelli kurulumda dogrudur.
     signals: list[SignalConfig] = field(default_factory=list)
+    # PROFIL (cihaz modeli) bazli setler: {profil_anahtari: [sinyaller]}.
+    #
+    # NEDEN: duz liste tek modelli kurulumda dogru calisir ama ikinci bir DNP3
+    # modeli eklendigi anda bozulur — ayni (object_group, index) cifti iki
+    # modelde FARKLI buyuklugu gosterir. Set ayrilmazsa okunan deger YANLIS
+    # `signal_key` ile yayinlanir; hata sessizdir, esik alarmi baska bir
+    # buyuklugun uzerinden calisir.
+    #
+    # Bos sozluk = eski backend (alan yok) -> duz listeye dusulur.
+    signals_by_profile: dict[str, list[SignalConfig]] = field(default_factory=dict)
     # Operator "tum cihazlara sorgu at" sayaci. Bir oncekiyle karsilastirilarak
     # integrity poll tetiklemesi yapilir; kalici state.py icinde tutulur.
     refresh_nonce: int = 0
@@ -157,6 +169,77 @@ class GatewayConfig:
 
 class GatewayConfigError(RuntimeError):
     """Backend API config endpoint'inden gecerli bir yanit alinamadi."""
+
+
+def _parse_signal_list(
+    signals_raw: Any, *, alan: str = "signals"
+) -> list[SignalConfig]:
+    """Ham sinyal listesini dogrulayarak SignalConfig listesine cevirir.
+
+    Hem duz `signals` hem `signals_by_profile` degerleri BURADAN gecer.
+    Ayri bir kopya yazilsaydi profil listesi sessizce daha zayif
+    dogrulanirdi: scale/offset icin inf/nan reddi, DNP3 grup/index clamp'i
+    ve alan kirpma yalnizca duz listeye uygulanmis olurdu.
+    """
+    if not isinstance(signals_raw, list):
+        raise GatewayConfigError(
+            f"config response {alan!r} list olmali "
+            f"(gelen tip: {type(signals_raw).__name__})"
+        )
+    if len(signals_raw) > _MAX_SIGNALS_HARD_LIMIT:
+        logger.error(
+            "config_signals_overflow alan=%s received=%d hard_limit=%d — fazlasi yok sayilacak.",
+            alan,
+            len(signals_raw),
+            _MAX_SIGNALS_HARD_LIMIT,
+        )
+        signals_raw = signals_raw[:_MAX_SIGNALS_HARD_LIMIT]
+
+    signals: list[SignalConfig] = []
+    for item in signals_raw:
+        if not isinstance(item, dict) or not item.get("key"):
+            continue
+        try:
+            # scale / offset: inf/nan reddet — JetStream consumer'a sizar ve
+            # json.dumps `Infinity` cikarir (allow_nan=True default), bazi
+            # tag-engine parser'lari bunu reject eder veya sessizce drop eder.
+            raw_scale = item.get("scale")
+            raw_offset = item.get("offset")
+            scale_val = _safe_finite_float(raw_scale, 1.0)
+            offset_val = _safe_finite_float(raw_offset, 0.0)
+            # _safe_finite_float "inf"/"nan"/parse hatasinda default'a duser.
+            # Default'a indirilen anlamli bir degerse log atalim (saldiri /
+            # backend bozulmasi sinyali).
+            if raw_scale not in (None, "", 1.0, "1.0") and scale_val == 1.0:
+                logger.warning(
+                    "config_signal_scale_invalid key=%r received=%r -> default 1.0",
+                    item.get("key"),
+                    raw_scale,
+                )
+            signals.append(
+                SignalConfig(
+                    key=_truncate(item["key"], _MAX_CODE_LENGTH),
+                    label=_truncate(item.get("label") or item["key"], _MAX_LABEL_LENGTH),
+                    unit=(_truncate(item["unit"], _MAX_UNIT_LENGTH) if item.get("unit") else None),
+                    source=_truncate(item.get("source") or "master", _MAX_CODE_LENGTH),
+                    dnp3_class=_truncate(item.get("dnp3_class") or "Class 1", _MAX_CODE_LENGTH),
+                    data_type=_truncate(item.get("data_type") or "analog", _MAX_CODE_LENGTH),
+                    # DNP3 grup ID'leri standartta 1-120; saglik icin 0-255 clamp.
+                    dnp3_object_group=_safe_int(item.get("dnp3_object_group"), 30, lo=0, hi=255),
+                    # DNP3 index 16-bit (0-65535).
+                    dnp3_index=_safe_int(item.get("dnp3_index"), 0, lo=0, hi=65535),
+                    scale=scale_val,
+                    offset=offset_val,
+                    supports_alarm=bool(item.get("supports_alarm", False)),
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            logger.warning(
+                "config_signal_parse_failed key=%r error=%s — sinyal atlandi",
+                item.get("key"),
+                exc,
+            )
+    return signals
 
 
 def _parse_optional_dnp3_tcp_port(item: dict[str, Any]) -> int | None:
@@ -245,6 +328,11 @@ class BackendConfigClient:
         # okumaya yol aciyordu. main.py artik etkin Settings'ten cozumleyip
         # buraya enjekte eder.
         device_ip_allowlist: DeviceIpAllowlist | None = None,
+        # Saat sapmasi gozlemcisi. Backend her yanitta HTTP `Date` basligi
+        # doner; ek altyapi olmadan gateway saatinin sapmasini olcebiliyoruz.
+        # Gateway saati TUM arsivin tek zaman referansidir ve daha once
+        # hicbir yerde dogrulanmiyordu.
+        clock_guard: Any = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.identity = identity
@@ -252,13 +340,53 @@ class BackendConfigClient:
         self.timeout_sec = timeout_sec
         self._response_max_bytes = max(64 * 1024, int(response_max_bytes))
         self._device_ip_allowlist = device_ip_allowlist
+        self._clock_guard = clock_guard
+        # Sartli istek onbellegi (ETag). Config nadiren degisir; her yoklamada
+        # 193 sinyali indirmemek icin son ETag ve son AYRISTIRILMIS config
+        # saklanir. 304 gelince ag uzerinden hicbir sey inmez ve JSON yeniden
+        # ayristirilmaz. Bkz. fetch_config.
+        self._last_etag: str | None = None
+        self._last_config: GatewayConfig | None = None
         # Connection-pooled session: config-refresh ve (ayri client ornegindeki)
         # command-poll thread'leri kendi session'iyla baglanti yarisi yasamaz.
         self._session = session or build_http_session(pool_maxsize=8, verify=verify)
 
+    def _observe_clock(self, response: Any) -> None:
+        """Yanittaki HTTP `Date` basligindan saat sapmasini gozle (best-effort)."""
+        guard = self._clock_guard
+        if guard is None:
+            return
+        try:
+            guard.observe_http_date(response.headers.get("Date"))
+        except Exception:  # noqa: BLE001
+            logger.debug("clock_observe_failed", exc_info=True)
+
     def fetch_config(self) -> GatewayConfig:
+        """Config'i ceker. DEGISMEDIYSE agdan hicbir sey indirmez.
+
+        SARTLI ISTEK (ETag / If-None-Match)
+        -----------------------------------
+        Adres haritasi nadiren degisir ama config-poll surekli calisir. Her
+        yoklamada 193 sinyali tel uzerinden cekmek bosuna trafik ve bosuna
+        JSON ayristirmasidir.
+
+        Backend bu yanit icin ETag uretiyor (config_version = payload'in
+        hash'i) ve `If-None-Match` eslesirse 304 donuyor. Gateway bu header'i
+        GONDERMIYORDU: backend'deki 304 yolu bugune kadar HIC calismadi ve her
+        yoklamada tam payload indi. Dahasi 304 gelse `status_code != 200`
+        kontrolune takilip HATA sayilacakti.
+
+        Artik: ilk cagri tam indirir, sonraki cagrilar yalnizca "degisti mi"
+        sorar. Degistiginde tam payload gelir ve onbellek tazelenir.
+        """
         url = f"{self.base_url}/gateways/{self.gateway_code}/config"
         headers = build_config_request_headers(self.identity)
+        # Sartli istek yalnizca elimizde AYRISTIRILMIS bir config varken
+        # gonderilir: 304 gelip donecek bir sey bulamamak, config'i hic
+        # alamamaktan beterdir. Restart sonrasi ilk cagri tam iner (surec
+        # basina bir kez); backend erisilemezse disk cache devrede.
+        if self._last_etag and self._last_config is not None:
+            headers["If-None-Match"] = self._last_etag
         try:
             # stream=True: body'i hemen okuma; Content-Length header'i kontrol
             # edilebilsin. response.content ile sonra gercek body okunur.
@@ -273,6 +401,31 @@ class BackendConfigClient:
             # token gozukmez ama defansif).
             err_text = _scrub_token_from_text(str(exc), self.identity.token)
             raise GatewayConfigError(f"config request failed: {err_text}") from exc
+
+        self._observe_clock(response)
+
+        # 304: config DEGISMEDI. Body yok, imza yok, ayristirma yok.
+        # `status_code != 200` kontrolunden ONCE ele alinmali — aksi halde
+        # basarili bir "degismedi" yaniti hata sayilirdi.
+        if response.status_code == 304:
+            try:
+                response.close()
+            except Exception:  # noqa: BLE001
+                pass
+            if self._last_config is None:
+                # Buraya normalde dusulmez (header'i yalnizca config varken
+                # gonderiyoruz). Dusulduyse onbellegi bosalt ki sonraki cagri
+                # kosulsuz gitsin ve kilitlenmeyelim.
+                self._last_etag = None
+                raise GatewayConfigError(
+                    "304 alindi ama onbellekte config yok — sonraki cagri "
+                    "kosulsuz yapilacak"
+                )
+            logger.debug(
+                "config_not_modified etag=%s — ag uzerinden veri inmedi",
+                self._last_etag,
+            )
+            return self._last_config
 
         # Content-Length kontrolu — backend cok buyuk response gonderirse erken
         # kestir
@@ -363,7 +516,7 @@ class BackendConfigClient:
         # thread'i) GatewayConfigError bekliyor. Ciplak bir NameError/TypeError
         # generic except'e duserdi ve teshis edilemez hale gelirdi.
         try:
-            return _parse_gateway_config(
+            config = _parse_gateway_config(
                 data,
                 default_gateway_code=self.gateway_code,
                 allowlist=self._device_ip_allowlist,
@@ -374,6 +527,16 @@ class BackendConfigClient:
             raise GatewayConfigError(
                 f"config parse failed: {type(exc).__name__}: {exc}"
             ) from exc
+
+        # Onbellegi yalnizca BASARILI ayristirmadan sonra tazele. Once
+        # yazsaydik, bozuk bir payload'in ETag'i saklanir ve sonraki cagrilar
+        # 304 alip bozuk config'i "gecerli" sayardi.
+        etag = (response.headers.get("ETag") or "").strip()
+        self._last_config = config
+        # ETag yoksa (eski backend) sartli istek gonderilmez; her cagri tam
+        # iner — yani onceki davranis. Bozulma yok, sadece kazanc yok.
+        self._last_etag = etag or None
+        return config
 
     def fetch_pending_commands(self) -> PendingPoll:
         """Hafif komut-poll — GET /gateways/{code}/pending.
@@ -831,63 +994,38 @@ def _parse_gateway_config(
             rejected_ips,
         )
 
-    signals_raw = data.get("signals") or []
-    if not isinstance(signals_raw, list):
-        raise GatewayConfigError(
-            f"config response 'signals' list olmali (gelen tip: {type(signals_raw).__name__})"
-        )
-    if len(signals_raw) > _MAX_SIGNALS_HARD_LIMIT:
-        logger.error(
-            "config_signals_overflow received=%d hard_limit=%d — fazlasi yok sayilacak.",
-            len(signals_raw),
-            _MAX_SIGNALS_HARD_LIMIT,
-        )
-        signals_raw = signals_raw[:_MAX_SIGNALS_HARD_LIMIT]
+    signals = _parse_signal_list(data.get("signals") or [], alan="signals")
 
-    signals: list[SignalConfig] = []
-    for item in signals_raw:
-        if not isinstance(item, dict) or not item.get("key"):
-            continue
-        try:
-            # scale / offset: inf/nan reddet — JetStream consumer'a sizar ve
-            # json.dumps `Infinity` cikarir (allow_nan=True default), bazi
-            # tag-engine parser'lari bunu reject eder veya sessizce drop eder.
-            raw_scale = item.get("scale")
-            raw_offset = item.get("offset")
-            scale_val = _safe_finite_float(raw_scale, 1.0)
-            offset_val = _safe_finite_float(raw_offset, 0.0)
-            # _safe_finite_float "inf"/"nan"/parse hatasinda default'a duser.
-            # Default'a indirilen anlamli bir degerse log atalim (saldiri /
-            # backend bozulmasi sinyali).
-            if raw_scale not in (None, "", 1.0, "1.0") and scale_val == 1.0:
+    # Profil bazli setler (opsiyonel; eski backend'de alan YOK -> bos sozluk ve
+    # duz listeye dusulur). Bozuk bir profil TUM config'i dusurmez: o profil
+    # atlanir, digerleri yasar — cihazlarin tamaminin karanliga dusmesindense
+    # bir modelin duz listeye dusmesi yeglenir.
+    signals_by_profile: dict[str, list[SignalConfig]] = {}
+    raw_profiles = data.get("signals_by_profile")
+    if isinstance(raw_profiles, dict):
+        for profil, ham in raw_profiles.items():
+            anahtar = _truncate(str(profil), _MAX_CODE_LENGTH)
+            if not anahtar:
+                continue
+            try:
+                # BOS LISTE DE KABUL EDILIR ve saklanir. Backend "bu model icin
+                # sinyal tanimli degil" demek icin bilerek bos gonderir; burada
+                # atlarsak cihaz duz listeye duser ve KOMSU modelin adreslerini
+                # yoklar — B3'un onlemek istedigi sessiz yanlis veri.
+                signals_by_profile[anahtar] = _parse_signal_list(
+                    ham or [], alan=f"signals_by_profile[{anahtar}]"
+                )
+            except GatewayConfigError as exc:
                 logger.warning(
-                    "config_signal_scale_invalid key=%r received=%r -> default 1.0",
-                    item.get("key"),
-                    raw_scale,
+                    "config_profile_parse_failed profil=%r error=%s — profil atlandi",
+                    anahtar,
+                    exc,
                 )
-            signals.append(
-                SignalConfig(
-                    key=_truncate(item["key"], _MAX_CODE_LENGTH),
-                    label=_truncate(item.get("label") or item["key"], _MAX_LABEL_LENGTH),
-                    unit=(_truncate(item["unit"], _MAX_UNIT_LENGTH) if item.get("unit") else None),
-                    source=_truncate(item.get("source") or "master", _MAX_CODE_LENGTH),
-                    dnp3_class=_truncate(item.get("dnp3_class") or "Class 1", _MAX_CODE_LENGTH),
-                    data_type=_truncate(item.get("data_type") or "analog", _MAX_CODE_LENGTH),
-                    # DNP3 grup ID'leri standartta 1-120; saglik icin 0-255 clamp.
-                    dnp3_object_group=_safe_int(item.get("dnp3_object_group"), 30, lo=0, hi=255),
-                    # DNP3 index 16-bit (0-65535).
-                    dnp3_index=_safe_int(item.get("dnp3_index"), 0, lo=0, hi=65535),
-                    scale=scale_val,
-                    offset=offset_val,
-                    supports_alarm=bool(item.get("supports_alarm", False)),
-                )
-            )
-        except (TypeError, ValueError) as exc:
-            logger.warning(
-                "config_signal_parse_failed key=%r error=%s — sinyal atlandi",
-                item.get("key"),
-                exc,
-            )
+    elif raw_profiles is not None:
+        logger.warning(
+            "config_signals_by_profile_invalid tip=%s — yok sayildi",
+            type(raw_profiles).__name__,
+        )
 
     try:
         refresh_nonce = int(data.get("refresh_nonce", 0) or 0)
@@ -936,6 +1074,7 @@ def _parse_gateway_config(
         config_version=str(data.get("config_version") or ""),
         devices=devices,
         signals=signals,
+        signals_by_profile=signals_by_profile,
         refresh_nonce=refresh_nonce,
         config_nonce=config_nonce,
         pending_commands=tuple(pending_commands),

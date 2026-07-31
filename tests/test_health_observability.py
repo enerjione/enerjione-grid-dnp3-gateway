@@ -1,0 +1,269 @@
+"""Gozlemlenebilirlik testleri — "sistem kor" sorunlarinin regresyonu.
+
+Kapatilan uretim korlukleri:
+
+1. **Tum cihazlar comm_lost iken /health "ok" donuyordu.** Health body cihaz
+   sagligini HIC icermiyordu. Saha switch'i coktugunde 300 outstation'in
+   tamami erisilemez oluyor, gateway ilk cycle'da bir kez comm_lost yayinlayip
+   sonsuza kadar sessiz kaliyor, Docker healthcheck yesil kaliyordu. Ariza
+   ancak saatler sonra, backend'de tag'lerin donmus oldugu fark edilince
+   anlasiliyordu.
+
+2. **Ana dongu donsa bile "ok".** `last_cycle_at_epoch` yaziliyor ama hicbir
+   esige sokulmuyordu; watchdog yoktu.
+
+3. **Thread'ler sessizce oluyordu.** retrier olurse telemetri teslimi,
+   command-poll olurse TUM SCADA komut kanali kalici duruyordu — hicbir
+   gosterge yoktu.
+
+4. **Metrik sayaclari olu koddu.** publish/read hata sayaclari repoda HIC
+   cagrilmiyordu; panelde her zaman 0 goruntuleniyordu.
+"""
+
+from __future__ import annotations
+
+import time
+from threading import Event
+from typing import Any
+
+from dnp3_gateway.health_server import (
+    GatewayMetrics,
+    ThreadLiveness,
+    _build_health_body,
+    _device_health_snapshot,
+)
+from dnp3_gateway.state import GatewayState
+
+
+class _FakeReader:
+    def __init__(self, health: dict[str, dict[str, Any]]) -> None:
+        self._health = health
+
+    def device_health(self) -> dict[str, dict[str, Any]]:
+        return self._health
+
+
+class _DeadThread:
+    def is_alive(self) -> bool:
+        return False
+
+
+class _LiveThread:
+    def is_alive(self) -> bool:
+        return True
+
+
+def _state(*, active: bool = True, device_count: int = 3) -> GatewayState:
+    from dnp3_gateway.backend import DeviceConfig, GatewayConfig
+
+    st = GatewayState()
+    st.update(
+        GatewayConfig(
+            gateway_code="GW-001",
+            gateway_name="Test",
+            batch_interval_sec=5,
+            max_devices=100,
+            is_active=active,
+            config_version="v1",
+            devices=[
+                DeviceConfig(code=f"DEV-{i}", name=f"d{i}", ip_address=f"10.0.0.{i}")
+                for i in range(1, device_count + 1)
+            ],
+            signals=[],
+        )
+    )
+    return st
+
+
+def _body(**kwargs: Any) -> tuple[dict[str, Any], int]:
+    ready = Event()
+    ready.set()
+    defaults: dict[str, Any] = {
+        "state": _state(),
+        "gateway_code": "GW-001",
+        "gateway_mode": "dnp3",
+        "config_ready": ready,
+        "instance_id": "i1",
+        "app_environment": "production",
+        "health_port": 8020,
+        "publisher": None,
+        "metrics": GatewayMetrics(),
+        "reader": None,
+        "liveness": None,
+        "poll_interval_sec": 1.0,
+    }
+    defaults.update(kwargs)
+    return _build_health_body(**defaults)
+
+
+# --------------------------------------------------------------------------
+# cihaz sagligi
+# --------------------------------------------------------------------------
+
+
+def test_tum_cihazlar_comm_lost_ise_unhealthy() -> None:
+    """REGRESYON: 300 cihazin tamami kopukken /health "ok" + HTTP 200 donuyordu."""
+    reader = _FakeReader(
+        {f"DEV-{i}": {"state": "lost", "last_frame_epoch": None} for i in (1, 2, 3)}
+    )
+    m = GatewayMetrics()
+    m.record_cycle(devices=3, published=0)
+    body, code = _body(reader=reader, metrics=m)
+    assert "all_devices_comm_lost" in body["issues"]
+    assert body["status"] == "unhealthy"
+    assert code == 503
+    assert body["devices"]["lost"] == 3
+    assert body["devices"]["online"] == 0
+
+
+def test_cogunluk_kopuksa_degraded() -> None:
+    reader = _FakeReader(
+        {
+            "DEV-1": {"state": "lost", "last_frame_epoch": None},
+            "DEV-2": {"state": "lost", "last_frame_epoch": None},
+            "DEV-3": {"state": "online", "last_frame_epoch": time.time()},
+        }
+    )
+    m = GatewayMetrics()
+    m.record_cycle(devices=3, published=1)
+    body, code = _body(reader=reader, metrics=m)
+    assert "majority_devices_comm_lost" in body["issues"]
+    assert body["status"] == "degraded"
+    assert code == 200
+
+
+def test_hepsi_online_ise_ok() -> None:
+    now = time.time()
+    reader = _FakeReader(
+        {f"DEV-{i}": {"state": "online", "last_frame_epoch": now} for i in (1, 2, 3)}
+    )
+    m = GatewayMetrics()
+    m.record_cycle(devices=3, published=5)
+    body, code = _body(reader=reader, metrics=m)
+    assert body["status"] == "ok"
+    assert code == 200
+    assert body["devices"]["online"] == 3
+
+
+def test_cihaz_ozeti_kod_ve_ip_sizdirmaz() -> None:
+    """/health auth'suz — recon malzemesi (cihaz kodu/IP) icermemeli."""
+    now = time.time()
+    reader = _FakeReader({"DEV-1": {"state": "online", "last_frame_epoch": now}})
+    body, _c = _body(reader=reader, state=_state(device_count=1))
+    serialized = repr(body)
+    assert "DEV-1" not in serialized
+    assert "10.0.0.1" not in serialized
+    assert set(body["devices"]) >= {"total", "online", "lost", "recovering", "unknown"}
+
+
+def test_adapter_master_acmadiysa_unknown_sayilir() -> None:
+    snap = _device_health_snapshot(_FakeReader({}), 5)
+    assert snap["total"] == 5
+    assert snap["unknown"] == 5
+
+
+# --------------------------------------------------------------------------
+# watchdog
+# --------------------------------------------------------------------------
+
+
+def test_donmus_poll_dongusu_unhealthy() -> None:
+    """REGRESYON: ana dongu donsa bile /health saatlerce 200/ok donuyordu."""
+    m = GatewayMetrics()
+    m.record_cycle(devices=3, published=1)
+    m.last_cycle_at_epoch = time.time() - 3600  # 1 saattir cycle yok
+    body, code = _body(metrics=m, poll_interval_sec=1.0)
+    assert "poll_loop_stalled" in body["issues"]
+    assert body["status"] == "unhealthy"
+    assert code == 503
+
+
+def test_taze_cycle_stall_saymaz() -> None:
+    m = GatewayMetrics()
+    m.record_cycle(devices=3, published=1)
+    body, _c = _body(metrics=m)
+    assert "poll_loop_stalled" not in body["issues"]
+    assert body["metrics"]["seconds_since_last_cycle"] is not None
+
+
+def test_pasif_gateway_stall_saymaz() -> None:
+    """is_active=False iken cycle calismamasi normaldir."""
+    m = GatewayMetrics()
+    m.record_cycle(devices=0, published=0)
+    m.last_cycle_at_epoch = time.time() - 3600
+    body, _c = _body(state=_state(active=False), metrics=m)
+    assert "poll_loop_stalled" not in body["issues"]
+
+
+# --------------------------------------------------------------------------
+# thread canliligi
+# --------------------------------------------------------------------------
+
+
+def test_olu_thread_unhealthy_yapar() -> None:
+    """REGRESYON: retrier olurse telemetri teslimi durur ama /health 'ok' derdi."""
+    lv = ThreadLiveness()
+    lv.register("outbox-retrier", _DeadThread())
+    lv.register("config-refresh", _LiveThread())
+    m = GatewayMetrics()
+    m.record_cycle(devices=3, published=1)
+    body, code = _body(liveness=lv, metrics=m)
+    assert "thread_dead:outbox-retrier" in body["issues"]
+    assert body["status"] == "unhealthy"
+    assert code == 503
+    assert body["threads"]["alive"]["config-refresh"] is True
+
+
+def test_canli_threadler_sorun_yaratmaz() -> None:
+    lv = ThreadLiveness()
+    lv.register("outbox-retrier", _LiveThread())
+    lv.register("command-poll", _LiveThread())
+    m = GatewayMetrics()
+    m.record_cycle(devices=3, published=1)
+    body, code = _body(liveness=lv, metrics=m)
+    assert body["status"] == "ok"
+    assert code == 200
+
+
+# --------------------------------------------------------------------------
+# metrikler
+# --------------------------------------------------------------------------
+
+
+def test_yeni_metrik_sayaclari_body_de() -> None:
+    m = GatewayMetrics()
+    m.record_cycle(devices=2, published=10)
+    m.inc_read_error(3)
+    m.inc_publish_error(2)
+    m.inc_outboxed(7)
+    body, _c = _body(metrics=m)
+    assert body["metrics"]["read_errors_total"] == 3
+    assert body["metrics"]["publish_errors_total"] == 2
+    assert body["metrics"]["signals_outboxed_total"] == 7
+
+
+def test_poller_metrikleri_gercekten_besler() -> None:
+    """REGRESYON: inc_read_error/inc_publish_error repoda HIC cagrilmiyordu."""
+    from dnp3_gateway.backend import DeviceConfig, SignalConfig
+    from dnp3_gateway.poller import poll_device
+
+    class _BrokenReader:
+        def read_device(self, *, device, signals):  # noqa: ARG002
+            raise RuntimeError("DNP3 okuma hatasi")
+
+    m = GatewayMetrics()
+    poll_device(
+        gateway_code="GW-001",
+        device=DeviceConfig(code="D1", name="d", ip_address="10.0.0.1"),
+        signals=[
+            SignalConfig(
+                key="a", label="a", unit=None, source="master", dnp3_class="Class 1",
+                data_type="analog", dnp3_object_group=30, dnp3_index=1,
+                scale=1.0, offset=0.0, supports_alarm=False,
+            )
+        ],
+        reader=_BrokenReader(),
+        publisher=object(),
+        metrics=m,
+    )
+    assert m.snapshot()["read_errors_total"] == 1, "okuma hatasi sayaca yansimali"

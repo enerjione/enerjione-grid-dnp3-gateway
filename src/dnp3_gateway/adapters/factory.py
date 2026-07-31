@@ -11,6 +11,50 @@ from dnp3_gateway.config import Settings
 logger = logging.getLogger(__name__)
 
 
+# yadnp3 (PRIMARY) adapter'in OKUMADIGI, yalnizca legacy dnp3py dalinda
+# kullanilan ayarlar. `.env.example`, docker sablonlari ve new_gateway.ps1
+# bunlari set ediyor ve "sahada ayarlayin" diyordu; operator 4G link'te timeout
+# alan cihazlar icin DNP3_RESPONSE_TIMEOUT_SEC'i buyutup servisi restart ediyor,
+# HICBIR SEY DEGISMIYORDU — cunku primary adapter bu alani hic gormuyor.
+# Ustelik log "adapter_selected ... scan=Xs baseline=Ys" basarak yanlis bir
+# dogrulama hissi veriyordu. Artik varsayilandan farkli set edilmisse acikca
+# uyariyoruz.
+_YADNP3_IGNORED_SETTINGS = (
+    "dnp3_response_timeout_sec",
+    "dnp3_read_strategy",
+    "dnp3_direct_max_points_per_read",
+    "dnp3_direct_sparse_ratio",
+    "dnp3_confirm_required",
+    "dnp3_link_reset_on_connect",
+    "dnp3_disable_unsolicited_on_connect",
+    "dnp3_unsolicited_class_mask",
+    "dnp3_log_raw_frames",
+)
+
+
+def _warn_ignored_dnp3_settings(settings: Settings) -> None:
+    """Primary adapter'in yok saydigi ayarlar varsayilandan farkliysa uyar."""
+    try:
+        defaults = type(settings).model_fields
+    except Exception:  # noqa: BLE001
+        return
+    changed = []
+    for name in _YADNP3_IGNORED_SETTINGS:
+        field = defaults.get(name)
+        if field is None:
+            continue
+        current = getattr(settings, name, None)
+        if current is not None and current != field.default:
+            changed.append(f"{name.upper()}={current}")
+    if changed:
+        logger.warning(
+            "dnp3_settings_ignored_by_yadnp3 %s — bu ayarlar YALNIZCA "
+            "DNP3_LIBRARY=dnp3py (legacy) dalinda gecerlidir; aktif yadnp3 "
+            "adapter'i bunlari YOK SAYAR. Degisikliginizin etkisi olmayacak.",
+            ", ".join(changed),
+        )
+
+
 def build_adapter(settings: Settings) -> TelemetryReader:
     mode = settings.gateway_mode.strip().lower()
     if mode == "mock":
@@ -26,19 +70,24 @@ def build_adapter(settings: Settings) -> TelemetryReader:
 
         logger.info(
             "adapter_selected mode=dnp3 library=yadnp3 (OpenDNP3) local_addr=%s default_tcp=%s "
-            "scan=%ss baseline=%ss manager_threads=%s",
+            "scan=%ss baseline=%ss manager_threads=%s time_sync=%s quality_flags_published=%s",
             settings.dnp3_local_address,
             settings.dnp3_tcp_port,
             settings.default_poll_interval_sec,
             settings.dnp3_event_baseline_interval_sec,
             settings.dnp3_manager_threads if settings.dnp3_manager_threads > 0 else "auto",
+            settings.dnp3_time_sync,
+            settings.dnp3_publish_quality_flags,
         )
+        _warn_ignored_dnp3_settings(settings)
         return Yadnp3TelemetryReader(
             local_address=settings.dnp3_local_address,
             default_dnp3_tcp_port=settings.dnp3_tcp_port,
             scan_interval_sec=settings.default_poll_interval_sec,
             baseline_interval_sec=settings.dnp3_event_baseline_interval_sec,
             manager_threads=settings.dnp3_manager_threads,
+            time_sync=settings.dnp3_time_sync,
+            publish_quality_flags=settings.dnp3_publish_quality_flags,
         )
 
     if library == "dnp3py":

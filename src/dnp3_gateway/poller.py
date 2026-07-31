@@ -154,6 +154,7 @@ def poll_device(
     signals: list[SignalConfig],
     reader: TelemetryReader,
     publisher: Any,
+    metrics: Any = None,
 ) -> int:
     """Tek bir cihazin tum sinyallerini okur ve yayinlar. Yayinlanan sayisini doner.
 
@@ -174,10 +175,17 @@ def poll_device(
             device.code,
             exc,
         )
+        # Sayaci gercekten besle: `read_errors_total` daha once HICBIR yerden
+        # artirilmiyordu ve /metrics her zaman 0 raporluyordu. Cihazlarin
+        # %40'i hata verirken bile izleme "hata yok" goruyordu.
+        _bump(metrics, "inc_read_error")
         return 0
 
     # Yayinlanacak sinyaller (no_change olanlar atlanir).
     to_publish = [r for r in readings if r.quality != "no_change"]
+    skipped = len(readings) - len(to_publish)
+    if skipped:
+        _bump(metrics, "inc_skipped_no_change", skipped)
     if not to_publish:
         return 0
 
@@ -204,17 +212,27 @@ def poll_device(
                 "device_code": device.code,
                 "signal_key": reading.signal_key,
             },
+            "reading": reading,
         }
         for reading in to_publish
     ]
     batch_fn = getattr(publisher, "publish_batch", None)
     if callable(batch_fn):
-        # publish_batch hata durumunda outbox'a yazar (raise etmez), sadece
-        # OutboxFullError yayar -> cycle breaker. Basari = tum item yayinlandi.
+        # publish_batch normal donerse mesaj KALICIDIR: ya broker ack verdi ya
+        # da outbox'a (SQLite) yazildi. Sadece OutboxFullError / disk hatasi
+        # raise eder -> cycle breaker. Bu yuzden yayin onayini ancak buradan
+        # sonra veriyoruz.
         batch_fn(items)
+        _commit_published(reader=reader, device=device, readings=to_publish)
+        # Broker'a mi gitti yoksa outbox'a mi dustu? Metrik dogrulugu icin
+        # ayirt ediyoruz — eskiden ikisi de "published" sayiliyordu ve backend
+        # tum POST'lari reddederken bile "yayin akiyor" gorunuyordu.
+        if getattr(publisher, "last_batch_outboxed", False):
+            _bump(metrics, "inc_outboxed", len(items))
+            _bump(metrics, "inc_publish_error")
         return len(items)
     # Fallback: batch yok -> tek tek publish (eski davranis).
-    published = 0
+    published: list[SignalReading] = []
     for it in items:
         try:
             publisher.publish(
@@ -223,15 +241,59 @@ def poll_device(
                 correlation_id=it["correlation_id"],
                 headers=it["headers"],
             )
-            published += 1
+            published.append(it["reading"])
         except OutboxFullError:
+            # Kalicilastirilamayanlarin onayini VERME; degerleri dirty kalir ve
+            # bir sonraki cycle'da yeniden yayinlanir.
+            _commit_published(reader=reader, device=device, readings=published)
             raise
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "poll_device_publish_failed gateway=%s device=%s error=%s",
                 gateway_code, device.code, exc,
             )
-    return published
+            _bump(metrics, "inc_publish_error")
+    _commit_published(reader=reader, device=device, readings=published)
+    return len(published)
+
+
+def _bump(metrics: Any, method: str, n: int = 1) -> None:
+    """Metrik sayacini artir; metrics yoksa/hata verirse akisi bozma."""
+    if metrics is None:
+        return
+    fn = getattr(metrics, method, None)
+    if not callable(fn):
+        return
+    try:
+        fn(n)
+    except Exception:  # noqa: BLE001
+        logger.debug("metrics_bump_failed method=%s", method, exc_info=True)
+
+
+def _commit_published(
+    *,
+    reader: TelemetryReader,
+    device: DeviceConfig,
+    readings: list[SignalReading],
+) -> None:
+    """Adapter'a "bu okumalar kalicilasti" de; degisiklik bayraklari temizlensin.
+
+    Bu cagri BASARILI yayindan SONRA yapilir. Eskiden adapter bayragi okuma
+    aninda temizliyordu; yayin basarisiz olursa (outbox dolu / disk hatasi)
+    deger sessizce ve KALICI olarak kayboluyordu — cihazda deger tekrar
+    degisene kadar bir daha yayinlanmiyordu.
+
+    Adapter destegi yoksa (mock) no-op'tur; hata yayin akisini bozmamali.
+    """
+    if not readings:
+        return
+    commit = getattr(reader, "commit_published", None)
+    if not callable(commit):
+        return
+    try:
+        commit(device=device, readings=readings)
+    except Exception:  # noqa: BLE001
+        logger.debug("commit_published_failed device=%s", device.code, exc_info=True)
 
 
 def run_poll_cycle(
@@ -245,6 +307,7 @@ def run_poll_cycle(
     device_timeout_sec: float = DEFAULT_DEVICE_POLL_TIMEOUT_SEC,
     cycle_timeout_sec: float = DEFAULT_CYCLE_TIMEOUT_SEC,
     stop_event: threading.Event | None = None,
+    metrics: Any = None,
 ) -> int:
     """State'ten okunma vakti gelen cihazlari cekip okur.
 
@@ -268,9 +331,26 @@ def run_poll_cycle(
     """
     if not state.is_active():
         return 0
-    signals = filter_readable_signals(state.signals())
-    if not signals:
+    # Sinyal seti artik CIHAZ BASINA secilir (profil/model bazli). Tek bir
+    # global liste tum cihazlara uygulanirsa, ayni (object_group, index) cifti
+    # iki DNP3 modelinde farkli buyuklugu gosterdigi icin okunan deger YANLIS
+    # `signal_key` ile yayinlanir — sessiz ve tehlikeli bir hata.
+    if not state.has_any_signals():
         return 0
+
+    # Ayni profilin filtresi cycle icinde BIR KEZ hesaplanir: 600 cihazda her
+    # cihaz icin 193 sinyali yeniden filtrelemek gereksiz is olurdu. Ayrica
+    # `signals_for` profil bulunamadiginda uyari basar; onbellek sayesinde bu
+    # uyari cihaz basina degil profil basina bir kez cikar.
+    _profil_onbellek: dict[str, list[SignalConfig]] = {}
+
+    def _cihaz_sinyalleri(dev: DeviceConfig) -> list[SignalConfig]:
+        anahtar = (getattr(dev, "signal_profile", None) or "").strip()
+        onbellekli = _profil_onbellek.get(anahtar)
+        if onbellekli is None:
+            onbellekli = filter_readable_signals(state.signals_for(dev))
+            _profil_onbellek[anahtar] = onbellekli
+        return onbellekli
     # Cycle basinda silinen cihazlarin acik master/channel'larini kapat.
     # Bu olmazsa zombie master'lar yeni cihazlarla TCP/DNP3 link layer
     # catismasina yol acar (ornek: ayni IP'de iki cihaz, biri silindiginde
@@ -340,9 +420,10 @@ def run_poll_cycle(
                 count = poll_device(
                     gateway_code=gateway_code,
                     device=device,
-                    signals=signals,
+                    signals=_cihaz_sinyalleri(device),
                     reader=reader,
                     publisher=publisher,
+                    metrics=metrics,
                 )
             except OutboxFullError:
                 # Disk-full → cycle'i kir, kalan cihazlari mark_read et
@@ -373,9 +454,13 @@ def run_poll_cycle(
             poll_device,
             gateway_code=gateway_code,
             device=device,
-            signals=signals,
+            # Onbellek ana thread'de doldurulur (submit dongusu burada kosuyor),
+            # worker thread'e hazir liste gider — paylasilan dict'e worker'lar
+            # yazmaz, yaris durumu yok.
+            signals=_cihaz_sinyalleri(device),
             reader=reader,
             publisher=publisher,
+            metrics=metrics,
         )
         futures[fut] = device
         future_start[fut] = submit_time

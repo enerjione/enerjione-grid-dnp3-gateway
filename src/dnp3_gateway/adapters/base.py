@@ -21,6 +21,12 @@ class SignalReading:
                       no_change: Event-driven okumada bu sinyal bu cycle'da
                       degisen event vermedi; cached deger gecerli, poller bunu
                       yayinlamaz (delta-only publish).
+    `read_token`    : Adapter'a OZEL, poller icin ANLAMSIZ bir isaretcidir.
+                      Poller yayin BASARIYLA kalicilastiktan sonra okumalari
+                      `commit_published` ile adapter'a geri verir; adapter bu
+                      token sayesinde "yayinlanan surum hala guncel mi"
+                      kontrolunu yapip degisiklik bayragini temizleyebilir.
+                      Bkz. `TelemetryReader.commit_published`.
     """
 
     signal_key: str
@@ -30,6 +36,12 @@ class SignalReading:
     scaled_value: float
     quality: str = "good"
     value_string: str | None = None
+    read_token: Any = None
+    # Cihazin bildirdigi HAM DNP3 bayrak byte'i (ONLINE/RESTART/COMM_LOST/
+    # REMOTE_FORCED/LOCAL_FORCED/OVER_RANGE/REFERENCE_ERR). Teshis icin tasinir;
+    # `quality` alanina yansitilmasi backend tag-engine hazir olunca acilacak
+    # (bkz. docs/BACKEND_TODO.md#B1). None = adapter bayrak saglamiyor.
+    dnp3_flags: int | None = None
 
 
 class TelemetryReader(ABC):
@@ -69,6 +81,60 @@ class TelemetryReader(ABC):
         tetiklenir. Doner: {ok: bool, status: str, ...}. Adapter destegi
         yoksa {ok: False, status: 'unsupported'} donmeli, exception atmamali.
         """
+
+    def commit_published(
+        self,
+        *,
+        device: DeviceConfig,
+        readings: list[SignalReading],
+    ) -> int:
+        """Yayin KALICILASTIKTAN sonra cagirilir; degisiklik bayragini temizler.
+
+        NEDEN AYRI BIR ADIM
+        -------------------
+        Eskiden adapter, degeri `read_device` icinde dondururken dirty bayragini
+        HEMEN temizliyordu — yani yayindan ONCE. Iki ayri kalici veri kaybi
+        uretiyordu:
+
+        1. **TOCTOU yarisi.** Deger okunduktan sonra, dirty temizlenmeden once
+           DNP3 IO thread'i yeni bir olcum yazabiliyordu. Poller ESKI degeri
+           yayinlayip yeni degerin bayragini siliyordu. Deger bir daha DEGISENE
+           kadar (saatler/gunler) yayinlanmiyordu; periyodik integrity poll de
+           ayni degeri yazdigi icin "degismedi" sayilip durumu duzeltmiyordu.
+           Ornek: acilan bir kesici SCADA'da kapali gorunmeye devam ediyordu.
+
+        2. **Yayin basarisiz olsa bile bayrak temizdi.** Outbox dolarsa veya
+           disk hatasi olursa mesaj ne broker'a ne diske gidiyordu; deger
+           cache'te "yayinlanmis" sayildigi icin telafi edilemiyordu.
+
+        Yeni akis: `read_device` yalnizca OKUR (bayrak korunur). Poller yayini
+        kalicilastirdiktan sonra (broker ack VEYA outbox'a yazildiktan sonra)
+        bu metodu cagirir. Adapter, `read_token` ile "yayinlanan surum hala
+        guncel mi" diye bakar; arada yeni deger geldiyse bayragi TEMIZLEMEZ ve
+        yeni deger bir sonraki cycle'da yayinlanir.
+
+        Returns: bayragi temizlenen sinyal sayisi.
+        Default: no-op (state tutmayan adapter'lar icin).
+        """
+        _ = device, readings
+        return 0
+
+    def device_health(self) -> dict[str, dict[str, Any]]:
+        """Cihaz basina haberlesme durumu — /health ve /metrics icin.
+
+        NEDEN: `/health` cihaz sagligini HIC raporlamiyordu. Saha switch'i
+        coktuginde 300 outstation'in tamami erisilemez oluyor, gateway ilk
+        cycle'da bir kez comm_lost yayinlayip sonsuza kadar sessiz kaliyor ve
+        `/health` yine `{"status":"ok"}` + HTTP 200 donuyordu. Docker
+        healthcheck yesil, cati panelinde gateway "saglikli"; ariza ancak
+        saatler sonra, backend'de tag'lerin donmus oldugu fark edilince
+        anlasiliyordu.
+
+        Donen sozluk: `{device_code: {"state": "online|recovering|lost",
+        "last_frame_epoch": float|None, "pending_signals": int}}`.
+        Default: bos (state tutmayan adapter'lar icin).
+        """
+        return {}
 
     def forget_devices(self, active_device_codes: set[str]) -> int:
         """Backend config'inden artik gorulmeyen cihazlarin acik master/channel

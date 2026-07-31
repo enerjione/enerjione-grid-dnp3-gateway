@@ -151,6 +151,11 @@ class GatewayMetrics:
         self._started_at_epoch = time.time()
         self.poll_cycles_total = 0
         self.signals_published_total = 0
+        # Broker'a DOGRUDAN gidemeyip outbox'a dusen mesajlar. Eskiden bunlar
+        # da "published" sayiliyordu; backend 30 dakikadir tum POST'lari
+        # reddederken /health `signals_published_total`'i artirmaya devam
+        # ediyor ve izleme "yayin akiyor" goruyordu.
+        self.signals_outboxed_total = 0
         self.signals_skipped_no_change_total = 0
         self.publish_errors_total = 0
         self.read_errors_total = 0
@@ -165,6 +170,10 @@ class GatewayMetrics:
             self.last_cycle_at_epoch = time.time()
             self.last_cycle_published = published
             self.last_cycle_devices = devices
+
+    def inc_outboxed(self, n: int = 1) -> None:
+        with self._lock:
+            self.signals_outboxed_total += n
 
     def inc_skipped_no_change(self, n: int = 1) -> None:
         with self._lock:
@@ -185,6 +194,7 @@ class GatewayMetrics:
                 "uptime_sec": round(time.monotonic() - self._started_at_monotonic, 2),
                 "poll_cycles_total": self.poll_cycles_total,
                 "signals_published_total": self.signals_published_total,
+                "signals_outboxed_total": self.signals_outboxed_total,
                 "signals_skipped_no_change_total": self.signals_skipped_no_change_total,
                 "publish_errors_total": self.publish_errors_total,
                 "read_errors_total": self.read_errors_total,
@@ -192,6 +202,142 @@ class GatewayMetrics:
                 "last_cycle_published": self.last_cycle_published,
                 "last_cycle_devices": self.last_cycle_devices,
             }
+
+
+class ThreadLiveness:
+    """Arkaplan thread'lerinin canlilik kaydi (/health icin).
+
+    NEDEN: config-refresh, command-poll ve outbox-retrier thread'lerinden biri
+    beklenmedik bir hatayla olurse gateway "calisiyor" gorunmeye devam
+    ediyordu — /health "ok", Docker healthcheck yesil, backend panelinde
+    gateway saglikli. Oysa retrier olduyse telemetri teslimi, command-poll
+    olduyse TUM SCADA komut kanali kalici olarak durmus oluyordu.
+
+    main.py thread'leri burada kaydeder; health endpoint'i `is_alive()`
+    sonuclarini rapor eder ve olu thread'i `unhealthy` sayar.
+    """
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._threads: dict[str, Any] = {}
+
+    def register(self, name: str, thread: Any) -> None:
+        with self._lock:
+            self._threads[name] = thread
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            items = list(self._threads.items())
+        alive: dict[str, bool | None] = {}
+        for name, t in items:
+            try:
+                is_alive_fn = getattr(t, "is_alive", None)
+                alive[name] = bool(is_alive_fn()) if callable(is_alive_fn) else None
+            except Exception:  # noqa: BLE001
+                alive[name] = None
+        return {"alive": alive}
+
+
+def _ledger_result_for(ledger: Any, command_id: int) -> dict[str, Any] | None:
+    """Ledger'dan bir komutun kayitli sonucunu getir (yoksa None)."""
+    try:
+        for res in ledger.pending_results():
+            if int(res.get("id", -1)) == command_id:
+                return res
+    except Exception:  # noqa: BLE001
+        logger.debug("ledger_result_lookup_failed id=%s", command_id, exc_info=True)
+    return None
+
+
+def _ledger_record(ledger: Any, command_id: int, result: dict[str, Any]) -> None:
+    """Komut sonucunu ledger'a yaz; hata yayin akisini bozmamali."""
+    if ledger is None:
+        return
+    try:
+        ledger.record_result(result)
+    except Exception:  # noqa: BLE001
+        logger.exception("ledger_record_failed id=%s", command_id)
+
+
+def _guard_snapshot(guard: Any) -> dict[str, Any]:
+    """DiskGuard/ClockGuard snapshot'i; guard yoksa bos sozluk."""
+    if guard is None:
+        return {}
+    try:
+        return dict(guard.snapshot())
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _thread_snapshot(liveness: Any) -> dict[str, Any]:
+    if liveness is None:
+        return {"alive": {}}
+    try:
+        return liveness.snapshot()
+    except Exception:  # noqa: BLE001
+        return {"alive": {}}
+
+
+def _quarantined_dbs() -> list[str]:
+    """Bu proses omrunde bozuk bulunup karantinaya alinan state dosyalari."""
+    try:
+        from dnp3_gateway.messaging.sqlite_support import quarantined_files
+
+        return [str(p) for p in quarantined_files()]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _device_health_snapshot(reader: Any, configured_count: int) -> dict[str, Any]:
+    """Adapter'dan cihaz basina haberlesme durumunu ozetler.
+
+    Donen ozet SAYIMDIR; cihaz kodu/IP icermez cunku /health auth'suzdur.
+    `unknown`: config'te tanimli ama adapter'da henuz master acilmamis cihazlar
+    (ilk baglanti bekleniyor veya cihaz hic ele alinmamis).
+    """
+    summary: dict[str, Any] = {
+        "total": int(configured_count or 0),
+        "online": 0,
+        "recovering": 0,
+        "lost": 0,
+        "unknown": 0,
+        "oldest_frame_age_sec": None,
+    }
+    if reader is None:
+        summary["unknown"] = summary["total"]
+        return summary
+    health_fn = getattr(reader, "device_health", None)
+    if not callable(health_fn):
+        summary["unknown"] = summary["total"]
+        return summary
+    try:
+        per_device = health_fn() or {}
+    except Exception:  # noqa: BLE001
+        summary["unknown"] = summary["total"]
+        return summary
+
+    now = time.time()
+    oldest_age: float | None = None
+    for info in per_device.values():
+        state_name = str(info.get("state") or "unknown")
+        if state_name in ("online", "recovering", "lost"):
+            summary[state_name] += 1
+        else:
+            summary["unknown"] += 1
+        last_frame = info.get("last_frame_epoch")
+        if last_frame:
+            age = max(0.0, now - float(last_frame))
+            oldest_age = age if oldest_age is None else max(oldest_age, age)
+
+    tracked = summary["online"] + summary["recovering"] + summary["lost"] + summary["unknown"]
+    if summary["total"] < tracked:
+        summary["total"] = tracked
+    elif summary["total"] > tracked:
+        # Config'te olup adapter'da henuz master'i olmayan cihazlar
+        summary["unknown"] += summary["total"] - tracked
+    if oldest_age is not None:
+        summary["oldest_frame_age_sec"] = round(oldest_age, 1)
+    return summary
 
 
 def _outbox_snapshot(publisher: Any) -> dict[str, Any]:
@@ -267,12 +413,17 @@ def _make_handler(
     actual_port_provider: Any,
     publisher_provider: Any,
     reader_provider: Any = None,
+    ledger_provider: Any = None,
     refresh_token: str = "",
     command_token: str = "",
     info_metrics_auth_required: bool = True,
     health_rate_limiter: _SlidingWindowRateLimiter | None = None,
     refresh_rate_limiter: _SlidingWindowRateLimiter | None = None,
     trusted_proxy_networks: list[Any] | None = None,
+    liveness: Any = None,
+    poll_interval_sec: float = 1.0,
+    disk_guard: Any = None,
+    clock_guard: Any = None,
 ) -> type[BaseHTTPRequestHandler]:
     """HTTP handler class'ini state'e + metrics'e bagli olarak dinamik ureten helper.
 
@@ -388,6 +539,11 @@ def _make_handler(
                     health_port=actual_port_provider(),
                     publisher=publisher_provider() if publisher_provider else None,
                     metrics=metrics,
+                    reader=reader_provider() if reader_provider else None,
+                    liveness=liveness,
+                    poll_interval_sec=poll_interval_sec,
+                    disk_guard=disk_guard,
+                    clock_guard=clock_guard,
                 )
                 self._respond_json(body, status_code=status_code)
                 return
@@ -484,8 +640,20 @@ def _make_handler(
             Config Update, Reset...) bu endpoint'e proxy eder.
 
             Body (JSON): {device_code, index, op_type?, count?, on_time_ms?,
-            off_time_ms?, timeout_sec?}. index Horstmann SN2 binary output
-            index'i, op_type default 'pulse_on'.
+            off_time_ms?, timeout_sec?, command_id?}
+              * `index`: cihazin binary output index'i
+              * `op_type`: **default `latch_on`** (docstring eskiden `pulse_on`
+                diyordu ama kod `latch_on` kullaniyordu — bu ikisi DNP3'te
+                TAMAMEN farkli davranistir: PULSE kendiliginden acilir, LATCH
+                cikisi KALICI olarak enerjili birakir. Entegratorler docstring'i
+                API sozlesmesi olarak okudugu icin "kisa darbe" bekleyip kalici
+                latch gonderilmesine yol aciyordu.)
+              * `command_id`: OPSIYONEL ama ONERILEN idempotency anahtari.
+                Verilirse komut CommandLedger'a yazilir ve ayni id ikinci kez
+                gelirse CROB TEKRAR GONDERILMEZ. Backend'in HTTP timeout'u
+                (~5sn) cihazin CROB suresinden (SN2'de 1-10sn) kisa oldugu icin
+                retry cok olasi; idempotency olmadan ayni kesici IKI KEZ
+                surulebiliyordu.
             """
             if not self._check_bearer_auth(command_token):
                 return  # 401 veya 503 zaten gonderildi
@@ -536,11 +704,62 @@ def _make_handler(
                     status_code=503,
                 )
                 return
+
+            op_type = str(payload.get("op_type", "latch_on"))
+            # ---- IDEMPOTENCY ------------------------------------------------
+            # Bu endpoint CommandLedger'i TAMAMEN ATLIYORDU. Backend'in HTTP
+            # timeout'u (~5sn) cihazin CROB suresinden (SN2'de 1-10sn) kisa
+            # oldugu icin retry cok olasi; gateway ikinci istegi YENI bir komut
+            # sanip AYNI binary output'a IKINCI KEZ CROB gonderiyordu. Fiziksel
+            # manevrada bu kabul edilemez. Ayrica pull kanaliyla (komut-poll)
+            # ayni komut es zamanli gelirse cift surme riski vardi.
+            ledger = ledger_provider() if ledger_provider else None
+            command_id = payload.get("command_id")
+            ledger_key: int | None = None
+            if command_id is not None and ledger is not None:
+                try:
+                    ledger_key = int(command_id)
+                except (TypeError, ValueError):
+                    self._respond_json(
+                        {"ok": False, "detail": "command_id tamsayi olmali"},
+                        status_code=400,
+                    )
+                    return
+                try:
+                    if not ledger.start_dispatch(ledger_key):
+                        # Bu komut daha once gonderilmis. TEKRAR GONDERME;
+                        # varsa kayitli sonucu don.
+                        prior = _ledger_result_for(ledger, ledger_key)
+                        logger.info(
+                            "operate_duplicate_suppressed device=%s index=%s command_id=%s "
+                            "— komut daha once gonderildi, CROB TEKRARLANMADI",
+                            device_code, index, ledger_key,
+                        )
+                        self._respond_json(
+                            {
+                                "ok": bool(prior.get("ok")) if prior else False,
+                                "duplicate": True,
+                                "detail": "komut daha once islendi; tekrar gonderilmedi",
+                                "result": prior,
+                            },
+                            status_code=200,
+                        )
+                        return
+                except Exception:  # noqa: BLE001
+                    # Ledger erisilemezse komutu ENGELLEME (saha operasyonu
+                    # durmasin) ama idempotency garantisi olmadigini logla.
+                    logger.exception(
+                        "operate_ledger_unavailable device=%s command_id=%s — "
+                        "idempotency GARANTI EDILEMIYOR",
+                        device_code, ledger_key,
+                    )
+                    ledger_key = None
+
             try:
                 result = reader.operate_device(
                     device=device,
                     index=index,
-                    op_type=str(payload.get("op_type", "latch_on")),
+                    op_type=op_type,
                     count=int(payload.get("count", 1)),
                     on_time_ms=int(payload.get("on_time_ms", 100)),
                     off_time_ms=int(payload.get("off_time_ms", 100)),
@@ -550,14 +769,33 @@ def _make_handler(
                 logger.exception(
                     "operate_failed device=%s index=%s", device_code, index
                 )
+                if ledger_key is not None:
+                    _ledger_record(ledger, ledger_key, {
+                        "id": ledger_key, "ok": False, "status": "error",
+                        "error": str(exc)[:400],
+                    })
                 self._respond_json(
                     {"ok": False, "detail": str(exc)}, status_code=500
                 )
                 return
             ok = bool(result.get("ok"))
+            if ledger_key is not None:
+                _ledger_record(ledger, ledger_key, {
+                    "id": ledger_key,
+                    "ok": ok,
+                    "status": str(result.get("status", "unknown")),
+                    "error": result.get("error"),
+                    "control": result.get("control"),
+                    "dnp3_status": result.get("dnp3_status"),
+                })
+            # Gonderilen CROB tipini de logla: olay sonrasi "hangi komut
+            # gonderildi" sorusu eskiden log'dan cevaplanamiyordu.
             logger.info(
-                "operate_requested device=%s index=%s ok=%s status=%s",
-                device_code, index, ok, result.get("status"),
+                "operate_requested device=%s index=%s control=%s count=%s "
+                "on_time=%s off_time=%s command_id=%s ok=%s status=%s",
+                device_code, index, op_type, payload.get("count", 1),
+                payload.get("on_time_ms", 100), payload.get("off_time_ms", 100),
+                ledger_key, ok, result.get("status"),
             )
             # Endpoint her zaman 200 doner; komut sonucu result.ok'ta. Cihaz
             # reddettiyse (unsupported/inactive/timeout) ok=False + status kalir,
@@ -590,6 +828,11 @@ def _build_health_body(
     health_port: int,
     publisher: Any,
     metrics: GatewayMetrics,
+    reader: Any = None,
+    liveness: Any = None,
+    poll_interval_sec: float = 1.0,
+    disk_guard: Any = None,
+    clock_guard: Any = None,
 ) -> tuple[dict[str, Any], int]:
     """Health body + HTTP status code uretir.
 
@@ -602,6 +845,8 @@ def _build_health_body(
     cfg_snapshot = state.snapshot()
     outbox_snap = _outbox_snapshot(publisher)
     metrics_snap = metrics.snapshot()
+    devices_snap = _device_health_snapshot(reader, cfg_snapshot.get("device_count", 0))
+    threads_snap = _thread_snapshot(liveness)
 
     issues: list[str] = []
     severity_score = 0  # 0=ok 1=degraded 2=unhealthy
@@ -640,6 +885,76 @@ def _build_health_body(
             issues.append("no_poll_cycles_yet")
             severity_score = max(severity_score, 1)
 
+    # --- Poll dongusu WATCHDOG'u -------------------------------------------
+    # `last_cycle_at_epoch` yaziliyordu ama HICBIR esige sokulmuyordu. Ana
+    # dongu donarsa (orn. adapter lock'unda takilma) health server ayri
+    # thread'te oldugu icin saatlerce 200/ok donmeye devam ediyordu; Docker
+    # healthcheck yesil kaliyor ve kimse restart etmiyordu.
+    last_cycle = metrics_snap.get("last_cycle_at_epoch")
+    if state.is_active() and last_cycle:
+        stall_threshold = max(5.0 * float(poll_interval_sec), 60.0)
+        since_cycle = max(0.0, time.time() - float(last_cycle))
+        if since_cycle > stall_threshold:
+            issues.append("poll_loop_stalled")
+            severity_score = max(severity_score, 2)
+
+    # --- Arkaplan thread'lerinin canliligi ---------------------------------
+    # Bir thread sessizce olurse (retrier -> telemetri teslimi durur,
+    # command-poll -> SCADA komutlari calismaz) disaridan gorulebilecek
+    # HICBIR gosterge yoktu.
+    for name, alive in threads_snap.get("alive", {}).items():
+        if alive is False:
+            issues.append(f"thread_dead:{name}")
+            severity_score = max(severity_score, 2)
+
+    # --- Cihaz haberlesme sagligi ------------------------------------------
+    # Eskiden 300 cihazin TAMAMI comm_lost iken bile status "ok" donuyordu.
+    total_dev = int(devices_snap.get("total") or 0)
+    lost_dev = int(devices_snap.get("lost") or 0)
+    if total_dev > 0 and lost_dev > 0:
+        lost_ratio = lost_dev / total_dev
+        if lost_ratio >= 1.0:
+            issues.append("all_devices_comm_lost")
+            severity_score = max(severity_score, 2)
+        elif lost_ratio >= 0.5:
+            issues.append("majority_devices_comm_lost")
+            severity_score = max(severity_score, 1)
+        else:
+            issues.append("some_devices_comm_lost")
+            severity_score = max(severity_score, 1)
+
+    # --- Bozuk/karantinaya alinmis veritabani ------------------------------
+    quarantined = _quarantined_dbs()
+    if quarantined:
+        issues.append("state_db_quarantined")
+        severity_score = max(severity_score, 1)
+
+    # --- Disk alani ---------------------------------------------------------
+    # "Disk-full breaker" aslinda MESAJ sayiyordu, bayt saymiyordu; disk
+    # dolmasi uc ayri arizanin (retrier olumu, log rotation kirilmasi, poller
+    # durmasi) ortak tetikleyicisiydi ve hicbir yerde olculmuyordu.
+    disk_snap = _guard_snapshot(disk_guard)
+    if disk_snap.get("level") == "critical":
+        issues.append("disk_space_critical")
+        severity_score = max(severity_score, 2)
+    elif disk_snap.get("level") == "low":
+        issues.append("disk_space_low")
+        severity_score = max(severity_score, 1)
+
+    # --- Sistem saati -------------------------------------------------------
+    # Gateway saati TUM arsivin tek zaman referansi; hicbir yerde
+    # dogrulanmiyordu. Sapma buyukse hem telemetri damgalari yanlis arsivlenir
+    # hem de (zaman-senk acikken) yanlis saat outstation'lara YAZILIR.
+    clock_snap = _guard_snapshot(clock_guard)
+    skew = clock_snap.get("skew_sec")
+    if skew is not None:
+        if not clock_snap.get("safe_for_time_sync", True):
+            issues.append("clock_skew_unsafe")
+            severity_score = max(severity_score, 1)
+        elif abs(float(skew)) >= 2.0:
+            issues.append("clock_skew_detected")
+            severity_score = max(severity_score, 1)
+
     if not config_ready.is_set():
         status = "starting"
         http_code = 200
@@ -673,17 +988,30 @@ def _build_health_body(
         "mode": gateway_mode,
         "config": cfg_safe,
         "outbox": outbox_snap,
+        # Cihaz haberlesme ozeti. Cihaz KODLARI ve IP'leri burada YOK
+        # (/health auth'suz; recon malzemesi vermeyelim) — yalnizca sayimlar.
+        # Kod bazli detay auth'lu /metrics ve /info endpoint'lerinde.
+        "devices": devices_snap,
+        "threads": threads_snap,
+        "disk": disk_snap,
+        "clock": clock_snap,
         "metrics": {
             "uptime_sec": metrics_snap["uptime_sec"],
             "poll_cycles_total": metrics_snap["poll_cycles_total"],
             "signals_published_total": metrics_snap["signals_published_total"],
+            "signals_outboxed_total": metrics_snap["signals_outboxed_total"],
             "publish_errors_total": metrics_snap["publish_errors_total"],
             "read_errors_total": metrics_snap["read_errors_total"],
             "last_cycle_at_epoch": metrics_snap["last_cycle_at_epoch"],
+            "seconds_since_last_cycle": (
+                round(max(0.0, time.time() - float(last_cycle)), 2) if last_cycle else None
+            ),
             "last_cycle_devices": metrics_snap["last_cycle_devices"],
             "last_cycle_published": metrics_snap["last_cycle_published"],
         },
     }
+    if quarantined:
+        body["quarantined_state_files"] = quarantined
     return body, http_code
 
 
@@ -700,12 +1028,17 @@ def start_health_server(
     metrics: GatewayMetrics | None = None,
     publisher_provider: Any = None,
     reader_provider: Any = None,
+    ledger_provider: Any = None,
     refresh_token: str = "",
     command_token: str = "",
     info_metrics_auth_required: bool = True,
     health_rate_limit_per_min: int = _HEALTH_RATE_LIMIT_PER_MIN,
     refresh_rate_limit_per_min: int = _REFRESH_RATE_LIMIT_PER_MIN,
     trusted_proxies: str = "",
+    liveness: ThreadLiveness | None = None,
+    poll_interval_sec: float = 1.0,
+    disk_guard: Any = None,
+    clock_guard: Any = None,
 ) -> tuple[HTTPServer, GatewayMetrics, int]:
     """Sunucuyu ayaga kaldirir.
 
@@ -790,12 +1123,17 @@ def start_health_server(
         actual_port_provider=_actual_port_provider,
         publisher_provider=publisher_provider,
         reader_provider=reader_provider,
+        ledger_provider=ledger_provider,
         refresh_token=refresh_token,
         command_token=command_token,
         info_metrics_auth_required=info_metrics_auth_required,
         health_rate_limiter=health_rl,
         refresh_rate_limiter=refresh_rl,
         trusted_proxy_networks=trusted_networks,
+        liveness=liveness,
+        poll_interval_sec=poll_interval_sec,
+        disk_guard=disk_guard,
+        clock_guard=clock_guard,
     )
     # ThreadingHTTPServer: yavas client (slow-loris) tek istegi durdursa bile
     # diger probe'lar bloklanmaz. HTTPServer single-threaded olsaydi cati

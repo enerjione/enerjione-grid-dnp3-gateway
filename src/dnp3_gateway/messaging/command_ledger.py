@@ -152,6 +152,29 @@ class CommandLedger:
             ).fetchone()
         return int(count)
 
+    def prune(self, *, retain_days: float = 90.0) -> int:
+        """Teslim edilmis eski komut kayitlarini siler; silinen sayiyi doner.
+
+        Tablo hic budanmiyordu. Bir backend otomasyonu saniyede 1 komut
+        uretirse yilda ~31M satir birikir; saha PC'sinde bu yuzlerce MB kalici
+        disk demektir ve `pending_results` sorgusunu de yavaslatir.
+
+        YALNIZCA `delivery_state='delivered'` satirlar silinir — teslim
+        edilmemis sonuclar ve dead_letter kayitlari (denetim izi) KORUNUR.
+        """
+        # Alt sinir burada DEGIL cagri yerinde (config `ge=1`) uygulanir;
+        # fonksiyonun kendisi test edilebilir kalsin.
+        cutoff = time.time() - max(0.0, float(retain_days)) * 86400.0
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM command_ledger "
+                "WHERE delivery_state = 'delivered' AND completed_at IS NOT NULL "
+                "AND completed_at < ?",
+                (cutoff,),
+            )
+            self._conn.commit()
+            return int(cur.rowcount or 0)
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()

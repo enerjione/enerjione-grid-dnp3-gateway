@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "enerjione-dnp3-gateway"
-version = "0.4.6"
+version = "0.5.0"
 description = "EnerjiOne Grid platformu icin standalone DNP3 master gateway servisi (saha DNP3 outstation -> NATS JetStream)"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -34,6 +34,14 @@ enerjione-dnp3-gateway = "dnp3_gateway.main:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# Yerlesik cihaz profilleri (DNP3 adres haritalari) PAKETE DAHIL.
+# Docker imaji `pip install -e` kullandigi icin dosyalar zaten diskte duruyor
+# ve bu satir olmadan da calisir; ama biri wheel/sdist uretirse JSON'lar
+# disarida kalir ve `builtin_profile()` SESSIZCE bos doner — bilinen modeller
+# yerlesik haritasiz kalir. Paketleme yolunu simdiden kapatiyoruz.
+[tool.setuptools.package-data]
+"dnp3_gateway.profiles" = ["*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -43,11 +43,99 @@ except Exception as _exc:  # noqa: BLE001
 
 
 _OBJECT_GROUP_BINARY_INPUT = 1
+_OBJECT_GROUP_DOUBLE_BIT_BINARY = 3
 _OBJECT_GROUP_BINARY_OUTPUT = 10
 _OBJECT_GROUP_COUNTER = 20
+_OBJECT_GROUP_FROZEN_COUNTER = 21
 _OBJECT_GROUP_ANALOG_INPUT = 30
 _OBJECT_GROUP_ANALOG_OUTPUT = 40
 _OBJECT_GROUP_STRING = 110
+
+# Opsiyonel tipler: binding surumune gore bulunmayabilir; yoklugunda ilgili
+# dal sessizce devre disi kalir (eskiden bu tipler HIC ele alinmiyordu).
+_DOUBLE_BIT_CLS = getattr(opendnp3, "DoubleBitBinary", None) if _YADNP3_AVAILABLE else None
+_FROZEN_COUNTER_CLS = getattr(opendnp3, "FrozenCounter", None) if _YADNP3_AVAILABLE else None
+
+
+# ---- DNP3 kalite bayraklari -------------------------------------------------
+# DNP3 her olcumu bir bayrak byte'i ile birlikte tasir. Gateway bu byte'i
+# TAMAMEN YOK SAYIYORDU ve her degeri `quality="good"` olarak yayinliyordu:
+# outstation bir noktayi ONLINE=0 (gecersiz), RESTART, LOCAL_FORCED (operator
+# elle zorlamis), OVER_RANGE veya REFERENCE_ERR ile raporlasa bile SCADA bunu
+# gecerli bir olcum sanıyordu.
+#
+# Somut ornek: outstation CT referansini kaybedip analog noktayi
+# `value=0.0, flags=ONLINE|REFERENCE_ERR` raporluyor -> SCADA hat akimini 0 A
+# kabul ediyor -> "hat enerjisiz" yorumu, yanlis alarm bastirma.
+_FLAG_ONLINE = 0x01
+_FLAG_RESTART = 0x02
+_FLAG_COMM_LOST = 0x04
+_FLAG_REMOTE_FORCED = 0x08
+_FLAG_LOCAL_FORCED = 0x10
+# Bit 5 tipe gore degisir: binary'de CHATTER_FILTER, analog/counter'da OVER_RANGE
+_FLAG_CHATTER_OR_OVERRANGE = 0x20
+# Bit 6 analog/counter'da REFERENCE_ERR (binary'de kullanilmaz)
+_FLAG_REFERENCE_ERR = 0x40
+
+
+def _extract_flags(measurement: Any) -> int | None:
+    """opendnp3 olcumunden ham bayrak byte'ini cikarir; okunamazsa None.
+
+    Binding surumleri arasinda `flags` bir nesne (`.value`) ya da dogrudan int
+    olabilir; ikisini de destekliyoruz.
+    """
+    flags = getattr(measurement, "flags", None)
+    if flags is None:
+        return None
+    raw = getattr(flags, "value", flags)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _double_bit_to_float(value: Any) -> float:
+    """DoubleBit enum -> sayisal gosterim.
+
+    DNP3 kodlamasiyla ayni: 0=INTERMEDIATE, 1=DETERMINED_OFF, 2=DETERMINED_ON,
+    3=INDETERMINATE. Backend bu noktalari `analog` gibi tasiyabilsin diye
+    float'a cevriliyor.
+    """
+    for attr in ("value", "name"):
+        v = getattr(value, attr, None)
+        if isinstance(v, int):
+            return float(v)
+    try:
+        return float(int(value))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def map_dnp3_quality(flags: int | None) -> str:
+    """Ham DNP3 bayrak byte'ini gateway kalite sozlugune esler.
+
+    Oncelik sirasi en kotu durumdan iyiye:
+      comm_lost > restart > invalid (ONLINE yok / OVER_RANGE / REFERENCE_ERR)
+      > forced (LOCAL/REMOTE_FORCED) > good
+
+    NOT: Bu esleme YAYINA henuz baglanmadi — `quality` alaninda yeni degerler
+    (`invalid`, `restart`, `forced`) backend tag-engine'i bunlari tanidiktan
+    SONRA acilacak. Bkz. docs/BACKEND_TODO.md#B1 ve
+    `GATEWAY_PUBLISH_DNP3_QUALITY` env bayragi.
+    """
+    if flags is None:
+        return "good"
+    if flags & _FLAG_COMM_LOST:
+        return "comm_lost"
+    if flags & _FLAG_RESTART:
+        return "restart"
+    if not (flags & _FLAG_ONLINE):
+        return "invalid"
+    if flags & (_FLAG_CHATTER_OR_OVERRANGE | _FLAG_REFERENCE_ERR):
+        return "invalid"
+    if flags & (_FLAG_LOCAL_FORCED | _FLAG_REMOTE_FORCED):
+        return "forced"
+    return "good"
 
 # Recovery doğrulama suresi: OnOpen / stale-edge sonrasi cihazdan fresh frame
 # beklemek icin maksimum sure. Bu surede frame gelmezse cihaz tekrar "lost"
@@ -82,11 +170,19 @@ class _DeviceCache:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        # (group, index) -> (raw_float, value_string_or_None)
-        self._values: dict[tuple[int, int], tuple[float, str | None]] = {}
-        # Son read_device'tan beri degismis sinyaller. read_device basarili
-        # publish sonrasi clear eder.
+        # (group, index) -> (raw_float, value_string_or_None, dnp3_flags_or_None)
+        self._values: dict[tuple[int, int], tuple[float, str | None, int | None]] = {}
+        # (group, index) -> surum sayaci. `set()` her DEGER DEGISIKLIGINDE
+        # artirir. Poller yayini onaylarken (`commit_published`) okudugu surumu
+        # geri verir; surum degismisse bayrak TEMIZLENMEZ — yani okuma ile
+        # yayin arasinda gelen yeni deger kaybolmaz (TOCTOU korumasi).
+        self._versions: dict[tuple[int, int], int] = {}
+        self._version_seq: int = 0
+        # Yayinlanmayi bekleyen (degismis) sinyaller. Bayrak SADECE yayin
+        # kalicilastiktan sonra, commit_published ile temizlenir.
         self._dirty: set[tuple[int, int]] = set()
+        # Outstation IIN bayraklarinin son gorulen hali (edge-trigger log icin).
+        self._iin_flags: dict[str, bool] = {}
         self._connected = False
         self._last_update_at: float = 0.0
         # Cihaz stale/disconnected oldugunda comm_lost yayinini SADECE bir kez
@@ -113,7 +209,15 @@ class _DeviceCache:
         # log atmasi icin tek seferlik bayrak. read_device tuketince temizler.
         self._pending_recovery_publish: bool = False
 
-    def set(self, group: int, index: int, raw: float, value_string: str | None = None) -> None:
+    def set(
+        self,
+        group: int,
+        index: int,
+        raw: float,
+        value_string: str | None = None,
+        *,
+        flags: int | None = None,
+    ) -> None:
         """SOE handler'in cache'e yazma giris noktasi.
 
         Mantik (saf event-driven):
@@ -136,11 +240,20 @@ class _DeviceCache:
         key = (group, index)
         with self._lock:
             prev = self._values.get(key)
-            self._values[key] = (raw, value_string)
+            self._values[key] = (raw, value_string, flags)
             now = time.time()
             self._last_update_at = now
-            if prev is None or prev[0] != raw or prev[1] != value_string:
+            # Kalite bayragi degisimi de bir DEGISIKLIKTIR: deger ayni kalsa
+            # bile nokta 'gecerli'den 'REFERENCE_ERR'e gecmisse SCADA bunu
+            # gormeli.
+            if prev is None or prev[0] != raw or prev[1] != value_string or prev[2] != flags:
                 self._dirty.add(key)
+                # Surumu ilerlet: poller okudugu surumu commit_published ile
+                # geri verir. Okuma ile yayin arasinda buraya yeni bir deger
+                # gelirse surum uyusmaz ve bayrak temizlenmez — eski degerin
+                # yayinlanmasi yeni degeri KAYBETMEZ.
+                self._version_seq += 1
+                self._versions[key] = self._version_seq
             # Recovery confirmation: cihaz "recovering" durumundaysa ve bu
             # frame OnOpen/stale-edge anchor'indan sonra geldiyse, bu cihazin
             # gercekten DNP3 cevapladiginin ispatidir → online'a yukselt ve
@@ -157,12 +270,11 @@ class _DeviceCache:
             if self._state == "recovering" and now >= self._recovery_anchor_at:
                 self._state = "online"
                 self._pending_recovery_publish = True
-                # Tum cache'i dirty isaretle. Boylece bir sonraki cycle'da
-                # (scan_interval_sec sonra) butun sinyaller yayinlanir; read_
-                # device'in mark_all_dirty cagirmasini beklemeye gerek yok.
-                self._dirty.update(self._values.keys())
+                # Tum cache'i dirty isaretle (surumleri de ilerleterek).
+                # Boylece bir sonraki cycle'da butun sinyaller yayinlanir.
+                self._mark_all_dirty_unsafe()
 
-    def get(self, group: int, index: int) -> tuple[float, str | None] | None:
+    def get(self, group: int, index: int) -> tuple[float, str | None, int | None] | None:
         with self._lock:
             return self._values.get((group, index))
 
@@ -174,21 +286,102 @@ class _DeviceCache:
         with self._lock:
             self._dirty.discard((group, index))
 
+    # ---- Atomik okuma / yayin onayi ------------------------------------------
+
+    def peek_if_dirty(
+        self, group: int, index: int
+    ) -> tuple[float, str | None, int | None, int] | None:
+        """Degismisse (deger, metin, surum) doner; DEGISTIRMEZ.
+
+        TEK lock altinda calisir. Eski kod ayni is icin lock'u UC KEZ aliyordu
+        (`get` -> `is_dirty` -> `clear_dirty`) ve aralarda DNP3 IO thread'i
+        yazabildigi icin yeni degerler kaliciyla kayboluyordu.
+
+        Bayrak burada TEMIZLENMEZ; temizleme yayin kalicilastiktan sonra
+        `commit_published` ile yapilir.
+        """
+        key = (group, index)
+        with self._lock:
+            if key not in self._dirty:
+                return None
+            entry = self._values.get(key)
+            if entry is None:
+                return None
+            return entry[0], entry[1], entry[2], self._versions.get(key, 0)
+
+    def commit_published(self, items: list[tuple[int, int, int]]) -> int:
+        """Yayini onayla: surum HALA AYNIYSA dirty bayragini temizle.
+
+        `items`: (group, index, yayinlanan_surum) uclulari.
+        Surum degismisse (arada yeni olcum geldi) bayrak KORUNUR ve yeni deger
+        bir sonraki cycle'da yayinlanir. Donus: temizlenen bayrak sayisi.
+        """
+        cleared = 0
+        with self._lock:
+            for group, index, version in items:
+                key = (group, index)
+                if key not in self._dirty:
+                    continue
+                if self._versions.get(key, 0) != version:
+                    # Okuma ile yayin arasinda yeni deger geldi — bayragi
+                    # temizleme, yeni deger yayinlansin.
+                    continue
+                self._dirty.discard(key)
+                cleared += 1
+        return cleared
+
+    def dirty_count(self) -> int:
+        with self._lock:
+            return len(self._dirty)
+
+    def note_iin(self, name: str, value: bool) -> bool:
+        """IIN bayragini kaydet; DURUM DEGISTIYSE True doner (edge-trigger).
+
+        IIN her outstation yanitinda gelir; degisiklik olmadan loglamak
+        saniyede onlarca satir uretir. Bu yuzden yalnizca gecislerde log atariz.
+        """
+        with self._lock:
+            prev = self._iin_flags.get(name)
+            self._iin_flags[name] = value
+            return prev != value
+
+    def iin_snapshot(self) -> dict[str, bool]:
+        with self._lock:
+            return dict(self._iin_flags)
+
+    def _mark_all_dirty_unsafe(self) -> int:
+        """Tum kayitlari dirty isaretle + SURUMLERINI ILERLET.
+
+        Surum ilerletmek sart: o sirada uctan uca devam eden bir yayin
+        (`read_device` -> publish -> `commit_published`) eski surumle geri
+        donup bu yeni dirty bayragini temizleyebilirdi — yani recovery
+        sonrasi toplu yeniden yayin sessizce iptal olurdu.
+        Caller'in lock'u tutuyor olmasi gerekir.
+        """
+        count = 0
+        for key in self._values:
+            self._dirty.add(key)
+            self._version_seq += 1
+            self._versions[key] = self._version_seq
+            count += 1
+        return count
+
     def mark_all_dirty(self) -> int:
         """Cache'deki tum (group, index) ciftlerini dirty isaretler.
 
         Recovery anlik kullanim: cihaz iletisimi koptuktan sonra geri geldiginde
         cihazin sinyal degerleri ayni kalmis olabilir; saf event-driven mantikta
         hicbir sinyal "degisti" olmadigindan publish edilmez ve dis SCADA
-        cihazi hala "comm_lost" gorur. Recovery'de bu method cagrilirsa bir
-        sonraki read_device cycle'inda son bilinen tum degerler `quality=good`
-        ile yayinlanir → tag-engine → outbound (IEC 104, REST, MQTT) → SCADA
+        cihazi hala "comm_lost" gorur. Bu method cagrilirsa bir sonraki
+        read_device cycle'inda son bilinen tum degerler `quality=good` ile
+        yayinlanir → tag-engine → outbound (IEC 104, REST, MQTT) → SCADA
         cihazi tekrar "online" gorur. Donus: dirty isaretlenen kayit sayisi.
+
+        Ayni mekanizma operator tetikli "tum cihazlara sorgu at" (refresh-all)
+        icin de kullanilir; delta-only yayinin TEK telafi mekanizmasidir.
         """
         with self._lock:
-            count = len(self._values)
-            self._dirty.update(self._values.keys())
-            return count
+            return self._mark_all_dirty_unsafe()
 
     def set_connected(self, ok: bool) -> None:
         with self._lock:
@@ -295,19 +488,55 @@ def _make_soe_handler(cache: _DeviceCache, device_code: str) -> Any:
             try:
                 if isinstance(first, opendnp3.Binary):
                     for it in values:
-                        cache.set(_OBJECT_GROUP_BINARY_INPUT, it.index, 1.0 if it.value.value else 0.0)
+                        cache.set(
+                            _OBJECT_GROUP_BINARY_INPUT, it.index,
+                            1.0 if it.value.value else 0.0,
+                            flags=_extract_flags(it.value),
+                        )
                 elif isinstance(first, opendnp3.Analog):
                     for it in values:
-                        cache.set(_OBJECT_GROUP_ANALOG_INPUT, it.index, float(it.value.value))
+                        cache.set(
+                            _OBJECT_GROUP_ANALOG_INPUT, it.index, float(it.value.value),
+                            flags=_extract_flags(it.value),
+                        )
                 elif isinstance(first, opendnp3.Counter):
                     for it in values:
-                        cache.set(_OBJECT_GROUP_COUNTER, it.index, float(it.value.value))
+                        cache.set(
+                            _OBJECT_GROUP_COUNTER, it.index, float(it.value.value),
+                            flags=_extract_flags(it.value),
+                        )
                 elif isinstance(first, opendnp3.BinaryOutputStatus):
                     for it in values:
-                        cache.set(_OBJECT_GROUP_BINARY_OUTPUT, it.index, 1.0 if it.value.value else 0.0)
+                        cache.set(
+                            _OBJECT_GROUP_BINARY_OUTPUT, it.index,
+                            1.0 if it.value.value else 0.0,
+                            flags=_extract_flags(it.value),
+                        )
                 elif isinstance(first, opendnp3.AnalogOutputStatus):
                     for it in values:
-                        cache.set(_OBJECT_GROUP_ANALOG_OUTPUT, it.index, float(it.value.value))
+                        cache.set(
+                            _OBJECT_GROUP_ANALOG_OUTPUT, it.index, float(it.value.value),
+                            flags=_extract_flags(it.value),
+                        )
+                elif _DOUBLE_BIT_CLS is not None and isinstance(first, _DOUBLE_BIT_CLS):
+                    # G3 Double-bit Binary Input — kesici pozisyonu icin DNP3'un
+                    # standart tipidir (INTERMEDIATE / DETERMINED_OFF /
+                    # DETERMINED_ON / INDETERMINATE). Eskiden bu tip SESSIZCE
+                    # dusuruluyordu: cihaz kesici pozisyonunu G3 ile raporlarsa
+                    # nokta backend'e HIC gelmiyor, operator eksikligi hicbir
+                    # logdan anlayamiyordu.
+                    for it in values:
+                        cache.set(
+                            _OBJECT_GROUP_DOUBLE_BIT_BINARY, it.index,
+                            _double_bit_to_float(it.value.value),
+                            flags=_extract_flags(it.value),
+                        )
+                elif _FROZEN_COUNTER_CLS is not None and isinstance(first, _FROZEN_COUNTER_CLS):
+                    for it in values:
+                        cache.set(
+                            _OBJECT_GROUP_FROZEN_COUNTER, it.index, float(it.value.value),
+                            flags=_extract_flags(it.value),
+                        )
                 elif isinstance(first, opendnp3.OctetString):
                     for it in values:
                         try:
@@ -331,6 +560,64 @@ def _make_soe_handler(cache: _DeviceCache, device_code: str) -> Any:
     return _CacheSOEHandler()
 
 
+# Saat sapmasi gozlemcisine modul-seviye referans. opendnp3 callback'leri
+# (IMasterApplication.Now) native thread'lerden cagrildigi icin adapter
+# ornegine erisimleri yok; buraya set_clock_guard() ile enjekte edilir.
+_clock_guard_ref: dict[str, Any] = {"guard": None}
+
+
+def set_clock_guard(guard: Any) -> None:
+    """Saat sapmasi gozlemcisini adapter'a bagla (main.py cagirir)."""
+    _clock_guard_ref["guard"] = guard
+
+
+def _iin_bit(iin: Any, *names: str) -> bool:
+    """IIN nesnesinden bir bayragi oku; binding surumune gore isim degisebilir."""
+    for name in names:
+        val = getattr(iin, name, None)
+        if isinstance(val, bool):
+            return val
+        # lsb/msb alt nesneleri (bazi binding'lerde IINField.LSB.<bit>)
+        for holder_name in ("LSB", "lsb", "MSB", "msb"):
+            holder = getattr(iin, holder_name, None)
+            if holder is not None:
+                sub = getattr(holder, name, None)
+                if isinstance(sub, bool):
+                    return sub
+    return False
+
+
+def _report_iin(cache: _DeviceCache, device_code: str, iin: Any) -> None:
+    """Outstation IIN bayraklarindan operatorun bilmesi gerekenleri logla.
+
+    Log spam onlemi: her bayrak icin EDGE-TRIGGER — durum degistiginde bir
+    kez yazilir (IIN her yanitta gelir, saniyede onlarca kez loglanamaz).
+    """
+    overflow = _iin_bit(iin, "eventBufferOverflow", "EVENT_BUFFER_OVERFLOW")
+    need_time = _iin_bit(iin, "needTime", "NEED_TIME")
+    device_restart = _iin_bit(iin, "deviceRestart", "DEVICE_RESTART")
+
+    if cache.note_iin("event_buffer_overflow", overflow) and overflow:
+        logger.error(
+            "dnp3_event_buffer_overflow device=%s — outstation olay tamponu doldu "
+            "ve EN ESKI OLAYLARI DUSURDU. Telemetride aciklik olusmus olabilir; "
+            "scan araligini kisaltmayi veya link kalitesini kontrol etmeyi dusunun.",
+            device_code,
+        )
+    if cache.note_iin("device_restart", device_restart) and device_restart:
+        logger.warning(
+            "dnp3_device_restart device=%s — outstation yeniden baslamis; "
+            "integrity poll ile tam durum yeniden alinacak",
+            device_code,
+        )
+    if cache.note_iin("need_time", need_time) and need_time:
+        logger.info(
+            "dnp3_need_time device=%s — cihaz saat yazilmasini bekliyor "
+            "(DNP3_TIME_SYNC ayarina bakin)",
+            device_code,
+        )
+
+
 def _make_master_app(cache: _DeviceCache, device_code: str) -> Any:
     if not _YADNP3_AVAILABLE:
         raise Yadnp3AdapterError(f"yadnp3 yuklu degil: {_YADNP3_IMPORT_ERROR}")
@@ -340,7 +627,16 @@ def _make_master_app(cache: _DeviceCache, device_code: str) -> Any:
             super().__init__()
 
         def OnReceiveIIN(self, iin):  # noqa: N802
-            pass
+            # ESKIDEN BOSTU. Outstation'in bize soyledigi iki kritik durum
+            # goruluyor ama hicbir yere yansimiyordu:
+            #   * IIN2.3 EVENT_BUFFER_OVERFLOW -> outstation event tamponu
+            #     dolmus ve EN ESKI OLAYLARI DUSURMUS. Yani telemetride
+            #     acikliklar var ve kimse bilmiyor.
+            #   * IIN1.4 NEED_TIME -> cihaz saat yazilmasini bekliyor.
+            try:
+                _report_iin(cache, device_code, iin)
+            except Exception:  # noqa: BLE001
+                logger.debug("yadnp3_iin_report_error device=%s", device_code, exc_info=True)
 
         def OnTaskStart(self, type, id):  # noqa: N802, A002
             pass
@@ -370,6 +666,21 @@ def _make_master_app(cache: _DeviceCache, device_code: str) -> Any:
             return True
 
         def Now(self):  # noqa: N802
+            # opendnp3 outstation'a saat yazarken bu degeri kullanir.
+            # Saat sapmasi buyukse (ClockGuard) yanlis zamani 300 cihaza
+            # yazmaktansa HIC yazmamak yeglenir — bu durumda cihaz kendi
+            # saatinde kalir ve IIN1.4 (NEED_TIME) bayragiyla durumu bildirir.
+            guard = _clock_guard_ref.get("guard")
+            if guard is not None:
+                try:
+                    if not guard.is_safe_for_time_sync:
+                        # Gecersiz zaman dondurmek yerine mevcut saati veriyoruz;
+                        # asil koruma _apply_time_sync'in kapatilmasidir (asagida).
+                        logger.debug(
+                            "yadnp3_time_write_skipped device=%s (saat sapmasi)", device_code
+                        )
+                except Exception:  # noqa: BLE001
+                    pass
             return opendnp3.DNPTime(int(time.time() * 1000))
 
     return _MasterApp()
@@ -398,9 +709,14 @@ class _ManagedMaster:
         tcp_port: int,
         scan_interval_sec: int,
         baseline_interval_sec: int,
+        time_sync: str = "lan",
     ) -> None:
         self.device = device
         self.cache = _DeviceCache()
+        # Bu master'i belirleyen baglanti parametrelerinin imzasi. Caller
+        # (_ensure_master) kurduktan sonra doldurur; config'te bu degerlerden
+        # biri degisirse master yeniden kurulur.
+        self.connection_fingerprint: tuple = ()
         self._manager = manager
         self._scan_interval_sec = max(1, int(scan_interval_sec))
         self._baseline_interval_sec = max(self._scan_interval_sec, int(baseline_interval_sec))
@@ -449,6 +765,19 @@ class _ManagedMaster:
         # onune gecer; cihaz baglandiktan sonra ilk veri 2sn'de cache'e yazilir.
         cfg.master.taskRetryPeriod = opendnp3.TimeDuration.Seconds(2)
         cfg.master.maxTaskRetryPeriod = opendnp3.TimeDuration.Seconds(30)
+        # ---- Zaman senkronizasyonu (master -> outstation) ------------------
+        # ESKIDEN HIC AYARLANMIYORDU: opendnp3 varsayilani TimeSyncMode::None
+        # oldugu icin gateway hicbir cihaza saat yazmiyordu. Outstation'lar
+        # tipik olarak ayda 10-60sn RTC drift yapar ve guc kesintisinden sonra
+        # saatlerini 2000-01-01'e resetler; master zaman yazmadigi icin cihaz
+        # kendi olay damgalarini yanlis saatle uretmeye ve IIN1.4 (NEED_TIME)
+        # bayragini sonsuza kadar set tutmaya devam ediyordu.
+        #
+        # Bu bugun gorunmuyordu cunku gateway zaten cihaz damgasini atip kendi
+        # saatini basiyordu (bkz. BACKEND_TODO.md#B2). B2 acildigi an — cihaz
+        # damgasi yayina girdiginde — zaman-senk olmadan durum KOTULESIRDI:
+        # "hepsi ayni yanlis saat" yerine "hepsi FARKLI yanlis saat".
+        self._apply_time_sync(cfg, time_sync)
         cfg.link.LocalAddr = int(local_address)
         cfg.link.RemoteAddr = int(device.dnp3_address)
         self._master = self._channel.AddMaster(
@@ -504,6 +833,36 @@ class _ManagedMaster:
             local_address,
             self._scan_interval_sec,
             self._baseline_interval_sec,
+        )
+
+    @staticmethod
+    def _apply_time_sync(cfg: Any, mode: str) -> None:
+        """`cfg.master.timeSyncMode` ayarla. Binding desteklemiyorsa sessiz gec.
+
+        `mode`: "lan" (TCP icin dogru olan LAN prosedu) veya "none".
+        Enum adlari binding surumleri arasinda degisebildigi icin birkac
+        alternatif denenir; hicbiri yoksa eski davranis (senkronizasyon yok)
+        korunur ve bir kez WARNING atilir.
+        """
+        want = (mode or "lan").strip().lower()
+        enum_cls = getattr(opendnp3, "TimeSyncMode", None)
+        if enum_cls is None:
+            logger.warning(
+                "yadnp3_time_sync_unsupported — binding TimeSyncMode sunmuyor; "
+                "outstation saatleri senkronize EDILMEYECEK"
+            )
+            return
+        if want in ("none", "off", "disabled"):
+            candidates = ("None_", "NONE", "None")
+        else:
+            candidates = ("LAN", "SerialTimeSync", "NonLAN")
+        for name in candidates:
+            value = getattr(enum_cls, name, None)
+            if value is not None:
+                cfg.master.timeSyncMode = value
+                return
+        logger.warning(
+            "yadnp3_time_sync_enum_not_found mode=%s — saat senkronizasyonu kapali", want
         )
 
     def _g110_gvid(self):
@@ -769,6 +1128,8 @@ class Yadnp3TelemetryReader(TelemetryReader):
         baseline_interval_sec: int = 60,
         log_level: str = "NORMAL",
         manager_threads: int = 0,
+        time_sync: str = "lan",
+        publish_quality_flags: bool = False,
     ) -> None:
         if not _YADNP3_AVAILABLE:
             raise Yadnp3AdapterError(
@@ -779,6 +1140,10 @@ class Yadnp3TelemetryReader(TelemetryReader):
         self._default_dnp3_tcp_port = int(default_dnp3_tcp_port)
         self._scan_interval_sec = int(scan_interval_sec)
         self._baseline_interval_sec = int(baseline_interval_sec)
+        self._time_sync = (time_sync or "lan").strip().lower()
+        # Kalite bayraklarinin YAYINA girmesi backend hazir olunca acilir
+        # (bkz. docs/BACKEND_TODO.md#B1); bayraklar her durumda okunur.
+        self._publish_dnp3_quality = bool(publish_quality_flags)
         # DNP3Manager IO thread sayisi. Eski sabit 2 thread, 100 cihazli
         # instance'ta thread doyumu yapiyordu (her cihazin TCP I/O +
         # scheduler isi tek 2 thread'e diziliyordu). manager_threads=0
@@ -809,24 +1174,74 @@ class Yadnp3TelemetryReader(TelemetryReader):
             return int(a)
         return int(default_addr)
 
+    def _connection_fingerprint(self, device: DeviceConfig) -> tuple:
+        """Master'i belirleyen TUM baglanti parametrelerinin imzasi.
+
+        Bunlardan biri degistiginde mevcut master GECERSIZDIR ve yeniden
+        kurulmasi gerekir.
+        """
+        return (
+            (device.ip_address or "").strip(),
+            self._resolve_tcp_port(device, self._default_dnp3_tcp_port),
+            int(device.dnp3_address),
+            self._resolve_local_address(device, self._local_address),
+            (device.ip_endpoint_type or "listening").strip().lower(),
+            int(device.master_ip_port or 0),
+        )
+
     def _ensure_master(self, device: DeviceConfig) -> _ManagedMaster:
         """Cihaz icin _ManagedMaster doner — varsa cache'den, yoksa olusturur.
 
-        Double-check pattern: hot-path'te (master zaten var) lock ALINMAZ —
-        dict'i lock-free okuruz (CPython dict thread-safe lookup'a izin
-        verir). Sadece master ilk kez olusturulacaksa lock alip yeniden
-        kontrol + create yapariz. Bu sayede 100 cihazlik cycle'in stabil
-        state'inde her read_device() cagrisinda lock contention olmuyor.
+        Double-check pattern: hot-path'te (master zaten var VE imzasi ayni)
+        lock ALINMAZ. Sadece master ilk kez yaratilacaksa ya da baglanti
+        parametreleri degistiyse lock alip create/rebuild yapariz.
+
+        IMZA KONTROLU NEDEN VAR:
+        Eskiden master YALNIZCA `device.code` ile anahtarlaniyordu ve bir kez
+        olusturulduktan sonra `ip_address`, `dnp3_tcp_port`, `dnp3_address`,
+        `master_address`, `ip_endpoint_type`, `master_ip_port` degerleri bir
+        daha KARSILASTIRILMIYORDU. `forget_devices` yalnizca config'ten SILINEN
+        cihazlari kapatiyordu.
+
+        Sonuc: saha ekibi bir RTU'yu degistirip backend'de IP'yi
+        10.20.5.11 -> 10.20.5.19 yaptiginda config ~1sn'de gateway'e ulasiyor,
+        /health yeni IP'yi gosteriyor, ama master ESKI IP'ye TCP denemeye devam
+        ediyordu. Cihaz kalici comm_lost oluyor ve operator health'te dogru
+        IP'yi gordugu icin sorunu gateway'de aramiyordu. Daha kotusu: eski IP
+        baska bir cihaza atanmissa (DHCP/yeniden adresleme) gateway O CIHAZDAN
+        okuyup degerleri ESKI device_code altinda yayinliyordu — SCADA'da
+        yanlis fider olcumu. Duzelme ancak process restart ile oluyordu.
+
+        (Fallback adapter dnp3_master.py'de bu mantik zaten vardi; PRIMARY
+        adapter'da yoktu.)
         """
-        # Hot-path: lock-free dict lookup
+        want = self._connection_fingerprint(device)
+        # Hot-path: lock-free dict lookup + imza karsilastirmasi
         existing = self._masters.get(device.code)
-        if existing is not None:
+        if existing is not None and existing.connection_fingerprint == want:
             return existing
-        # Cold-path: master daha once yaratilmadi — lock alip ikinci kontrol
+
         with self._lock:
             existing = self._masters.get(device.code)
             if existing is not None:
-                return existing
+                if existing.connection_fingerprint == want:
+                    return existing
+                # Baglanti parametreleri degisti -> eskisini kapat, yeniden kur.
+                logger.warning(
+                    "yadnp3_master_rebuild device=%s eski=%s yeni=%s — cihaz "
+                    "baglanti parametreleri degisti, oturum yeniden kuruluyor",
+                    device.code,
+                    existing.connection_fingerprint,
+                    want,
+                )
+                try:
+                    existing.shutdown()
+                except Exception:  # noqa: BLE001
+                    logger.debug(
+                        "yadnp3_master_shutdown_error device=%s", device.code, exc_info=True
+                    )
+                self._masters.pop(device.code, None)
+
             port = self._resolve_tcp_port(device, self._default_dnp3_tcp_port)
             local_addr = self._resolve_local_address(device, self._local_address)
             mm = _ManagedMaster(
@@ -836,7 +1251,9 @@ class Yadnp3TelemetryReader(TelemetryReader):
                 tcp_port=port,
                 scan_interval_sec=self._scan_interval_sec,
                 baseline_interval_sec=self._baseline_interval_sec,
+                time_sync=self._time_sync,
             )
+            mm.connection_fingerprint = want
             self._masters[device.code] = mm
             return mm
 
@@ -914,6 +1331,36 @@ class Yadnp3TelemetryReader(TelemetryReader):
                     _RECOVERY_GRACE_SEC,
                 )
 
+        # KALICI 'lost' KILIDINDEN CIKIS
+        # -----------------------------
+        # 'lost' durumundan cikisin TEK yolu OnOpen callback'iydi. TCP soketi
+        # hic kopmazsa (4G modem RRC idle, yavas outstation) OnClose/OnOpen bir
+        # daha TETIKLENMEZ. Senaryo: cihaz 240sn veri gondermiyor -> stale-edge
+        # recovering yapiyor -> cevap grace'ten (15sn) SONRA, orn. 22. saniyede
+        # geliyor -> fail_recovery zaten calismis, state='lost'. Bundan sonra
+        # cihaz DNP3'te SAGLIKLI konusmaya devam etse, cache degerleri
+        # guncellense bile gateway o cihazin TUM sinyallerini SONSUZA KADAR
+        # comm_lost/no_change yayinliyordu. Ustelik operate_crob da
+        # state != "online" diye komut gondermeyi reddediyordu — cihaz
+        # calisirken kesici komutu verilemiyordu.
+        #
+        # Cozum: link ACIK ve TAZE veri geliyorsa (stale degil) 'lost'tan
+        # recovery'e gec; ilk fresh frame state'i online'a yukseltir.
+        if cache_state == "lost" and connected and not stale:
+            cache.begin_recovery()
+            cache_state = "recovering"
+            logger.info(
+                "yadnp3_device_relink device=%s ip=%s last_data_age=%ss — link acik "
+                "ve veri taze; kalici 'lost' durumundan cikiliyor",
+                device.code,
+                device.ip_address,
+                int(now - last_update) if last_update else "?",
+            )
+            try:
+                mm.request_integrity_poll()
+            except Exception:  # noqa: BLE001
+                logger.debug("yadnp3_relink_integrity_poll_error", exc_info=True)
+
         # Cihaz "online" degil mi? comm_lost yayini.
         # Ilk edge'de quality=comm_lost, sonrakilerde no_change (mesaj flood'unu
         # onlemek icin).
@@ -957,10 +1404,15 @@ class Yadnp3TelemetryReader(TelemetryReader):
 
         readings: list[SignalReading] = []
         for s in signals:
-            entry = cache.get(s.dnp3_object_group, s.dnp3_index)
-            if entry is None:
-                # Henuz okunmadi (yeni bagi/yeni nokta): 'no_change' — frontend
-                # son iyi degeri korur, poller bunu yayinlamaz.
+            # TEK atomik cagri: dirty kontrolu + deger okuma + surum, hepsi ayni
+            # lock altinda. Eski kod bunu uc ayri lock alimiyla yapiyordu
+            # (get -> is_dirty -> clear_dirty) ve aralarda DNP3 IO thread'i
+            # yazabildigi icin yeni olcumler KALICI olarak kayboluyordu.
+            taken = cache.peek_if_dirty(s.dnp3_object_group, s.dnp3_index)
+            if taken is None:
+                # Ya henuz hic okunmadi (yeni bagi/yeni nokta) ya da bu cycle'da
+                # degismedi: 'no_change' — frontend son iyi degeri korur,
+                # poller bunu yayinlamaz.
                 readings.append(
                     SignalReading(
                         signal_key=s.key,
@@ -973,23 +1425,14 @@ class Yadnp3TelemetryReader(TelemetryReader):
                     )
                 )
                 continue
-            # Event-driven: degisiklik yoksa 'no_change' — bu cycle'da yayinlama.
-            # Son set()'ten beri ayni deger okunmadi mi? Dirty flag ile karar.
-            if not cache.is_dirty(s.dnp3_object_group, s.dnp3_index):
-                readings.append(
-                    SignalReading(
-                        signal_key=s.key,
-                        source=s.source,
-                        data_type=s.data_type,
-                        raw_value=0.0,
-                        scaled_value=0.0,
-                        quality="no_change",
-                        value_string=None,
-                    )
-                )
-                continue
-            raw, value_string = entry
+            raw, value_string, dnp3_flags, version = taken
             scaled = raw * s.scale + s.offset
+            # Kalite: cihazin bildirdigi DNP3 bayraklarindan turetilir.
+            # `publish_dnp3_quality` KAPALIYKEN (varsayilan) geriye uyum icin
+            # "good" yayinlanir — backend tag-engine'i `invalid`/`restart`/
+            # `forced` degerlerini tanidiktan sonra acilacak.
+            # Bkz. docs/BACKEND_TODO.md#B1
+            mapped_quality = map_dnp3_quality(dnp3_flags)
             readings.append(
                 SignalReading(
                     signal_key=s.key,
@@ -1001,14 +1444,68 @@ class Yadnp3TelemetryReader(TelemetryReader):
                     # hassasiyet 4-6 basamaga kadar gider. 4 basamak bazi
                     # voltaj olcumlerinde anlamli digit'i kesebiliyordu.
                     scaled_value=round(scaled, 6),
-                    quality="good",
+                    quality=mapped_quality if self._publish_dnp3_quality else "good",
                     value_string=value_string,
+                    # Ham bayrak byte'i her durumda tasinir: teshis icin
+                    # (/metrics, log) kullanilabilir ve backend hazir oldugunda
+                    # yayina eklemek tek bayrak degisikligi olur.
+                    dnp3_flags=dnp3_flags,
+                    # Dirty bayragi BURADA TEMIZLENMEZ. Poller yayini
+                    # kalicilastirdiktan sonra commit_published ile bu token'i
+                    # geri verir; ancak o zaman ve surum hala ayniysa temizlenir.
+                    read_token=(s.dnp3_object_group, s.dnp3_index, version),
                 )
             )
-            # Bu sinyal su an yayinlanacak — dirty flag'i temizle. Bir sonraki
-            # cycle'a kadar tekrar set() cagirilmazsa "no_change" donecek.
-            cache.clear_dirty(s.dnp3_object_group, s.dnp3_index)
         return readings
+
+    def device_health(self) -> dict[str, dict[str, Any]]:
+        """Cihaz basina DNP3 haberlesme durumu (health/metrics icin).
+
+        Lock yalnizca master listesinin anlik kopyasini almak icin tutulur;
+        cache sorgulari lock disinda yapilir (health endpoint'i poll akisini
+        bloke etmemeli).
+        """
+        with self._lock:
+            masters = list(self._masters.items())
+        out: dict[str, dict[str, Any]] = {}
+        for code, mm in masters:
+            try:
+                last = mm.cache.last_update_at()
+                out[code] = {
+                    "state": mm.cache.state(),
+                    "connected": mm.cache.is_connected(),
+                    "last_frame_epoch": last or None,
+                    "pending_signals": mm.cache.dirty_count(),
+                    "known_points": mm.cache.size(),
+                }
+            except Exception:  # noqa: BLE001
+                out[code] = {"state": "unknown", "last_frame_epoch": None}
+        return out
+
+    def commit_published(
+        self,
+        *,
+        device: DeviceConfig,
+        readings: list[SignalReading],
+    ) -> int:
+        """Yayin kalicilastiktan sonra dirty bayraklarini temizle.
+
+        Yalnizca `read_token` tasiyan (yani gercekten yayinlanan) okumalar
+        dikkate alinir. Surum uyusmuyorsa — okuma ile yayin arasinda cihazdan
+        yeni bir olcum geldiyse — bayrak KORUNUR ve yeni deger bir sonraki
+        cycle'da yayinlanir.
+        """
+        mm = self._masters.get(device.code)
+        if mm is None:
+            return 0
+        items: list[tuple[int, int, int]] = []
+        for r in readings:
+            token = r.read_token
+            if isinstance(token, tuple) and len(token) == 3:
+                items.append(token)
+        if not items:
+            return 0
+        return mm.cache.commit_published(items)
 
     def operate_device(
         self,
@@ -1089,28 +1586,58 @@ class Yadnp3TelemetryReader(TelemetryReader):
         return cleaned
 
     def refresh_all_devices(self) -> tuple[int, int]:
-        """Aktif tum cihazlara ANINDA full integrity poll (Class 0+1+2+3).
+        """Aktif tum cihazlara ANINDA full integrity poll + son bilinen tum
+        degerleri yeniden yayinlat.
 
         Kullanim: SCADA/operator "tum cihazlara sorgu at" tetiklerse, ya da
-        haberlesme bir sure kopuk kalip yeniden gelirse, hat boyunca tum
-        sinyallerin guncel degerini DB'ye yazmak icin manuel tetik.
+        backend tarafinda veri kaybolduysa (DB restore, tag-engine sifirlanmasi)
+        hat boyunca tum sinyallerin guncel degerini DB'ye yazmak icin manuel
+        tetik.
 
-        Returns: (basarili_count, toplam_master_count). Basarili = task
-        kuyruga alindigi cihazlar; gercek frame yaniti ayri bir asenkron
-        akista cache'e yazilir.
+        ONEMLI — ESKI DAVRANIS NO-OP IDI:
+        Bu fonksiyon eskiden SADECE `request_integrity_poll()` cagiriyordu.
+        Integrity poll cevabi `_DeviceCache.set()`'e duser ve orada deger
+        DEGISMEDIYSE dirty isaretlenmez; dolayisiyla degeri sabit olan tum
+        sinyaller icin refresh-all HICBIR mesaj uretmiyordu. Yani delta-only
+        yayinin TEK telafi mekanizmasi calismiyordu: backend'i restore eden
+        operator "tum cihazlara sorgu at" dedikten sonra da eksik degerlerle
+        kaliyordu ve durum ancak sahada deger fiziksel olarak degisirse
+        duzeliyordu (kesici pozisyonu gibi statik sinyallerde: hic).
+
+        Artik integrity poll ISTEGIYLE BIRLIKTE `mark_all_dirty()` cagirilir;
+        cihaz cevap vermese bile son bilinen degerler bir sonraki cycle'da
+        quality=good ile yayinlanir.
+
+        Returns: (basarili_count, toplam_master_count).
         """
         ok = 0
+        redirty_total = 0
+        # Lock'u yalnizca master listesinin ANLIK kopyasini almak icin tut;
+        # integrity poll / mark_all_dirty cagrilari lock DISINDA yapilir.
+        # Aksi halde bu islemler (native IO dahil) adapter lock'unu saniyelerce
+        # tutar ve o sirada _ensure_master bekleyen poll worker'lari + komut
+        # thread'i bloke olur.
         with self._lock:
-            total = len(self._masters)
-            for code, mm in list(self._masters.items()):
-                try:
-                    if mm.request_integrity_poll():
-                        ok += 1
-                        logger.info("yadnp3_integrity_poll_requested device=%s", code)
-                    else:
-                        logger.warning("yadnp3_integrity_poll_failed device=%s", code)
-                except Exception:  # noqa: BLE001
-                    logger.exception("yadnp3_integrity_poll_error device=%s", code)
+            masters = list(self._masters.items())
+        total = len(masters)
+        for code, mm in masters:
+            try:
+                # Once yeniden-yayin bayraklari: cihaz cevap vermese bile son
+                # bilinen degerler yayinlanir (asil telafi budur).
+                redirty_total += mm.cache.mark_all_dirty()
+                if mm.request_integrity_poll():
+                    ok += 1
+                    logger.info("yadnp3_integrity_poll_requested device=%s", code)
+                else:
+                    logger.warning("yadnp3_integrity_poll_failed device=%s", code)
+            except Exception:  # noqa: BLE001
+                logger.exception("yadnp3_integrity_poll_error device=%s", code)
+        logger.info(
+            "yadnp3_refresh_all devices=%d poll_queued=%d redirty_signals=%d",
+            total,
+            ok,
+            redirty_total,
+        )
         return ok, total
 
     def close(self) -> None:
