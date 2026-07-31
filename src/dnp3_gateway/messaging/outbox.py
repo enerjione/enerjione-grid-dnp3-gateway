@@ -35,6 +35,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from dnp3_gateway.messaging.sqlite_support import Migration, open_versioned_db
+
 logger = logging.getLogger(__name__)
 
 # Bir mesaj kac kere retry edilirse dead-letter tablosuna tasinir.
@@ -60,34 +62,63 @@ class OutboxFullError(RuntimeError):
     breaker'i tetiklemek icin yakalar."""
 
 
-_DDL = """
-CREATE TABLE IF NOT EXISTS outbox (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    message_id TEXT NOT NULL,
-    correlation_id TEXT,
-    headers TEXT,
-    payload TEXT NOT NULL,
-    enqueued_at REAL NOT NULL,
-    retry_count INTEGER NOT NULL DEFAULT 0,
-    last_error TEXT
-);
-CREATE INDEX IF NOT EXISTS ix_outbox_enqueued_at ON outbox(enqueued_at);
+def _migration_001_initial(conn: sqlite3.Connection) -> None:
+    """v1 — baslangic semasi (0.4.x ile ayni; mevcut dosyalar uyumlu)."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS outbox (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_id TEXT NOT NULL,
+            correlation_id TEXT,
+            headers TEXT,
+            payload TEXT NOT NULL,
+            enqueued_at REAL NOT NULL,
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT
+        );
+        CREATE INDEX IF NOT EXISTS ix_outbox_enqueued_at ON outbox(enqueued_at);
 
--- Poison message'lar burada (retry_count > MAX olmus olanlar). Manuel
--- inceleme icin saklanir; otomatik silme yok. Operator karari.
-CREATE TABLE IF NOT EXISTS outbox_dead_letter (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    message_id TEXT NOT NULL,
-    correlation_id TEXT,
-    headers TEXT,
-    payload TEXT NOT NULL,
-    enqueued_at REAL NOT NULL,
-    moved_at REAL NOT NULL,
-    retry_count INTEGER NOT NULL,
-    last_error TEXT
-);
-CREATE INDEX IF NOT EXISTS ix_dead_letter_moved_at ON outbox_dead_letter(moved_at);
-"""
+        -- Poison message'lar burada (retry_count > MAX olmus olanlar). Manuel
+        -- inceleme icin saklanir. Retention v2'de eklendi.
+        CREATE TABLE IF NOT EXISTS outbox_dead_letter (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_id TEXT NOT NULL,
+            correlation_id TEXT,
+            headers TEXT,
+            payload TEXT NOT NULL,
+            enqueued_at REAL NOT NULL,
+            moved_at REAL NOT NULL,
+            retry_count INTEGER NOT NULL,
+            last_error TEXT
+        );
+        CREATE INDEX IF NOT EXISTS ix_dead_letter_moved_at
+            ON outbox_dead_letter(moved_at);
+        """
+    )
+
+
+def _migration_002_next_attempt_at(conn: sqlite3.Connection) -> None:
+    """v2 — satir-bazli backoff icin `next_attempt_at`.
+
+    Eskiden retrier TUM kuyrugu tek bir global backoff ile yonetiyordu ve
+    kalici hatali tek bir satir kuyrugun basini sonsuza kadar tikayabiliyordu
+    (head-of-line blocking). Satir bazli `next_attempt_at` ile hatali satir
+    ertelenir, arkasindaki telemetri akmaya devam eder.
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(outbox)").fetchall()}
+    if "next_attempt_at" not in cols:
+        conn.execute(
+            "ALTER TABLE outbox ADD COLUMN next_attempt_at REAL NOT NULL DEFAULT 0"
+        )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS ix_outbox_next_attempt ON outbox(next_attempt_at, id)"
+    )
+
+
+_MIGRATIONS: list[Migration] = [
+    (1, "initial outbox + dead_letter schema", _migration_001_initial),
+    (2, "outbox.next_attempt_at (satir-bazli backoff)", _migration_002_next_attempt_at),
+]
 
 
 class Outbox:
@@ -102,50 +133,30 @@ class Outbox:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
-        # Outbox SQLite dosyasinda telemetri payload + correlation_id +
-        # cihaz IP'leri serialize halde durur. POSIX'te diger user'lar
-        # bunu okumasin diye chmod 600 (owner read/write only).
-        # Windows'ta NTFS ACL ayri; install.ps1'da GATEWAY_STATE_DIR'a
-        # `icacls` ile kisitlama yapilmali.
-        try:
-            import os as _os
-            if _os.name == "posix":
-                # Dosya henuz olusmamissa _init_db'den sonra chmod yapilacak;
-                # burada once mevcut dosya icin (idempotent boot) deneyelim.
-                if self.db_path.exists():
-                    _os.chmod(self.db_path, 0o600)
-        except OSError:
-            # chmod basarisiz oldu — log'a yazmiyoruz cunku logger henuz
-            # init olmamis olabilir. Kritik degil; defense-in-depth.
-            pass
         self._max_pending = max(1000, int(max_pending))
-        # Persistent connection: her enqueue/fetch/delete cagrisinda yeni
-        # sqlite3.connect() acmak yerine bir kez acip PRAGMA'lari uyguluyoruz.
-        # check_same_thread=False + dis lock thread-safe. WAL otomatik
-        # checkpoint dosyayi temizler. Kazanc: ~3000 mesaj/sn yukunde her
-        # mesajda 1-3ms baglanti acma overhead'i kalkar.
-        self._conn: sqlite3.Connection | None = None
+        # Surumlenmis + butunlugu dogrulanmis baglanti:
+        #   * PRAGMA quick_check — bozuk dosya karantinaya alinir, gateway
+        #     kalici boot arizasina girmez (eskiden yapicida raise ediyordu).
+        #   * PRAGMA user_version tabanli migration — yeni kolon eklemek
+        #     sahadaki mevcut .db dosyalarini crash-loop'a sokmaz.
+        # POSIX chmod 600 open_versioned_db icinde uygulanir (telemetri
+        # payload'u + cihaz IP'leri diger kullanicilara kapali kalsin).
+        self._conn: sqlite3.Connection | None = open_versioned_db(
+            self.db_path,
+            migrations=_MIGRATIONS,
+            label=f"outbox[{self.db_path.name}]",
+            synchronous="NORMAL",
+            wal_autocheckpoint=1000,
+        )
         # Estimate counter: enqueue'da SELECT COUNT(*) yapmak yerine in-memory
         # sayac tutariz. Init'te bir kez tam COUNT, sonra +/- delta.
-        # `move_to_dead_letter` ve `delete` -1; `enqueue` +1.
-        # Yaklasik degerdir ama ust sinire kadar yanlislik kabul edilebilir
-        # (worst case birkac mesaj fazla kabul edilebilir; broker recovery'de
-        # zaten retrier hizla bosaltir).
         self._pending_estimate: int = 0
-        # `_init_db` DDL'i transaction icinde uygular; tablo olusturulduktan
-        # SONRA COUNT yapariz. Init asamasinda baska thread enqueue cagiramaz
-        # (Outbox henuz constructor'in icinde, publisher publisher_holder'a
-        # injekte edilmedi), ama defansif olarak yine de self._lock altinda
-        # yapiyoruz — gelecekte init sirasinda thread spawn'lanirsa garanti.
-        self._init_db()
         try:
             with self._lock:
                 c = self._cached_connection()
                 (n,) = c.execute("SELECT COUNT(*) FROM outbox").fetchone()
                 self._pending_estimate = int(n)
         except sqlite3.Error:
-            # Init asamasinda tablo erisilemediyse 0 ile basla; enqueue ilk
-            # cagri'da sayim yine kendi kendine duzelir (sadece estimate).
             self._pending_estimate = 0
 
     def _cached_connection(self) -> sqlite3.Connection:
@@ -155,19 +166,14 @@ class Outbox:
         return self._conn
 
     def _open_connection(self) -> sqlite3.Connection:
-        # check_same_thread=False: thread-safe lock disaridan saglaniyor.
-        # WAL: yazma+okuma birlikte olabilsin (retrier vs enqueue).
-        # synchronous=NORMAL: WAL ile kombine production'da OK; FULL ihtiyaci
-        # mesajlar zaten idempotent (deduplication tag-engine'de) oldugu icin
-        # cok kucuk bir kayip riski tolere edilir vs. ~%30 throughput kazanc.
-        conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=5.0)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        # WAL dosyasi zamanla bytes-MB'lara cikar; her 1000 sayfada checkpoint.
-        # 100 cok agresifti (fsync firtinasi); 1000 ile WAL <8MB kalir,
-        # restart hizli.
-        conn.execute("PRAGMA wal_autocheckpoint=1000")
-        return conn
+        """Yeniden baglanti (close sonrasi). Migration + quick_check dahil."""
+        return open_versioned_db(
+            self.db_path,
+            migrations=_MIGRATIONS,
+            label=f"outbox[{self.db_path.name}]",
+            synchronous="NORMAL",
+            wal_autocheckpoint=1000,
+        )
 
     # Geriye uyumluluk: eski testler veya kullanim _connect()'i context
     # manager olarak cagiriyor olabilir.
@@ -175,22 +181,8 @@ class Outbox:
         return self._open_connection()
 
     def _init_db(self) -> None:
-        # Init'te ayri bir connection olusturup hemen kapatiyoruz — DDL'i
-        # autocommit moda zorlamak icin.
-        conn = self._open_connection()
-        try:
-            conn.executescript(_DDL)
-            conn.commit()
-        finally:
-            conn.close()
-        # POSIX'te chmod 600 — telemetri payload + cihaz IP'leri diger
-        # user'lara kapali kalsin.
-        try:
-            import os as _os
-            if _os.name == "posix" and self.db_path.exists():
-                _os.chmod(self.db_path, 0o600)
-        except OSError:
-            pass
+        """Geriye uyumluluk no-op — sema artik open_versioned_db ile kurulur."""
+        return None
 
     @property
     def max_pending(self) -> int:

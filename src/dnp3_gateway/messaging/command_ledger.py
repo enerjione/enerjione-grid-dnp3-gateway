@@ -3,28 +3,38 @@
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 import threading
 import time
 from pathlib import Path
 from typing import Any
 
+from dnp3_gateway.messaging.sqlite_support import Migration, open_versioned_db
 
-_DDL = """
-CREATE TABLE IF NOT EXISTS command_ledger (
-    command_id INTEGER PRIMARY KEY,
-    state TEXT NOT NULL,
-    received_at REAL NOT NULL,
-    dispatch_started_at REAL,
-    completed_at REAL,
-    result_json TEXT,
-    delivery_state TEXT NOT NULL DEFAULT 'pending',
-    delivery_error TEXT
-);
-CREATE INDEX IF NOT EXISTS ix_command_ledger_delivery
-    ON command_ledger (delivery_state, completed_at);
-"""
+
+def _migration_001_initial(conn: sqlite3.Connection) -> None:
+    """v1 — baslangic semasi (0.4.x ile ayni; mevcut dosyalar uyumlu)."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS command_ledger (
+            command_id INTEGER PRIMARY KEY,
+            state TEXT NOT NULL,
+            received_at REAL NOT NULL,
+            dispatch_started_at REAL,
+            completed_at REAL,
+            result_json TEXT,
+            delivery_state TEXT NOT NULL DEFAULT 'pending',
+            delivery_error TEXT
+        );
+        CREATE INDEX IF NOT EXISTS ix_command_ledger_delivery
+            ON command_ledger (delivery_state, completed_at);
+        """
+    )
+
+
+_MIGRATIONS: list[Migration] = [
+    (1, "initial command_ledger schema", _migration_001_initial),
+]
 
 
 class CommandLedger:
@@ -39,17 +49,18 @@ class CommandLedger:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
-        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=5.0)
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=FULL")
-        self._conn.execute("PRAGMA wal_autocheckpoint=1000")
-        self._conn.executescript(_DDL)
-        self._conn.commit()
-        if os.name == "posix":
-            try:
-                os.chmod(self.db_path, 0o600)
-            except OSError:
-                pass
+        # synchronous=FULL: bu dosya FIZIKSEL komutlarin tek yerel kaydidir.
+        # Bir CROB'un gonderilip gonderilmedigi bilgisi elektrik kesintisinde
+        # bile kaybolmamali (idempotency + denetim izi).
+        # open_versioned_db: quick_check ile bozuk dosya karantinaya alinir,
+        # user_version ile sema surumlenir, POSIX'te chmod 600 uygulanir.
+        self._conn = open_versioned_db(
+            self.db_path,
+            migrations=_MIGRATIONS,
+            label=f"command_ledger[{self.db_path.name}]",
+            synchronous="FULL",
+            wal_autocheckpoint=1000,
+        )
 
     def start_dispatch(self, command_id: int) -> bool:
         """Dispatch intent'i kalıcı yazılırsa True döner."""
