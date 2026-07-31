@@ -1,26 +1,31 @@
 # Build & push container image to GitHub Container Registry (ghcr.io).
 #
-# Triggers:
-#   - main push     -> ghcr.io/<owner>/<repo>:latest + :sha-<short>
-#   - tag v*.*.*    -> ghcr.io/<owner>/<repo>:<version> + :latest
+# ETIKETLEME POLITIKASI (2026-07 degisikligi)
+# -------------------------------------------
+# ESKI: main'e giden her push `:latest`'i EZIYORDU ve test kapisi yoktu.
+#   Sahadaki compose dosyalari `:latest` cektigi icin, bir sunucu bakiminda
+#   `docker compose pull && up -d` yapan operator test edilmemis bir imaji
+#   uretime aliyordu. Bozuk bir commit tum sahayi ayni anda dusurebiliyordu
+#   ve geri donus icin saglam bir etiket de yoktu.
+#
+# YENI:
+#   * main push   -> SADECE :main + :sha-<short>   (deneme/CI imaji)
+#   * tag v*.*.*  -> :<version> + :<major>.<minor> + :latest  (uretim surumu)
+#   `:latest` artik yalnizca bilincli bir surum etiketiyle olusur; rollback
+#   icin her surumun kendi semver etiketi vardir.
+#
+# Ayrica: `needs: ci` — testler ve lint gecmeden HICBIR imaj yayinlanmaz.
 #
 # Image visibility:
-#   The repo is private but the published package can be made PUBLIC from
-#   GitHub UI (Profile -> Packages -> enerjionegrid-dnp3-gateway -> Settings ->
-#   Change visibility -> Public). After that step, end users can run
-#   `docker pull ghcr.io/fikretsafak/enerjionegrid-dnp3-gateway:latest` without
-#   `docker login`. Source code stays private.
-#
-# Why GHCR (not Docker Hub):
-#   - Already authenticated via GITHUB_TOKEN (no extra secrets to manage).
-#   - Public packages have unlimited anonymous pulls; Docker Hub free tier rate-limits.
+#   Repo private olsa da paket GitHub UI'dan PUBLIC yapilabilir
+#   (Packages -> enerjione-dnp3-gateway -> Settings -> Change visibility).
+#   Sonrasinda son kullanici `docker login` olmadan pull edebilir.
 #
 # Multi-arch:
-#   linux/amd64 (typical Ubuntu / Windows Docker Desktop hosts) and
-#   linux/arm64 (Raspberry Pi 4/5, Apple Silicon dev). Customer field servers
-#   are usually amd64; arm64 covers edge devices without an extra build.
+#   yadnp3 (OpenDNP3 native) PyPI'de arm64 wheel saglamiyor; bu yuzden
+#   linux/amd64 only. Saha sunuculari zaten amd64.
 
-name: build-and-push-image
+name: release-image
 
 on:
   push:
@@ -37,14 +42,16 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  # KAPI: testler + lint gecmeden imaj yayinlanmaz.
+  ci:
+    uses: ./.github/workflows/ci.yml
+
   build:
+    needs: ci
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -61,13 +68,13 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          # main push -> :latest + :sha-<short>; tag v0.4.3 -> :0.4.3 + :latest.
+          # main push -> :main + :sha-<short>
+          # tag v0.5.0 -> :0.5.0 + :0.5 + :latest
           tags: |
             type=ref,event=branch
+            type=sha,prefix=sha-,format=short
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=sha,prefix=sha-,format=short
-            type=raw,value=latest,enable={{is_default_branch}}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
 
       - name: Build & push
@@ -75,10 +82,6 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
-          # yadnp3 (OpenDNP3 native) — PyPI manylinux wheel'i hazir, build
-          # hizli; Group 110 string sinyalleri tam destekli. amd64 only —
-          # yadnp3 PyPI'de arm64 wheel saglamiyor; arm64 ihtiyaci olunca
-          # ayri bir build path eklenir.
           build-args: |
             DNP3_LIBRARY=yadnp3
           platforms: linux/amd64
@@ -87,3 +90,10 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Ozet
+        run: |
+          echo "### Yayinlanan etiketler" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ steps.meta.outputs.tags }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"

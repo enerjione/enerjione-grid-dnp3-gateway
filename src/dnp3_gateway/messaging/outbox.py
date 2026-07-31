@@ -32,8 +32,9 @@ import random
 import sqlite3
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from dnp3_gateway.messaging.sqlite_support import Migration, open_versioned_db
 

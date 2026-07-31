@@ -26,8 +26,10 @@ import threading
 from concurrent.futures import (
     FIRST_COMPLETED,
     ThreadPoolExecutor,
-    TimeoutError as FuturesTimeoutError,
     wait,
+)
+from concurrent.futures import (
+    TimeoutError as FuturesTimeoutError,
 )
 from datetime import datetime, timezone
 from typing import Any

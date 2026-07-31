@@ -8,8 +8,6 @@ from __future__ import annotations
 
 import time
 
-import pytest
-
 from dnp3_gateway.adapters.dnp3_yadnp3_master import _DeviceCache
 
 

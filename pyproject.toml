@@ -47,3 +47,13 @@ target-version = "py310"
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "N"]
 ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# opendnp3 (yadnp3) C++ binding'i PascalCase metod adlari kullanir
+# (ISOEHandler.Process, IMasterApplication.OnOpen, master.DirectOperate ...).
+# Bunlari override/mock ederken Python adlandirma kuralina uyamayiz.
+"src/dnp3_gateway/adapters/dnp3_yadnp3_master.py" = ["N802", "N803"]
+"tests/test_crob_command.py" = ["N802", "N803"]
+# TelemetryReader.close() bilincli olarak bos bir varsayilan (no-op):
+# state tutmayan adapter'lar (mock) override etmek zorunda kalmasin.
+"src/dnp3_gateway/adapters/base.py" = ["B027"]

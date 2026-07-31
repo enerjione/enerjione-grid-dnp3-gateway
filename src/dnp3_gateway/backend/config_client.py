@@ -375,7 +375,7 @@ class BackendConfigClient:
                 f"config parse failed: {type(exc).__name__}: {exc}"
             ) from exc
 
-    def fetch_pending_commands(self) -> "PendingPoll":
+    def fetch_pending_commands(self) -> PendingPoll:
         """Hafif komut-poll — GET /gateways/{code}/pending.
 
         Config'ten AYRI: sadece bekleyen komutlar + config_nonce + refresh_nonce

@@ -120,7 +120,7 @@ class JetStreamPublisher:
         publish_timeout_sec: float = 2.0,
         tls_ca_path: str = "",
         credentials_path: str = "",
-    ) -> "JetStreamPublisher | None":
+    ) -> JetStreamPublisher | None:
         """Publisher instance olustur ve background thread'i baslat.
 
         nats-py paketi yoksa None doner (production'da requirements'ta

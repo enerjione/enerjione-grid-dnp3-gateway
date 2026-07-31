@@ -20,6 +20,23 @@ __all__ = ["__version__"]
 
 
 def _load_version() -> str:
+    """Paket surumu.
+
+    Once kurulu paket metadata'sindan okunur (`pip install .` ile kurulmus
+    normal dagitimlarda repo koku YOKTUR; eskiden bu durumda surum sessizce
+    "0.0.0" oluyordu ve /health, User-Agent, log satirlari yanlis surum
+    raporluyordu). Metadata yoksa (repo'dan dogrudan calistirma, editable
+    kurulum) repo kokundeki VERSION dosyasina duseriz.
+    """
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+
+        return version("enerjione-dnp3-gateway")
+    except PackageNotFoundError:
+        pass
+    except Exception:  # noqa: BLE001 — metadata okunamadi, dosyaya dus
+        pass
+
     version_file = Path(__file__).resolve().parents[2] / "VERSION"
     try:
         return version_file.read_text(encoding="utf-8").strip() or "0.0.0"

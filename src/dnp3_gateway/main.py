@@ -35,7 +35,7 @@ from dnp3_gateway.backend import (
     parse_device_ip_allowlist,
 )
 from dnp3_gateway.config import Settings, settings
-from dnp3_gateway.health_server import GatewayMetrics, start_health_server
+from dnp3_gateway.health_server import start_health_server
 from dnp3_gateway.logging_setup import configure_logging, register_secret
 from dnp3_gateway.messaging import CommandLedger, Outbox, OutboxRetrier
 from dnp3_gateway.messaging.resilient_publisher import ResilientPublisher
@@ -59,12 +59,15 @@ def _print_console_banner(
     # tarayicidan/curl'den asla 0.0.0.0:PORT yazmaz. Loopback'e dusur.
     display_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
     health_url = f"http://{display_host}:{port}/health"
-    config_path = f"{cfg.backend_api_url.rstrip('/')}/gateways/{identity.gateway_code}/config"
+    config_url = f"{cfg.backend_api_url.rstrip('/')}/gateways/{identity.gateway_code}/config"
     print("", flush=True)
     print("  EnerjiOne DNP3 Gateway", flush=True)
     print(f"  surum {__version__}  |  gateway {identity.gateway_code}", flush=True)
     print(f"  health   {health_url}", flush=True)
     print(f"  backend  {cfg.backend_api_url.rstrip('/')}", flush=True)
+    # Kurulumda "gateway backend'e ulasiyor mu" sorusunun ilk adresi budur;
+    # operator bunu dogrudan curl'leyebilsin diye banner'da gosteriyoruz.
+    print(f"  config   {config_url}", flush=True)
     if cfg.is_mock_mode:
         print("  UYARI: GATEWAY_MODE=mock — sahadan okuma YOK, degerler ureticidir.", flush=True)
     print("", flush=True)

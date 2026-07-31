@@ -8,7 +8,6 @@ from urllib.parse import urlparse
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-
 # Production validator placeholder-token tespiti icin prefix listesi.
 #
 # .env.example ve eski seed scriptlerinden gelen jenerik degerler buraya
@@ -676,7 +675,7 @@ class Settings(BaseSettings):
         return s
 
     @model_validator(mode="after")
-    def _validate_production_safeguards(self) -> "Settings":
+    def _validate_production_safeguards(self) -> Settings:
         """Production / staging ortaminda guvenlik kontrolleri.
 
         Staging + Production icin:

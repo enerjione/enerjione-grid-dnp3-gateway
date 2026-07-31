@@ -58,7 +58,7 @@ def _validate_code(code: str) -> None:
 def _render_text(template: str, replacements: dict[str, str]) -> str:
     """Cift-suslu yer tutuculari ({{KEY}}) replacements ile degistirir."""
 
-    def _sub(match: "re.Match[str]") -> str:
+    def _sub(match: re.Match[str]) -> str:
         key = match.group(1)
         if key not in replacements:
             raise RenderError(f"Sablonda doldurulmamis yer tutucu: {{{{ {key} }}}}")

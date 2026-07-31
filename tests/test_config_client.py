@@ -42,7 +42,7 @@ class _DummyResponse:
     def __init__(self, status_code: int, payload: Any) -> None:
         self.status_code = status_code
         self._payload = payload
-        body = json.dumps(payload) if isinstance(payload, (dict, list)) else str(payload)
+        body = json.dumps(payload) if isinstance(payload, dict | list) else str(payload)
         self.text = body
         self.content = body.encode("utf-8")
         self.headers: dict[str, str] = {

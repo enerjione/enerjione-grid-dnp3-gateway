@@ -11,8 +11,6 @@ from __future__ import annotations
 
 import time
 
-import pytest
-
 from dnp3_gateway.health_server import (
     _ip_in_networks,
     _parse_trusted_proxies,
