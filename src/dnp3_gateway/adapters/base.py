@@ -114,6 +114,23 @@ class TelemetryReader(ABC):
         _ = device, readings
         return 0
 
+    def device_health(self) -> dict[str, dict[str, Any]]:
+        """Cihaz basina haberlesme durumu — /health ve /metrics icin.
+
+        NEDEN: `/health` cihaz sagligini HIC raporlamiyordu. Saha switch'i
+        coktuginde 300 outstation'in tamami erisilemez oluyor, gateway ilk
+        cycle'da bir kez comm_lost yayinlayip sonsuza kadar sessiz kaliyor ve
+        `/health` yine `{"status":"ok"}` + HTTP 200 donuyordu. Docker
+        healthcheck yesil, cati panelinde gateway "saglikli"; ariza ancak
+        saatler sonra, backend'de tag'lerin donmus oldugu fark edilince
+        anlasiliyordu.
+
+        Donen sozluk: `{device_code: {"state": "online|recovering|lost",
+        "last_frame_epoch": float|None, "pending_signals": int}}`.
+        Default: bos (state tutmayan adapter'lar icin).
+        """
+        return {}
+
     def forget_devices(self, active_device_codes: set[str]) -> int:
         """Backend config'inden artik gorulmeyen cihazlarin acik master/channel
         kaynaklarini kapat.

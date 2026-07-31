@@ -75,6 +75,10 @@ class ResilientPublisher:
         # loglarda neredeyse sessiz kaliyordu.
         self._counter_lock = threading.Lock()
         self._consecutive_failures = 0
+        # Son publish_batch cagrisinda mesajlar broker'a mi gitti (False) yoksa
+        # outbox'a mi dustu (True)? Poller metrik dogrulugu icin okur:
+        # outbox'a dusen mesajlar "published" sayilmamali.
+        self._last_batch_outboxed = False
         # Disk-full / outbox-full circuit breaker durumu (health endpoint
         # ve poller cycle bunu okur).
         self._lock = threading.Lock()
@@ -91,6 +95,11 @@ class ResilientPublisher:
     def outbox_full(self) -> bool:
         with self._lock:
             return self._outbox_full
+
+    @property
+    def last_batch_outboxed(self) -> bool:
+        """Son publish_batch broker yerine outbox'a mi dustu?"""
+        return self._last_batch_outboxed
 
     @property
     def outbox_full_since(self) -> float | None:
@@ -264,6 +273,7 @@ class ResilientPublisher:
             return
         try:
             batch_fn(items)
+            self._last_batch_outboxed = False
             with self._counter_lock:
                 had_failures = self._consecutive_failures
                 self._consecutive_failures = 0
@@ -322,7 +332,10 @@ class ResilientPublisher:
                     first_fatal,
                 )
                 raise first_fatal from exc
-            if consecutive in (1, 5, 50, 500):
+            # Mesajlar broker'a degil outbox'a dustu — poller bunu "published"
+            # saymamali (metrik yalani onlemi).
+            self._last_batch_outboxed = True
+            if consecutive in (1, 5, 50, 500) or consecutive % 1000 == 0:
                 logger.warning(
                     "publish_batch_failed_outboxed count=%d error=%s consecutive=%s",
                     len(items),

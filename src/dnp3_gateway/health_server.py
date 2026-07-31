@@ -151,6 +151,11 @@ class GatewayMetrics:
         self._started_at_epoch = time.time()
         self.poll_cycles_total = 0
         self.signals_published_total = 0
+        # Broker'a DOGRUDAN gidemeyip outbox'a dusen mesajlar. Eskiden bunlar
+        # da "published" sayiliyordu; backend 30 dakikadir tum POST'lari
+        # reddederken /health `signals_published_total`'i artirmaya devam
+        # ediyor ve izleme "yayin akiyor" goruyordu.
+        self.signals_outboxed_total = 0
         self.signals_skipped_no_change_total = 0
         self.publish_errors_total = 0
         self.read_errors_total = 0
@@ -165,6 +170,10 @@ class GatewayMetrics:
             self.last_cycle_at_epoch = time.time()
             self.last_cycle_published = published
             self.last_cycle_devices = devices
+
+    def inc_outboxed(self, n: int = 1) -> None:
+        with self._lock:
+            self.signals_outboxed_total += n
 
     def inc_skipped_no_change(self, n: int = 1) -> None:
         with self._lock:
@@ -185,6 +194,7 @@ class GatewayMetrics:
                 "uptime_sec": round(time.monotonic() - self._started_at_monotonic, 2),
                 "poll_cycles_total": self.poll_cycles_total,
                 "signals_published_total": self.signals_published_total,
+                "signals_outboxed_total": self.signals_outboxed_total,
                 "signals_skipped_no_change_total": self.signals_skipped_no_change_total,
                 "publish_errors_total": self.publish_errors_total,
                 "read_errors_total": self.read_errors_total,
@@ -192,6 +202,111 @@ class GatewayMetrics:
                 "last_cycle_published": self.last_cycle_published,
                 "last_cycle_devices": self.last_cycle_devices,
             }
+
+
+class ThreadLiveness:
+    """Arkaplan thread'lerinin canlilik kaydi (/health icin).
+
+    NEDEN: config-refresh, command-poll ve outbox-retrier thread'lerinden biri
+    beklenmedik bir hatayla olurse gateway "calisiyor" gorunmeye devam
+    ediyordu — /health "ok", Docker healthcheck yesil, backend panelinde
+    gateway saglikli. Oysa retrier olduyse telemetri teslimi, command-poll
+    olduyse TUM SCADA komut kanali kalici olarak durmus oluyordu.
+
+    main.py thread'leri burada kaydeder; health endpoint'i `is_alive()`
+    sonuclarini rapor eder ve olu thread'i `unhealthy` sayar.
+    """
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._threads: dict[str, Any] = {}
+
+    def register(self, name: str, thread: Any) -> None:
+        with self._lock:
+            self._threads[name] = thread
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            items = list(self._threads.items())
+        alive: dict[str, bool | None] = {}
+        for name, t in items:
+            try:
+                is_alive_fn = getattr(t, "is_alive", None)
+                alive[name] = bool(is_alive_fn()) if callable(is_alive_fn) else None
+            except Exception:  # noqa: BLE001
+                alive[name] = None
+        return {"alive": alive}
+
+
+def _thread_snapshot(liveness: Any) -> dict[str, Any]:
+    if liveness is None:
+        return {"alive": {}}
+    try:
+        return liveness.snapshot()
+    except Exception:  # noqa: BLE001
+        return {"alive": {}}
+
+
+def _quarantined_dbs() -> list[str]:
+    """Bu proses omrunde bozuk bulunup karantinaya alinan state dosyalari."""
+    try:
+        from dnp3_gateway.messaging.sqlite_support import quarantined_files
+
+        return [str(p) for p in quarantined_files()]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _device_health_snapshot(reader: Any, configured_count: int) -> dict[str, Any]:
+    """Adapter'dan cihaz basina haberlesme durumunu ozetler.
+
+    Donen ozet SAYIMDIR; cihaz kodu/IP icermez cunku /health auth'suzdur.
+    `unknown`: config'te tanimli ama adapter'da henuz master acilmamis cihazlar
+    (ilk baglanti bekleniyor veya cihaz hic ele alinmamis).
+    """
+    summary: dict[str, Any] = {
+        "total": int(configured_count or 0),
+        "online": 0,
+        "recovering": 0,
+        "lost": 0,
+        "unknown": 0,
+        "oldest_frame_age_sec": None,
+    }
+    if reader is None:
+        summary["unknown"] = summary["total"]
+        return summary
+    health_fn = getattr(reader, "device_health", None)
+    if not callable(health_fn):
+        summary["unknown"] = summary["total"]
+        return summary
+    try:
+        per_device = health_fn() or {}
+    except Exception:  # noqa: BLE001
+        summary["unknown"] = summary["total"]
+        return summary
+
+    now = time.time()
+    oldest_age: float | None = None
+    for info in per_device.values():
+        state_name = str(info.get("state") or "unknown")
+        if state_name in ("online", "recovering", "lost"):
+            summary[state_name] += 1
+        else:
+            summary["unknown"] += 1
+        last_frame = info.get("last_frame_epoch")
+        if last_frame:
+            age = max(0.0, now - float(last_frame))
+            oldest_age = age if oldest_age is None else max(oldest_age, age)
+
+    tracked = summary["online"] + summary["recovering"] + summary["lost"] + summary["unknown"]
+    if summary["total"] < tracked:
+        summary["total"] = tracked
+    elif summary["total"] > tracked:
+        # Config'te olup adapter'da henuz master'i olmayan cihazlar
+        summary["unknown"] += summary["total"] - tracked
+    if oldest_age is not None:
+        summary["oldest_frame_age_sec"] = round(oldest_age, 1)
+    return summary
 
 
 def _outbox_snapshot(publisher: Any) -> dict[str, Any]:
@@ -273,6 +388,8 @@ def _make_handler(
     health_rate_limiter: _SlidingWindowRateLimiter | None = None,
     refresh_rate_limiter: _SlidingWindowRateLimiter | None = None,
     trusted_proxy_networks: list[Any] | None = None,
+    liveness: Any = None,
+    poll_interval_sec: float = 1.0,
 ) -> type[BaseHTTPRequestHandler]:
     """HTTP handler class'ini state'e + metrics'e bagli olarak dinamik ureten helper.
 
@@ -388,6 +505,9 @@ def _make_handler(
                     health_port=actual_port_provider(),
                     publisher=publisher_provider() if publisher_provider else None,
                     metrics=metrics,
+                    reader=reader_provider() if reader_provider else None,
+                    liveness=liveness,
+                    poll_interval_sec=poll_interval_sec,
                 )
                 self._respond_json(body, status_code=status_code)
                 return
@@ -590,6 +710,9 @@ def _build_health_body(
     health_port: int,
     publisher: Any,
     metrics: GatewayMetrics,
+    reader: Any = None,
+    liveness: Any = None,
+    poll_interval_sec: float = 1.0,
 ) -> tuple[dict[str, Any], int]:
     """Health body + HTTP status code uretir.
 
@@ -602,6 +725,8 @@ def _build_health_body(
     cfg_snapshot = state.snapshot()
     outbox_snap = _outbox_snapshot(publisher)
     metrics_snap = metrics.snapshot()
+    devices_snap = _device_health_snapshot(reader, cfg_snapshot.get("device_count", 0))
+    threads_snap = _thread_snapshot(liveness)
 
     issues: list[str] = []
     severity_score = 0  # 0=ok 1=degraded 2=unhealthy
@@ -640,6 +765,50 @@ def _build_health_body(
             issues.append("no_poll_cycles_yet")
             severity_score = max(severity_score, 1)
 
+    # --- Poll dongusu WATCHDOG'u -------------------------------------------
+    # `last_cycle_at_epoch` yaziliyordu ama HICBIR esige sokulmuyordu. Ana
+    # dongu donarsa (orn. adapter lock'unda takilma) health server ayri
+    # thread'te oldugu icin saatlerce 200/ok donmeye devam ediyordu; Docker
+    # healthcheck yesil kaliyor ve kimse restart etmiyordu.
+    last_cycle = metrics_snap.get("last_cycle_at_epoch")
+    if state.is_active() and last_cycle:
+        stall_threshold = max(5.0 * float(poll_interval_sec), 60.0)
+        since_cycle = max(0.0, time.time() - float(last_cycle))
+        if since_cycle > stall_threshold:
+            issues.append("poll_loop_stalled")
+            severity_score = max(severity_score, 2)
+
+    # --- Arkaplan thread'lerinin canliligi ---------------------------------
+    # Bir thread sessizce olurse (retrier -> telemetri teslimi durur,
+    # command-poll -> SCADA komutlari calismaz) disaridan gorulebilecek
+    # HICBIR gosterge yoktu.
+    for name, alive in threads_snap.get("alive", {}).items():
+        if alive is False:
+            issues.append(f"thread_dead:{name}")
+            severity_score = max(severity_score, 2)
+
+    # --- Cihaz haberlesme sagligi ------------------------------------------
+    # Eskiden 300 cihazin TAMAMI comm_lost iken bile status "ok" donuyordu.
+    total_dev = int(devices_snap.get("total") or 0)
+    lost_dev = int(devices_snap.get("lost") or 0)
+    if total_dev > 0 and lost_dev > 0:
+        lost_ratio = lost_dev / total_dev
+        if lost_ratio >= 1.0:
+            issues.append("all_devices_comm_lost")
+            severity_score = max(severity_score, 2)
+        elif lost_ratio >= 0.5:
+            issues.append("majority_devices_comm_lost")
+            severity_score = max(severity_score, 1)
+        else:
+            issues.append("some_devices_comm_lost")
+            severity_score = max(severity_score, 1)
+
+    # --- Bozuk/karantinaya alinmis veritabani ------------------------------
+    quarantined = _quarantined_dbs()
+    if quarantined:
+        issues.append("state_db_quarantined")
+        severity_score = max(severity_score, 1)
+
     if not config_ready.is_set():
         status = "starting"
         http_code = 200
@@ -673,17 +842,28 @@ def _build_health_body(
         "mode": gateway_mode,
         "config": cfg_safe,
         "outbox": outbox_snap,
+        # Cihaz haberlesme ozeti. Cihaz KODLARI ve IP'leri burada YOK
+        # (/health auth'suz; recon malzemesi vermeyelim) — yalnizca sayimlar.
+        # Kod bazli detay auth'lu /metrics ve /info endpoint'lerinde.
+        "devices": devices_snap,
+        "threads": threads_snap,
         "metrics": {
             "uptime_sec": metrics_snap["uptime_sec"],
             "poll_cycles_total": metrics_snap["poll_cycles_total"],
             "signals_published_total": metrics_snap["signals_published_total"],
+            "signals_outboxed_total": metrics_snap["signals_outboxed_total"],
             "publish_errors_total": metrics_snap["publish_errors_total"],
             "read_errors_total": metrics_snap["read_errors_total"],
             "last_cycle_at_epoch": metrics_snap["last_cycle_at_epoch"],
+            "seconds_since_last_cycle": (
+                round(max(0.0, time.time() - float(last_cycle)), 2) if last_cycle else None
+            ),
             "last_cycle_devices": metrics_snap["last_cycle_devices"],
             "last_cycle_published": metrics_snap["last_cycle_published"],
         },
     }
+    if quarantined:
+        body["quarantined_state_files"] = quarantined
     return body, http_code
 
 
@@ -706,6 +886,8 @@ def start_health_server(
     health_rate_limit_per_min: int = _HEALTH_RATE_LIMIT_PER_MIN,
     refresh_rate_limit_per_min: int = _REFRESH_RATE_LIMIT_PER_MIN,
     trusted_proxies: str = "",
+    liveness: ThreadLiveness | None = None,
+    poll_interval_sec: float = 1.0,
 ) -> tuple[HTTPServer, GatewayMetrics, int]:
     """Sunucuyu ayaga kaldirir.
 
@@ -796,6 +978,8 @@ def start_health_server(
         health_rate_limiter=health_rl,
         refresh_rate_limiter=refresh_rl,
         trusted_proxy_networks=trusted_networks,
+        liveness=liveness,
+        poll_interval_sec=poll_interval_sec,
     )
     # ThreadingHTTPServer: yavas client (slow-loris) tek istegi durdursa bile
     # diger probe'lar bloklanmaz. HTTPServer single-threaded olsaydi cati

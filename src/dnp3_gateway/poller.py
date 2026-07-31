@@ -154,6 +154,7 @@ def poll_device(
     signals: list[SignalConfig],
     reader: TelemetryReader,
     publisher: Any,
+    metrics: Any = None,
 ) -> int:
     """Tek bir cihazin tum sinyallerini okur ve yayinlar. Yayinlanan sayisini doner.
 
@@ -174,10 +175,17 @@ def poll_device(
             device.code,
             exc,
         )
+        # Sayaci gercekten besle: `read_errors_total` daha once HICBIR yerden
+        # artirilmiyordu ve /metrics her zaman 0 raporluyordu. Cihazlarin
+        # %40'i hata verirken bile izleme "hata yok" goruyordu.
+        _bump(metrics, "inc_read_error")
         return 0
 
     # Yayinlanacak sinyaller (no_change olanlar atlanir).
     to_publish = [r for r in readings if r.quality != "no_change"]
+    skipped = len(readings) - len(to_publish)
+    if skipped:
+        _bump(metrics, "inc_skipped_no_change", skipped)
     if not to_publish:
         return 0
 
@@ -216,6 +224,12 @@ def poll_device(
         # sonra veriyoruz.
         batch_fn(items)
         _commit_published(reader=reader, device=device, readings=to_publish)
+        # Broker'a mi gitti yoksa outbox'a mi dustu? Metrik dogrulugu icin
+        # ayirt ediyoruz — eskiden ikisi de "published" sayiliyordu ve backend
+        # tum POST'lari reddederken bile "yayin akiyor" gorunuyordu.
+        if getattr(publisher, "last_batch_outboxed", False):
+            _bump(metrics, "inc_outboxed", len(items))
+            _bump(metrics, "inc_publish_error")
         return len(items)
     # Fallback: batch yok -> tek tek publish (eski davranis).
     published: list[SignalReading] = []
@@ -238,8 +252,22 @@ def poll_device(
                 "poll_device_publish_failed gateway=%s device=%s error=%s",
                 gateway_code, device.code, exc,
             )
+            _bump(metrics, "inc_publish_error")
     _commit_published(reader=reader, device=device, readings=published)
     return len(published)
+
+
+def _bump(metrics: Any, method: str, n: int = 1) -> None:
+    """Metrik sayacini artir; metrics yoksa/hata verirse akisi bozma."""
+    if metrics is None:
+        return
+    fn = getattr(metrics, method, None)
+    if not callable(fn):
+        return
+    try:
+        fn(n)
+    except Exception:  # noqa: BLE001
+        logger.debug("metrics_bump_failed method=%s", method, exc_info=True)
 
 
 def _commit_published(
@@ -279,6 +307,7 @@ def run_poll_cycle(
     device_timeout_sec: float = DEFAULT_DEVICE_POLL_TIMEOUT_SEC,
     cycle_timeout_sec: float = DEFAULT_CYCLE_TIMEOUT_SEC,
     stop_event: threading.Event | None = None,
+    metrics: Any = None,
 ) -> int:
     """State'ten okunma vakti gelen cihazlari cekip okur.
 
@@ -377,6 +406,7 @@ def run_poll_cycle(
                     signals=signals,
                     reader=reader,
                     publisher=publisher,
+                    metrics=metrics,
                 )
             except OutboxFullError:
                 # Disk-full → cycle'i kir, kalan cihazlari mark_read et
@@ -410,6 +440,7 @@ def run_poll_cycle(
             signals=signals,
             reader=reader,
             publisher=publisher,
+            metrics=metrics,
         )
         futures[fut] = device
         future_start[fut] = submit_time

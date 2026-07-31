@@ -1078,6 +1078,30 @@ class Yadnp3TelemetryReader(TelemetryReader):
             )
         return readings
 
+    def device_health(self) -> dict[str, dict[str, Any]]:
+        """Cihaz basina DNP3 haberlesme durumu (health/metrics icin).
+
+        Lock yalnizca master listesinin anlik kopyasini almak icin tutulur;
+        cache sorgulari lock disinda yapilir (health endpoint'i poll akisini
+        bloke etmemeli).
+        """
+        with self._lock:
+            masters = list(self._masters.items())
+        out: dict[str, dict[str, Any]] = {}
+        for code, mm in masters:
+            try:
+                last = mm.cache.last_update_at()
+                out[code] = {
+                    "state": mm.cache.state(),
+                    "connected": mm.cache.is_connected(),
+                    "last_frame_epoch": last or None,
+                    "pending_signals": mm.cache.dirty_count(),
+                    "known_points": mm.cache.size(),
+                }
+            except Exception:  # noqa: BLE001
+                out[code] = {"state": "unknown", "last_frame_epoch": None}
+        return out
+
     def commit_published(
         self,
         *,

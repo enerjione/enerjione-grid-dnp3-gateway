@@ -35,7 +35,7 @@ from dnp3_gateway.backend import (
     parse_device_ip_allowlist,
 )
 from dnp3_gateway.config import Settings, settings
-from dnp3_gateway.health_server import start_health_server
+from dnp3_gateway.health_server import ThreadLiveness, start_health_server
 from dnp3_gateway.logging_setup import configure_logging, register_secret
 from dnp3_gateway.messaging import CommandLedger, Outbox, OutboxRetrier
 from dnp3_gateway.messaging.resilient_publisher import ResilientPublisher
@@ -584,6 +584,9 @@ def run(current_settings: Settings | None = None) -> int:
             identity.gateway_code,
         )
 
+    # Arkaplan thread'leri burada kaydedilir; /health olu thread'i raporlar.
+    liveness = ThreadLiveness()
+
     health, metrics, actual_health_port = start_health_server(
         host=cfg.worker_health_host,
         port=cfg.worker_health_port,
@@ -602,6 +605,11 @@ def run(current_settings: Settings | None = None) -> int:
         # subnet'lerden gelen istekler icin okunur. Bos ise XFF yok sayilir
         # (saldirgan rate-limit bypass yapamaz).
         trusted_proxies=cfg.health_trusted_proxies,
+        # Arkaplan thread'lerinin canliligi + poll dongusu watchdog'u.
+        # Bir thread sessizce olurse (retrier -> telemetri teslimi durur,
+        # command-poll -> SCADA komut kanali olur) /health artik unhealthy doner.
+        liveness=liveness,
+        poll_interval_sec=cfg.default_poll_interval_sec,
     )
     # Banner: gercek (auto-assigned olabilir) health portunu yansitabilmek icin
     # health_server start sonrasi yazdirilir.
@@ -696,6 +704,7 @@ def run(current_settings: Settings | None = None) -> int:
         max_backoff_sec=cfg.outbox_retrier_max_backoff_sec,
     )
     retrier.start()
+    liveness.register("outbox-retrier", retrier)
 
     reader: TelemetryReader = build_adapter(cfg)
     # Health server /refresh-all endpoint'i icin injection
@@ -765,6 +774,7 @@ def run(current_settings: Settings | None = None) -> int:
         daemon=True,
     )
     refresh_thread.start()
+    liveness.register("config-refresh", refresh_thread)
 
     # Hafif komut-poll thread'i (config'ten AYRI, ~1sn). Komutlar burada gelir;
     # config 5dk'da bir. reader operate_device destekliyorsa baslat.
@@ -785,6 +795,7 @@ def run(current_settings: Settings | None = None) -> int:
             daemon=True,
         )
         command_thread.start()
+        liveness.register("command-poll", command_thread)
         logger.info(
             "command_poll_started gateway=%s poll_sec=%d (config_refresh_sec=%d)",
             identity.gateway_code, cfg.command_poll_sec, cfg.config_refresh_sec,
@@ -839,6 +850,7 @@ def run(current_settings: Settings | None = None) -> int:
                 device_timeout_sec=cfg.device_poll_timeout_sec,
                 cycle_timeout_sec=cfg.cycle_timeout_sec,
                 stop_event=stop_event,
+                metrics=metrics,
             )
             if due_count or published:
                 metrics.record_cycle(devices=due_count, published=published)
