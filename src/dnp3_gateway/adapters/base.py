@@ -37,6 +37,11 @@ class SignalReading:
     quality: str = "good"
     value_string: str | None = None
     read_token: Any = None
+    # Cihazin bildirdigi HAM DNP3 bayrak byte'i (ONLINE/RESTART/COMM_LOST/
+    # REMOTE_FORCED/LOCAL_FORCED/OVER_RANGE/REFERENCE_ERR). Teshis icin tasinir;
+    # `quality` alanina yansitilmasi backend tag-engine hazir olunca acilacak
+    # (bkz. docs/BACKEND_TODO.md#B1). None = adapter bayrak saglamiyor.
+    dnp3_flags: int | None = None
 
 
 class TelemetryReader(ABC):

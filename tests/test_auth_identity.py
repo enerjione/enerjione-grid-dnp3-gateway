@@ -83,6 +83,7 @@ def test_production_validator_blocks_placeholder_at_construct(
 ) -> None:
     """Production'da Settings() construction'i bile geçmez — erken yakalama."""
     monkeypatch.setenv("APP_ENVIRONMENT", "production")
+    monkeypatch.setenv("GATEWAY_MODE", "dnp3")  # prod\'da mock yasak
     monkeypatch.setenv("GATEWAY_TOKEN", "change-me-and-fill-in-real-token-32-ch")
     monkeypatch.setenv("GATEWAY_CODE", "GW-001")
     _set_prod_safe_urls(monkeypatch)

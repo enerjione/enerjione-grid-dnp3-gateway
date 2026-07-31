@@ -309,6 +309,40 @@ class Outbox:
             )
             c.commit()
 
+    def prune_dead_letter(self, *, retain_days: float = 30.0, max_rows: int = 50_000) -> int:
+        """Eski/fazla dead-letter kayitlarini siler; silinen sayiyi doner.
+
+        Dead-letter tablosunda RETENTION YOKTU. Uzun bir backend semantik
+        hatasindan sonra (4xx reddedilen payload'lar) tablo yuz binlerce satira
+        cikip 100-200 MB kalici disk tuketiyor ve saha PC'sinde disk dolmasinin
+        ana kaynagi oluyordu. Ayrica her /health cagrisi bu tabloda COUNT(*)
+        calistirdigi icin yavasliyordu.
+        """
+        # Alt sinir cagri yerinde (config `ge=1`) uygulanir.
+        cutoff = time.time() - max(0.0, float(retain_days)) * 86400.0
+        removed = 0
+        with self._lock:
+            c = self._cached_connection()
+            cur = c.execute("DELETE FROM outbox_dead_letter WHERE moved_at < ?", (cutoff,))
+            removed += int(cur.rowcount or 0)
+            # Yas siniri yetmezse adet sinirini uygula (en eskiler gider).
+            (n,) = c.execute("SELECT COUNT(*) FROM outbox_dead_letter").fetchone()
+            excess = int(n) - max(1000, int(max_rows))
+            if excess > 0:
+                cur = c.execute(
+                    "DELETE FROM outbox_dead_letter WHERE id IN ("
+                    "SELECT id FROM outbox_dead_letter ORDER BY moved_at ASC LIMIT ?)",
+                    (excess,),
+                )
+                removed += int(cur.rowcount or 0)
+            c.commit()
+        if removed:
+            logger.info(
+                "outbox_dead_letter_pruned removed=%d retain_days=%.0f max_rows=%d",
+                removed, retain_days, max_rows,
+            )
+        return removed
+
     def ready_count(self, *, now: float | None = None) -> int:
         """Su an gonderilmeye hazir (ertelenmemis) satir sayisi."""
         ts = time.time() if now is None else now

@@ -23,6 +23,7 @@ import logging
 import os
 import tempfile
 import time
+from collections import deque
 from dataclasses import asdict
 from pathlib import Path
 from threading import Lock
@@ -39,6 +40,12 @@ logger = logging.getLogger(__name__)
 # olabilir). 24 saat varsayilan; production'da CONFIG_CACHE_MAX_AGE_HOURS ile
 # override edilebilir.
 DEFAULT_CACHE_MAX_AGE_HOURS = 24
+
+# In-memory komut dedup penceresi. Otoritatif idempotency CommandLedger'da
+# (kalici SQLite); bu set yalnizca ayni turdaki tekrarlari ucuza eler.
+# Sinirsiz buyume yerine son N id yeter — bir komut bu pencereden cikacak
+# kadar eskiyse ledger zaten onu 'dispatched' olarak biliyordur.
+MAX_SEEN_COMMAND_IDS = 10_000
 
 
 class GatewayState:
@@ -72,7 +79,14 @@ class GatewayState:
         # ayni komut config'te tekrar gelirse (result bildirilene kadar) yeniden
         # calistirilmaz.
         self._pending_commands: list[PendingCommand] = []
+        # Gorulmus komut id'leri (in-memory dedup). SINIRSIZ BUYUYORDU:
+        # otoritatif idempotency zaten CommandLedger'da (kalici SQLite); bu set
+        # yalnizca ayni turdaki tekrarlari ucuza elemek icin. Saha SCADA'si
+        # gunde ~50.000 komut uretirse 30 gunde 1.5M kayit x ~60B = ~90 MB RAM
+        # (set yeniden boyutlandirmalariyla anlik 2x tepe) — aylarca calisan
+        # proseste gereksiz ve sinirsiz bir buyume. Artik son N id tutuluyor.
         self._seen_command_ids: set[int] = set()
+        self._seen_command_order: deque[int] = deque()
         self._cache_path: Path | None = Path(cache_path) if cache_path else None
         self._cache_max_age_sec: float = max(60.0, float(cache_max_age_hours) * 3600.0)
         # Wall-clock zamanda son basarili config update timestamp'i (cache age
@@ -136,13 +150,25 @@ class GatewayState:
             # kadar 'sent' olarak tutar; ama ETag miss'te tekrar gonderebilir)
             # yeniden calistirilmaz.
             for cmd in getattr(config, "pending_commands", ()) or ():
-                if cmd.id not in self._seen_command_ids:
-                    self._seen_command_ids.add(cmd.id)
-                    self._pending_commands.append(cmd)
+                self._queue_command_unsafe(cmd)
         # disk yazimi lock disinda — dosya I/O sirasinda okuyucular bloklanmasin
         if changed:
             self._persist_unsafe(config, loaded_at_unix=now_unix)
         return changed
+
+    def _queue_command_unsafe(self, cmd: PendingCommand) -> None:
+        """Gorulmemis komutu kuyruga al; dedup penceresini sinirli tut.
+
+        Caller'in lock'u tutuyor olmasi gerekir.
+        """
+        if cmd.id in self._seen_command_ids:
+            return
+        self._seen_command_ids.add(cmd.id)
+        self._seen_command_order.append(cmd.id)
+        # FIFO budama: en eski id'ler pencereden dusurulur.
+        while len(self._seen_command_order) > MAX_SEEN_COMMAND_IDS:
+            self._seen_command_ids.discard(self._seen_command_order.popleft())
+        self._pending_commands.append(cmd)
 
     def take_refresh_request(self) -> bool:
         """Operator tetikli refresh-all bayragini OKUYUP TEMIZLER.
@@ -185,9 +211,7 @@ class GatewayState:
         """
         with self._lock:
             for cmd in getattr(poll, "commands", ()) or ():
-                if cmd.id not in self._seen_command_ids:
-                    self._seen_command_ids.add(cmd.id)
-                    self._pending_commands.append(cmd)
+                self._queue_command_unsafe(cmd)
             try:
                 cn = int(getattr(poll, "config_nonce", 0) or 0)
             except (TypeError, ValueError):

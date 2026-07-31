@@ -53,6 +53,7 @@ def _strong_token() -> str:
 def test_prod_allows_http_to_private_ip(monkeypatch: pytest.MonkeyPatch) -> None:
     """Internal deploy: backend 192.168.x'te, gateway prod ortaminda."""
     monkeypatch.setenv("APP_ENVIRONMENT", "production")
+    monkeypatch.setenv("GATEWAY_MODE", "dnp3")  # prod\'da mock yasak
     monkeypatch.setenv("GATEWAY_TOKEN", _strong_token())
     monkeypatch.setenv("BACKEND_API_URL", "http://192.168.1.10:8000/api/v1")
     monkeypatch.setenv("NATS_URL", "nats://192.168.1.10:4222")
@@ -64,6 +65,7 @@ def test_prod_allows_http_to_private_ip(monkeypatch: pytest.MonkeyPatch) -> None
 def test_prod_allows_http_to_loopback(monkeypatch: pytest.MonkeyPatch) -> None:
     """Same-host deploy: backend container 127.0.0.1'de."""
     monkeypatch.setenv("APP_ENVIRONMENT", "production")
+    monkeypatch.setenv("GATEWAY_MODE", "dnp3")  # prod\'da mock yasak
     monkeypatch.setenv("GATEWAY_TOKEN", _strong_token())
     monkeypatch.setenv("BACKEND_API_URL", "http://127.0.0.1:8000/api/v1")
     monkeypatch.setenv("NATS_URL", "nats://localhost:4222")
@@ -73,6 +75,7 @@ def test_prod_allows_http_to_loopback(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_prod_rejects_http_to_public_ip(monkeypatch: pytest.MonkeyPatch) -> None:
     """Saha hatasi: public IP'ye clear-text HTTP — token MITM riski."""
     monkeypatch.setenv("APP_ENVIRONMENT", "production")
+    monkeypatch.setenv("GATEWAY_MODE", "dnp3")  # prod\'da mock yasak
     monkeypatch.setenv("GATEWAY_TOKEN", _strong_token())
     monkeypatch.setenv("BACKEND_API_URL", "http://77.83.37.44:8000/api/v1")
     monkeypatch.setenv("NATS_URL", "nats://77.83.37.44:4222")
@@ -85,6 +88,7 @@ def test_prod_rejects_nats_clear_text_to_public_host(
 ) -> None:
     """Legacy NATS publisher secilirse public clear-text reddedilmeli."""
     monkeypatch.setenv("APP_ENVIRONMENT", "production")
+    monkeypatch.setenv("GATEWAY_MODE", "dnp3")  # prod\'da mock yasak
     monkeypatch.setenv("GATEWAY_TOKEN", _strong_token())
     monkeypatch.setenv("BACKEND_API_URL", "https://api.example.com/api/v1")
     monkeypatch.setenv("TELEMETRY_PUBLISHER", "nats")
@@ -98,6 +102,7 @@ def test_prod_allows_public_http_when_insecure_opt_in(
 ) -> None:
     """Operator bilincli opt-out: TLS henuz kurulamadi, public IP'de calisiyor."""
     monkeypatch.setenv("APP_ENVIRONMENT", "production")
+    monkeypatch.setenv("GATEWAY_MODE", "dnp3")  # prod\'da mock yasak
     monkeypatch.setenv("GATEWAY_TOKEN", _strong_token())
     monkeypatch.setenv("BACKEND_API_URL", "http://77.83.37.44:8000/api/v1")
     monkeypatch.setenv("NATS_URL", "nats://77.83.37.44:4222")
@@ -109,6 +114,7 @@ def test_prod_allows_public_http_when_insecure_opt_in(
 def test_prod_http_publisher_ignores_nats_url(monkeypatch: pytest.MonkeyPatch) -> None:
     """Default HTTP publisher icin NATS_URL rollback ayari validate edilmez."""
     monkeypatch.setenv("APP_ENVIRONMENT", "production")
+    monkeypatch.setenv("GATEWAY_MODE", "dnp3")  # prod\'da mock yasak
     monkeypatch.setenv("GATEWAY_TOKEN", _strong_token())
     monkeypatch.setenv("BACKEND_API_URL", "https://api.example.com/api/v1")
     monkeypatch.setenv("NATS_URL", "nats://nats.example.com:4222")
@@ -119,6 +125,7 @@ def test_prod_http_publisher_ignores_nats_url(monkeypatch: pytest.MonkeyPatch) -
 def test_prod_accepts_https_public(monkeypatch: pytest.MonkeyPatch) -> None:
     """Hedef deploy: backend HTTPS, NATS TLS — temiz prod konfigurasyonu."""
     monkeypatch.setenv("APP_ENVIRONMENT", "production")
+    monkeypatch.setenv("GATEWAY_MODE", "dnp3")  # prod\'da mock yasak
     monkeypatch.setenv("GATEWAY_TOKEN", _strong_token())
     monkeypatch.setenv("BACKEND_API_URL", "https://api.enerjione.local/api/v1")
     monkeypatch.setenv("NATS_URL", "tls://nats.enerjione.local:4222")
@@ -131,6 +138,7 @@ def test_prod_accepts_https_public(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_prod_rejects_placeholder_token(monkeypatch: pytest.MonkeyPatch) -> None:
     """`.env.example`'dan kopyalanan `gw-001-token` reddedilmeli."""
     monkeypatch.setenv("APP_ENVIRONMENT", "production")
+    monkeypatch.setenv("GATEWAY_MODE", "dnp3")  # prod\'da mock yasak
     monkeypatch.setenv("GATEWAY_TOKEN", "gw-001-token-with-some-extra-chars-to-pass-min-len")
     monkeypatch.setenv("BACKEND_API_URL", "https://api.enerjione.local/api/v1")
     monkeypatch.setenv("NATS_URL", "tls://nats.enerjione.local:4222")
@@ -141,6 +149,7 @@ def test_prod_rejects_placeholder_token(monkeypatch: pytest.MonkeyPatch) -> None
 def test_prod_rejects_change_me_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
     """`change-me...` prefix'i reddedilmeli."""
     monkeypatch.setenv("APP_ENVIRONMENT", "production")
+    monkeypatch.setenv("GATEWAY_MODE", "dnp3")  # prod\'da mock yasak
     monkeypatch.setenv(
         "GATEWAY_TOKEN", "change-me-and-fill-with-real-token-32-chars-pls"
     )
@@ -153,6 +162,7 @@ def test_prod_rejects_change_me_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_prod_rejects_rabbitmq_url(monkeypatch: pytest.MonkeyPatch) -> None:
     """Eski .env'den kalan `RABBITMQ_URL` production'da reddedilmeli."""
     monkeypatch.setenv("APP_ENVIRONMENT", "production")
+    monkeypatch.setenv("GATEWAY_MODE", "dnp3")  # prod\'da mock yasak
     monkeypatch.setenv("GATEWAY_TOKEN", _strong_token())
     monkeypatch.setenv("BACKEND_API_URL", "https://api.enerjione.local/api/v1")
     monkeypatch.setenv("NATS_URL", "tls://nats.enerjione.local:4222")
@@ -164,6 +174,7 @@ def test_prod_rejects_rabbitmq_url(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_prod_rejects_dual_publish_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
     """DEPRECATED `NATS_DUAL_PUBLISH_ENABLED=true` production'da reddedilmeli."""
     monkeypatch.setenv("APP_ENVIRONMENT", "production")
+    monkeypatch.setenv("GATEWAY_MODE", "dnp3")  # prod\'da mock yasak
     monkeypatch.setenv("GATEWAY_TOKEN", _strong_token())
     monkeypatch.setenv("BACKEND_API_URL", "https://api.enerjione.local/api/v1")
     monkeypatch.setenv("NATS_URL", "tls://nats.enerjione.local:4222")

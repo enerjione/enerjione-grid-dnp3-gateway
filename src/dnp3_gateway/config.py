@@ -510,6 +510,30 @@ class Settings(BaseSettings):
             "onerilir; daha azinda thread doyumu olur (eski sabit 2 yetersiz)."
         ),
     )
+    dnp3_time_sync: str = Field(
+        default="lan",
+        description=(
+            "DNP3 master->outstation zaman senkronizasyonu: lan | none. "
+            "Outstation'lar tipik olarak ayda 10-60sn RTC drift yapar ve guc "
+            "kesintisinden sonra saatlerini sifirlar; master zaman yazmazsa "
+            "cihaz kendi olay damgalarini yanlis saatle uretir ve IIN1.4 "
+            "(NEED_TIME) bayragini sonsuza kadar set tutar. TCP baglantilar "
+            "icin 'lan' (LAN prosedu) dogru secimdir. Gateway saati guvenilmez "
+            "goruldugunde (bkz. saat sapmasi kontrolu) yazim otomatik durur."
+        ),
+    )
+    dnp3_publish_quality_flags: bool = Field(
+        default=False,
+        description=(
+            "Cihazin DNP3 kalite bayraklarini (RESTART / LOCAL_FORCED / "
+            "OVER_RANGE / REFERENCE_ERR ...) telemetri `quality` alanina yansit. "
+            "VARSAYILAN KAPALI: yeni kalite degerleri (invalid/restart/forced) "
+            "backend tag-engine tarafindan taninmadan acilirsa olcumler yanlis "
+            "islenebilir. Backend hazir oldugunda saha genelinde acilacak. "
+            "Bkz. docs/BACKEND_TODO.md#B1. Bayrak KAPALI olsa da bayraklar "
+            "okunur ve teshis icin tasinir."
+        ),
+    )
 
     # ----- Logging -------------------------------------------------------------
     log_level: str = Field(default="INFO")
@@ -731,6 +755,28 @@ class Settings(BaseSettings):
                     "ile bilincli opt-out yapabilirsiniz (boot'ta WARN log atilir)."
                 )
             if is_prod:
+                # ---- MOCK MODU URETIMDE YASAK --------------------------------
+                # `gateway_mode` varsayilani "mock" ve `.env.example` de mock ile
+                # geliyor. Validator TLS, token, deprecated alan gibi onlarca sey
+                # kontrol ediyordu ama BUNU etmiyordu; tek koruma main.py'deki bir
+                # WARNING satiriydi ve 7/24 servis loglarinda kayboluyordu.
+                #
+                # Senaryo: operator `.env.example`'i kopyalayip APP_ENVIRONMENT'i
+                # production yapiyor, GATEWAY_TOKEN'i backend'den aldigi gercek
+                # token ile degistiriyor (validator zorluyor, dikkati oraya
+                # gidiyor) ama GATEWAY_MODE=mock satirini degistirmeyi unutuyor.
+                # Gateway sorunsuz boot ediyor, /health "ok" donuyor, backend'e
+                # saniye saniye UYDURMA voltaj/akim akiyor, frontend'de grafikler
+                # dolu gorunuyor. DNP3 cihazina TCP baglantisi bile acilmiyor.
+                # Ustelik mock adapter HER komuta {"ok": True} donduruyor —
+                # operator kesici/reset komutunun uygulandigini saniyor.
+                if self.gateway_mode.strip().lower() == "mock":
+                    raise ValueError(
+                        "GUVENLIK: APP_ENVIRONMENT=production'da GATEWAY_MODE=mock "
+                        "olamaz. Mock adapter sahadan OKUMAZ; uydurma degerler "
+                        "gercek telemetri gibi yayinlanir ve her komuta 'basarili' "
+                        "doner. Saha kurulumu icin GATEWAY_MODE=dnp3 yapin."
+                    )
                 # NATS sadece legacy/rollback publisher secilirse zorunlu.
                 if self.telemetry_publisher == "nats":
                     nats_url_raw = (self.nats_url or "").strip()
