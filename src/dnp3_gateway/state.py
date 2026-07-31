@@ -30,6 +30,7 @@ from threading import Lock
 from typing import Any
 
 from dnp3_gateway.backend import DeviceConfig, GatewayConfig, PendingCommand, SignalConfig
+from dnp3_gateway.profiles import builtin_profile
 
 logger = logging.getLogger(__name__)
 
@@ -433,30 +434,63 @@ class GatewayState:
         akar, deger makul gorunur, ama esik alarmi baska bir buyuklugun
         uzerinden calisir.
 
-        Oncelik:
-          1. Cihazin profiline ait set (backend `signals_by_profile`)
-             — BOS LISTE DE GECERLI BIR CEVAPTIR: backend "bu model icin sinyal
-               tanimli degil" diyor. Duz listeye dusmek, KOMSU modelin
-               adreslerini yoklamak olurdu.
-          2. Profil hic bildirilmemisse duz liste (eski backend / tek model).
+        ONCELIK — BACKEND KAZANIR:
+          1. Backend'in bu profil icin gonderdigi DOLU set. Otorite budur:
+             kurulumcu sahada yanlis bir DNP3 index'ini arayuzden
+             duzeltebilmeli. Yerlesik harita kazansaydi tek bir adres hatasi
+             icin yeni gateway imaji cikarmak gerekirdi.
+          2. Yerlesik profil (profiles/<model>.json) — backend o model icin
+             sinyal gondermediyse ya da BOS gonderdiyse. Boylece bilinen bir
+             model, katalog bos olsa bile dogru yoklanir.
+          3. Duz liste — profil kavrami hic yoksa (eski backend / tek model).
+
+        DIKKAT: 2. adim yoksa BOS liste doner ve cihaz yoklanmaz. Bu kasitli:
+        duz listeye dusmek KOMSU DNP3 modelinin adreslerini yoklamak olurdu ve
+        okunan deger yanlis `signal_key` ile yayinlanirdi. Sessiz yanlis veri,
+        gorunur eksik veriden daha kotudur.
         """
         with self._lock:
+            profil = (getattr(device, "signal_profile", None) or "").strip()
             if not self._signals_by_profile:
                 # Backend profil gondermiyor (eski surum) -> bugunku davranis.
                 return list(self._signals)
-            profil = (getattr(device, "signal_profile", None) or "").strip()
-            if profil in self._signals_by_profile:
-                return list(self._signals_by_profile[profil])
-            # Profil bildirilmis ama BU cihazin anahtari sozlukte yok. Backend
-            # her cihazin profilini yazar; buraya dusmek surum uyumsuzlugu ya
-            # da bozuk profil ayristirmasi demektir. Duz liste en az kotu
-            # secenek: cihaz karanliga dusmez, tek modelli kurulumda da zaten
-            # dogru sonuc verir.
+            backend_seti = self._signals_by_profile.get(profil)
+
+        if backend_seti:
+            return list(backend_seti)
+
+        # Lock DISINDA: dosya okuma/onbellek. Kilit altinda I/O yapmak poll
+        # cycle'ini bloklardi.
+        yerlesik = builtin_profile(profil)
+        if yerlesik:
+            if backend_seti is not None:
+                logger.info(
+                    "signals_builtin_used device=%s profil=%s — backend bu model "
+                    "icin sinyal gondermedi, yerlesik harita kullaniliyor",
+                    getattr(device, "code", "?"),
+                    profil,
+                )
+            return list(yerlesik)
+
+        if backend_seti is not None:
+            # Backend bilerek bos gonderdi ve yerlesik harita da yok.
             logger.warning(
-                "signals_profile_missing device=%s profil=%r — duz listeye dusuldu",
+                "signals_empty device=%s profil=%s — bu model icin sinyal yok; "
+                "cihaz yoklanmayacak (komsu modelin adresleri KULLANILMAZ)",
                 getattr(device, "code", "?"),
                 profil,
             )
+            return []
+
+        # Profil anahtari sozlukte HIC yok: surum uyumsuzlugu ya da bozuk
+        # ayristirma. Bilgi eksik oldugu icin duz liste en az kotu secenek —
+        # cihaz karanliga dusmez, tek modelli kurulumda zaten dogru sonuc verir.
+        logger.warning(
+            "signals_profile_missing device=%s profil=%r — duz listeye dusuldu",
+            getattr(device, "code", "?"),
+            profil,
+        )
+        with self._lock:
             return list(self._signals)
 
     def has_any_signals(self) -> bool:
@@ -469,7 +503,15 @@ class GatewayState:
         with self._lock:
             if self._signals:
                 return True
-            return any(bool(v) for v in self._signals_by_profile.values())
+            if any(bool(v) for v in self._signals_by_profile.values()):
+                return True
+            profiller = {
+                (getattr(d, "signal_profile", None) or "").strip()
+                for d in self._devices
+            }
+        # Yerlesik profiller de sayilir: backend katalogu tamamen bos olsa bile
+        # bilinen modeller yoklanabilir, cycle erken cikmamali.
+        return any(builtin_profile(p) for p in profiller if p)
 
     def is_active(self) -> bool:
         with self._lock:

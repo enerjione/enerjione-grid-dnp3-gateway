@@ -341,6 +341,12 @@ class BackendConfigClient:
         self._response_max_bytes = max(64 * 1024, int(response_max_bytes))
         self._device_ip_allowlist = device_ip_allowlist
         self._clock_guard = clock_guard
+        # Sartli istek onbellegi (ETag). Config nadiren degisir; her yoklamada
+        # 193 sinyali indirmemek icin son ETag ve son AYRISTIRILMIS config
+        # saklanir. 304 gelince ag uzerinden hicbir sey inmez ve JSON yeniden
+        # ayristirilmaz. Bkz. fetch_config.
+        self._last_etag: str | None = None
+        self._last_config: GatewayConfig | None = None
         # Connection-pooled session: config-refresh ve (ayri client ornegindeki)
         # command-poll thread'leri kendi session'iyla baglanti yarisi yasamaz.
         self._session = session or build_http_session(pool_maxsize=8, verify=verify)
@@ -356,8 +362,31 @@ class BackendConfigClient:
             logger.debug("clock_observe_failed", exc_info=True)
 
     def fetch_config(self) -> GatewayConfig:
+        """Config'i ceker. DEGISMEDIYSE agdan hicbir sey indirmez.
+
+        SARTLI ISTEK (ETag / If-None-Match)
+        -----------------------------------
+        Adres haritasi nadiren degisir ama config-poll surekli calisir. Her
+        yoklamada 193 sinyali tel uzerinden cekmek bosuna trafik ve bosuna
+        JSON ayristirmasidir.
+
+        Backend bu yanit icin ETag uretiyor (config_version = payload'in
+        hash'i) ve `If-None-Match` eslesirse 304 donuyor. Gateway bu header'i
+        GONDERMIYORDU: backend'deki 304 yolu bugune kadar HIC calismadi ve her
+        yoklamada tam payload indi. Dahasi 304 gelse `status_code != 200`
+        kontrolune takilip HATA sayilacakti.
+
+        Artik: ilk cagri tam indirir, sonraki cagrilar yalnizca "degisti mi"
+        sorar. Degistiginde tam payload gelir ve onbellek tazelenir.
+        """
         url = f"{self.base_url}/gateways/{self.gateway_code}/config"
         headers = build_config_request_headers(self.identity)
+        # Sartli istek yalnizca elimizde AYRISTIRILMIS bir config varken
+        # gonderilir: 304 gelip donecek bir sey bulamamak, config'i hic
+        # alamamaktan beterdir. Restart sonrasi ilk cagri tam iner (surec
+        # basina bir kez); backend erisilemezse disk cache devrede.
+        if self._last_etag and self._last_config is not None:
+            headers["If-None-Match"] = self._last_etag
         try:
             # stream=True: body'i hemen okuma; Content-Length header'i kontrol
             # edilebilsin. response.content ile sonra gercek body okunur.
@@ -374,6 +403,29 @@ class BackendConfigClient:
             raise GatewayConfigError(f"config request failed: {err_text}") from exc
 
         self._observe_clock(response)
+
+        # 304: config DEGISMEDI. Body yok, imza yok, ayristirma yok.
+        # `status_code != 200` kontrolunden ONCE ele alinmali — aksi halde
+        # basarili bir "degismedi" yaniti hata sayilirdi.
+        if response.status_code == 304:
+            try:
+                response.close()
+            except Exception:  # noqa: BLE001
+                pass
+            if self._last_config is None:
+                # Buraya normalde dusulmez (header'i yalnizca config varken
+                # gonderiyoruz). Dusulduyse onbellegi bosalt ki sonraki cagri
+                # kosulsuz gitsin ve kilitlenmeyelim.
+                self._last_etag = None
+                raise GatewayConfigError(
+                    "304 alindi ama onbellekte config yok — sonraki cagri "
+                    "kosulsuz yapilacak"
+                )
+            logger.debug(
+                "config_not_modified etag=%s — ag uzerinden veri inmedi",
+                self._last_etag,
+            )
+            return self._last_config
 
         # Content-Length kontrolu — backend cok buyuk response gonderirse erken
         # kestir
@@ -464,7 +516,7 @@ class BackendConfigClient:
         # thread'i) GatewayConfigError bekliyor. Ciplak bir NameError/TypeError
         # generic except'e duserdi ve teshis edilemez hale gelirdi.
         try:
-            return _parse_gateway_config(
+            config = _parse_gateway_config(
                 data,
                 default_gateway_code=self.gateway_code,
                 allowlist=self._device_ip_allowlist,
@@ -475,6 +527,16 @@ class BackendConfigClient:
             raise GatewayConfigError(
                 f"config parse failed: {type(exc).__name__}: {exc}"
             ) from exc
+
+        # Onbellegi yalnizca BASARILI ayristirmadan sonra tazele. Once
+        # yazsaydik, bozuk bir payload'in ETag'i saklanir ve sonraki cagrilar
+        # 304 alip bozuk config'i "gecerli" sayardi.
+        etag = (response.headers.get("ETag") or "").strip()
+        self._last_config = config
+        # ETag yoksa (eski backend) sartli istek gonderilmez; her cagri tam
+        # iner — yani onceki davranis. Bozulma yok, sadece kazanc yok.
+        self._last_etag = etag or None
+        return config
 
     def fetch_pending_commands(self) -> PendingPoll:
         """Hafif komut-poll — GET /gateways/{code}/pending.

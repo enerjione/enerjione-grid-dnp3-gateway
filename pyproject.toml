@@ -35,6 +35,14 @@ enerjione-dnp3-gateway = "dnp3_gateway.main:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# Yerlesik cihaz profilleri (DNP3 adres haritalari) PAKETE DAHIL.
+# Docker imaji `pip install -e` kullandigi icin dosyalar zaten diskte duruyor
+# ve bu satir olmadan da calisir; ama biri wheel/sdist uretirse JSON'lar
+# disarida kalir ve `builtin_profile()` SESSIZCE bos doner — bilinen modeller
+# yerlesik haritasiz kalir. Paketleme yolunu simdiden kapatiyoruz.
+[tool.setuptools.package-data]
+"dnp3_gateway.profiles" = ["*.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]

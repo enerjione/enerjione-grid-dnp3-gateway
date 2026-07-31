@@ -330,3 +330,97 @@ def test_yalnizca_profilde_sinyal_varsa_cycle_CALISIR():
     )
     assert state.has_any_signals() is True
     assert [s.key for s in state.signals_for(_cihaz("DEV-A", MODEL_A))] == ["master.current"]
+
+
+# ----------------------------------------------------- yerlesik adres haritasi
+#
+# OTORITE BACKEND'DEDIR. Yerlesik harita yalnizca backend o model icin sinyal
+# gondermediginde/bos gonderdiginde devreye girer. Gerekce: kurulumcu sahada
+# yanlis bir DNP3 index'ini arayuzden duzeltebilmeli; yerlesik harita kazansaydi
+# tek bir adres hatasi icin yeni gateway imaji cikarmak gerekirdi.
+
+
+def test_yerlesik_horstmann_profili_YUKLENIR():
+    from dnp3_gateway.profiles import builtin_profile, known_models
+
+    assert MODEL_A in known_models()
+    sinyaller = builtin_profile(MODEL_A)
+    assert len(sinyaller) == 193, f"beklenen 193, gelen {len(sinyaller)}"
+    anahtarlar = {s.key for s in sinyaller}
+    assert "master.actual_current" in anahtarlar or any(
+        a.startswith("master.") for a in anahtarlar
+    )
+
+
+def test_bilinmeyen_model_yerlesik_profili_YOK():
+    from dnp3_gateway.profiles import builtin_profile
+
+    assert builtin_profile("hic_boyle_model_yok") == ()
+    assert builtin_profile("") == ()
+
+
+def test_yerlesik_profil_dosya_yolu_KACISINA_kapali():
+    """Model adi backend'den gelen bir string; dosya sistemine sizmamali."""
+    from dnp3_gateway.profiles import builtin_profile
+
+    assert builtin_profile("../../etc/passwd") == ()
+    assert builtin_profile(r"..\..\windows") == ()
+    assert builtin_profile(".gizli") == ()
+
+
+def test_BACKEND_dolu_gonderirse_yerlesigi_EZER():
+    """Otorite backend. Kurulumcunun UI'dan yaptigi duzeltme kazanmali."""
+    backend_sinyali = make_signal("master.duzeltilmis", object_group=30, index=99)
+    state = GatewayState()
+    state.update(
+        _config(
+            devices=[_cihaz("DEV-A", MODEL_A)],
+            signals=[backend_sinyali],
+            by_profile={MODEL_A: [backend_sinyali]},
+        )
+    )
+    secilen = [s.key for s in state.signals_for(_cihaz("DEV-A", MODEL_A))]
+    assert secilen == ["master.duzeltilmis"], "yerlesik harita backend'i ezmis"
+
+
+def test_BACKEND_bos_gonderirse_YERLESIK_devreye_girer():
+    """Katalog bos olsa bile bilinen model dogru yoklanmali.
+
+    Bu, "gorunur eksik veri" kuralinin YUMUSAMASI degil: yerlesik harita O
+    MODELE ait dogru adreslerdir, komsu modelin adresleri degil.
+    """
+    state = GatewayState()
+    state.update(
+        _config(
+            devices=[_cihaz("DEV-A", MODEL_A)],
+            signals=[make_signal("baska.model.sinyali")],
+            by_profile={MODEL_A: []},          # backend: "bu model icin sinyal yok"
+        )
+    )
+    secilen = state.signals_for(_cihaz("DEV-A", MODEL_A))
+    assert len(secilen) == 193, "yerlesik harita devreye girmedi"
+    assert "baska.model.sinyali" not in {s.key for s in secilen}, (
+        "duz listeye dusulmus — komsu modelin adresleri kullanilmis"
+    )
+
+
+def test_BOS_profil_ve_YERLESIK_YOKSA_yine_bos():
+    """Yerlesigi olmayan model icin kural degismedi: yoklama yapilmaz."""
+    state = GatewayState()
+    state.update(
+        _config(
+            devices=[_cihaz("DEV-B", MODEL_B)],
+            signals=[make_signal("baska.model.sinyali")],
+            by_profile={MODEL_B: []},
+        )
+    )
+    assert state.signals_for(_cihaz("DEV-B", MODEL_B)) == []
+
+
+def test_yalnizca_YERLESIK_varsa_cycle_calisir():
+    """Backend katalogu tamamen bos olsa bile bilinen model yoklanmali."""
+    state = GatewayState()
+    state.update(
+        _config(devices=[_cihaz("DEV-A", MODEL_A)], signals=[], by_profile={MODEL_A: []})
+    )
+    assert state.has_any_signals() is True
