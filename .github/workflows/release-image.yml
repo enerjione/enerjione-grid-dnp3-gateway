@@ -37,6 +37,10 @@ permissions:
   contents: read
   packages: write
 
+concurrency:
+  group: release-image-${{ github.ref }}
+  cancel-in-progress: false   # yayinlanan imaji yarida kesme
+
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}

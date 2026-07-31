@@ -11,10 +11,12 @@
 
 name: ci
 
+# NOT: `push` tetikleyicisi BILINCLI OLARAK YOK.
+# main/tag push'unda release-image.yml calisir ve bu workflow'u `needs: ci` ile
+# ZATEN cagirir. Buraya push eklenirse ayni commit icin testler iki kez kosar ve
+# (ayni concurrency grubuna dustuklerinde) birbirlerini iptal ederler — ilk
+# kurulumda tam olarak bu oldu, `ci` run'i "cancelled" duruma dustu.
 on:
-  push:
-    branches: [main]
-    tags: ["v*.*.*"]
   pull_request:
     branches: [main]
   workflow_call: {}   # release-image.yml bunu tekrar kullanir
@@ -24,7 +26,10 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  # `github.workflow` cagiran workflow'un adina cozulur (dogrudan tetikte "ci",
+  # release-image icinden cagrildiginda "release-image"). Grup adina dahil
+  # edilmezse iki calisma ayni gruba duser ve birbirini iptal eder.
+  group: ${{ github.workflow }}-ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
