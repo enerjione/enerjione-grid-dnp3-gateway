@@ -25,9 +25,9 @@ from __future__ import annotations
 
 import json
 
-from dnp3_gateway.backend import DeviceConfig, GatewayConfig, SignalConfig
-from dnp3_gateway.backend.config_client import _parse_gateway_config
 from dnp3_gateway.adapters import TelemetryReader
+from dnp3_gateway.backend import DeviceConfig, GatewayConfig
+from dnp3_gateway.backend.config_client import _parse_gateway_config
 from dnp3_gateway.poller import run_poll_cycle
 from dnp3_gateway.state import GatewayState
 
@@ -50,7 +50,7 @@ def _config(*, devices, signals, by_profile) -> GatewayConfig:
 # ------------------------------------------------------- cihaz basina secim
 
 
-def test_her_cihaz_KENDI_modelinin_setini_alir():
+def test_her_cihaz_kendi_modelinin_setini_alir():
     """B3'un ozu."""
     a_sinyal = make_signal("master.current", object_group=30, index=0)
     b_sinyal = make_signal("acme.oil_temp", object_group=30, index=0)  # AYNI adres
@@ -70,7 +70,7 @@ def test_her_cihaz_KENDI_modelinin_setini_alir():
     assert b_keys == ["acme.oil_temp"]
 
 
-def test_ESKI_backend_duz_listeye_duser():
+def test_eski_backend_duz_listeye_duser():
     """`signals_by_profile` alani yoksa davranis AYNEN korunur."""
     sinyal = make_signal("master.current")
     state = GatewayState()
@@ -79,7 +79,7 @@ def test_ESKI_backend_duz_listeye_duser():
     assert [s.key for s in state.signals_for(_cihaz("DEV-A", MODEL_A))] == ["master.current"]
 
 
-def test_BOS_profil_duz_listeye_DUSMEZ():
+def test_bos_profil_duz_listeye_dusmez():
     """Kasitli tasarim karari.
 
     Backend bos liste gonderdiginde "bu model icin sinyal tanimli degil" diyor.
@@ -102,7 +102,7 @@ def test_BOS_profil_duz_listeye_DUSMEZ():
     )
 
 
-def test_BILINMEYEN_profil_duz_listeye_duser():
+def test_bilinmeyen_profil_duz_listeye_duser():
     """Anahtar hic yoksa (surum uyumsuzlugu) cihaz KARANLIGA dusmemeli.
 
     Bos liste ile bu durum FARKLIDIR: orada backend bilerek "sinyal yok"
@@ -124,7 +124,7 @@ def test_BILINMEYEN_profil_duz_listeye_duser():
 # --------------------------------------------------- gercek poll davranisi
 
 
-def test_poll_cycle_her_cihaza_KENDI_setini_verir():
+def test_poll_cycle_her_cihaza_kendi_setini_verir():
     """En onemli test: davranisin ta kendisi.
 
     Yukaridaki testler secimi dogruluyor; bu test poller'in o secimi gercekten
@@ -181,7 +181,7 @@ def test_poll_cycle_her_cihaza_KENDI_setini_verir():
 # --------------------------------------------------------- config parse
 
 
-def test_config_yanitindan_profiller_AYRISTIRILIR():
+def test_config_yanitindan_profiller_ayristirilir():
     payload = {
         "gateway_code": "GW-001",
         "gateway_name": "Test",
@@ -209,7 +209,7 @@ def test_config_yanitindan_profiller_AYRISTIRILIR():
     assert cfg.signals_by_profile[MODEL_B] == [], "bos profil yutulmus"
 
 
-def test_profil_sinyalleri_AYNI_dogrulamadan_gecer():
+def test_profil_sinyalleri_ayni_dogrulamadan_gecer():
     """inf/nan gibi bozuk degerler duz listede reddediliyorsa profilde de."""
     payload = {
         "gateway_code": "GW-001",
@@ -236,7 +236,7 @@ def test_profil_sinyalleri_AYNI_dogrulamadan_gecer():
     assert sinyal.offset == 0.0
 
 
-def test_bozuk_signals_by_profile_config_i_DUSURMEZ():
+def test_bozuk_signals_by_profile_config_i_dusurmez():
     payload = {
         "gateway_code": "GW-001",
         "config_version": "v1",
@@ -253,7 +253,7 @@ def test_bozuk_signals_by_profile_config_i_DUSURMEZ():
 # ------------------------------------------------------------ disk cache
 
 
-def test_disk_cache_profilleri_KORUR(tmp_path):
+def test_disk_cache_profilleri_korur(tmp_path):
     """Backend erisilemezken restart eden gateway profilleri kaybetmemeli.
 
     Kaybetseydi tum cihazlari duz listeyle yoklardi — cok modelli sahada tam
@@ -279,7 +279,7 @@ def test_disk_cache_profilleri_KORUR(tmp_path):
     assert [s.key for s in okuyan.signals_for(_cihaz("DEV-B", MODEL_B))] == ["acme.oil_temp"]
 
 
-def test_ESKI_cache_dosyasi_okunabilir(tmp_path):
+def test_eski_cache_dosyasi_okunabilir(tmp_path):
     """Alan icermeyen eski cache -> duz listeye dusulur, patlamaz."""
     cache = tmp_path / "config-cache.json"
     cache.write_text(
@@ -313,7 +313,7 @@ def test_ESKI_cache_dosyasi_okunabilir(tmp_path):
     assert [s.key for s in state.signals_for(_cihaz("DEV-A", MODEL_A))] == ["master.current"]
 
 
-def test_yalnizca_profilde_sinyal_varsa_cycle_CALISIR():
+def test_yalnizca_profilde_sinyal_varsa_cycle_calisir():
     """Duz liste bos, profil dolu — cycle erken cikmamali.
 
     `has_any_signals` yalnizca duz listeye bakiyor olsaydi, profil bazli
@@ -340,7 +340,7 @@ def test_yalnizca_profilde_sinyal_varsa_cycle_CALISIR():
 # tek bir adres hatasi icin yeni gateway imaji cikarmak gerekirdi.
 
 
-def test_yerlesik_horstmann_profili_YUKLENIR():
+def test_yerlesik_horstmann_profili_yuklenir():
     from dnp3_gateway.profiles import builtin_profile, known_models
 
     assert MODEL_A in known_models()
@@ -352,14 +352,14 @@ def test_yerlesik_horstmann_profili_YUKLENIR():
     )
 
 
-def test_bilinmeyen_model_yerlesik_profili_YOK():
+def test_bilinmeyen_model_yerlesik_profili_yok():
     from dnp3_gateway.profiles import builtin_profile
 
     assert builtin_profile("hic_boyle_model_yok") == ()
     assert builtin_profile("") == ()
 
 
-def test_yerlesik_profil_dosya_yolu_KACISINA_kapali():
+def test_yerlesik_profil_dosya_yolu_kacisina_kapali():
     """Model adi backend'den gelen bir string; dosya sistemine sizmamali."""
     from dnp3_gateway.profiles import builtin_profile
 
@@ -368,7 +368,7 @@ def test_yerlesik_profil_dosya_yolu_KACISINA_kapali():
     assert builtin_profile(".gizli") == ()
 
 
-def test_BACKEND_dolu_gonderirse_yerlesigi_EZER():
+def test_backend_dolu_gonderirse_yerlesigi_ezer():
     """Otorite backend. Kurulumcunun UI'dan yaptigi duzeltme kazanmali."""
     backend_sinyali = make_signal("master.duzeltilmis", object_group=30, index=99)
     state = GatewayState()
@@ -383,7 +383,7 @@ def test_BACKEND_dolu_gonderirse_yerlesigi_EZER():
     assert secilen == ["master.duzeltilmis"], "yerlesik harita backend'i ezmis"
 
 
-def test_BACKEND_bos_gonderirse_YERLESIK_devreye_girer():
+def test_backend_bos_gonderirse_yerlesik_devreye_girer():
     """Katalog bos olsa bile bilinen model dogru yoklanmali.
 
     Bu, "gorunur eksik veri" kuralinin YUMUSAMASI degil: yerlesik harita O
@@ -404,7 +404,7 @@ def test_BACKEND_bos_gonderirse_YERLESIK_devreye_girer():
     )
 
 
-def test_BOS_profil_ve_YERLESIK_YOKSA_yine_bos():
+def test_bos_profil_ve_yerlesik_yoksa_yine_bos():
     """Yerlesigi olmayan model icin kural degismedi: yoklama yapilmaz."""
     state = GatewayState()
     state.update(
@@ -417,7 +417,7 @@ def test_BOS_profil_ve_YERLESIK_YOKSA_yine_bos():
     assert state.signals_for(_cihaz("DEV-B", MODEL_B)) == []
 
 
-def test_yalnizca_YERLESIK_varsa_cycle_calisir():
+def test_yalnizca_yerlesik_varsa_cycle_calisir():
     """Backend katalogu tamamen bos olsa bile bilinen model yoklanmali."""
     state = GatewayState()
     state.update(

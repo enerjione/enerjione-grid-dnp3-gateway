@@ -98,7 +98,7 @@ def _istemci(oturum: _Oturum) -> BackendConfigClient:
     )
 
 
-def test_ILK_cagri_sartsiz_gider():
+def test_ilk_cagri_sartsiz_gider():
     """Elde config yokken If-None-Match gonderilmemeli.
 
     Gonderilseydi ve 304 gelseydi donecek hicbir sey olmazdi.
@@ -110,7 +110,7 @@ def test_ILK_cagri_sartsiz_gider():
     assert "If-None-Match" not in oturum.istek_headerlari[0]
 
 
-def test_IKINCI_cagri_sartli_gider_ve_304te_veri_INMEZ():
+def test_ikinci_cagri_sartli_gider_ve_304te_veri_inmez():
     """Testin ozu: degismemis config icin agdan bayt inmemeli."""
     oturum = _Oturum(
         [
@@ -120,7 +120,7 @@ def test_IKINCI_cagri_sartli_gider_ve_304te_veri_INMEZ():
     )
     istemci = _istemci(oturum)
 
-    ilk = istemci.fetch_config()
+    istemci.fetch_config()
     ilk_bayt = oturum.indirilen_bayt
     assert ilk_bayt > 0
 
@@ -132,7 +132,7 @@ def test_IKINCI_cagri_sartli_gider_ve_304te_veri_INMEZ():
     assert [s.key for s in ikinci.signals] == ["master.current"]
 
 
-def test_304_HATA_SAYILMAZ():
+def test_304_hata_sayilmaz():
     """Once `status_code != 200` kontrolune takilip exception atiyordu."""
     oturum = _Oturum([_Yanit(200, _PAYLOAD_V1, etag='"surum-1"'), _Yanit(304)])
     istemci = _istemci(oturum)
@@ -140,7 +140,7 @@ def test_304_HATA_SAYILMAZ():
     istemci.fetch_config()  # patlarsa test kirmizi
 
 
-def test_DEGISINCE_tam_payload_iner_ve_onbellek_tazelenir():
+def test_degisince_tam_payload_iner_ve_onbellek_tazelenir():
     """"Degisirse yine oku" tarafi."""
     oturum = _Oturum(
         [
@@ -162,7 +162,7 @@ def test_DEGISINCE_tam_payload_iner_ve_onbellek_tazelenir():
     assert [s.key for s in ucuncu.signals] == ["master.current", "master.voltage"]
 
 
-def test_ETAGSIZ_backend_ile_davranis_DEGISMEZ():
+def test_etagsiz_backend_ile_davranis_degismez():
     """Eski backend ETag gondermiyorsa her cagri tam iner — bozulma yok."""
     oturum = _Oturum([_Yanit(200, _PAYLOAD_V1), _Yanit(200, _PAYLOAD_V2)])
     istemci = _istemci(oturum)
@@ -174,7 +174,7 @@ def test_ETAGSIZ_backend_ile_davranis_DEGISMEZ():
     assert [s.key for s in ikinci.signals] == ["master.current", "master.voltage"]
 
 
-def test_BOZUK_payload_ETAGI_saklanmaz():
+def test_bozuk_payload_etagi_saklanmaz():
     """Kritik sira: onbellek yalnizca BASARILI ayristirmadan sonra tazelenir.
 
     Once yazsaydik, bozuk bir payload'in ETag'i saklanir ve sonraki cagrilar
@@ -202,7 +202,7 @@ def test_BOZUK_payload_ETAGI_saklanmaz():
     assert ucuncu.config_version == "surum-1"
 
 
-def test_304_govdesi_KAPATILIR():
+def test_304_govdesi_kapatilir():
     """Baglanti havuzuna geri verilsin; sizinti olmasin."""
     uc_yuz_dort = _Yanit(304)
     oturum = _Oturum([_Yanit(200, _PAYLOAD_V1, etag='"surum-1"'), uc_yuz_dort])

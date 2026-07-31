@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import json
 import logging
-from functools import lru_cache
+from functools import cache
 from pathlib import Path
 
 from dnp3_gateway.backend import SignalConfig
@@ -66,7 +66,7 @@ _ALANLAR = (
 )
 
 
-@lru_cache(maxsize=None)
+@cache
 def builtin_profile(model: str) -> tuple[SignalConfig, ...]:
     """Modelin yerlesik sinyal seti. Bilinmiyorsa BOS demet.
 
