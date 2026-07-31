@@ -107,21 +107,33 @@ WORKER_HEALTH_HOST=127.0.0.1
 WORKER_HEALTH_PORT=$HealthPort
 
 # Polling / paralellik
-DEFAULT_POLL_INTERVAL_SEC=5
+# NOT: 5sn cok yavasti — frontend'de olcum yasi 5-30sn araliginda salinuyordu.
+# config.py varsayilani 1sn; sablon artik onu eziyor DEGIL.
+DEFAULT_POLL_INTERVAL_SEC=1
 MAX_PARALLEL_DEVICES=$MaxParallelDevices
+
+# Her gateway KENDI state dizinini kullanmali: outbox, komut ledger'i,
+# config cache ve instance lock burada tutulur. Ayni dizini paylasan iki
+# instance ayni SQLite dosyalarina yazar.
+GATEWAY_STATE_DIR=.gateway_state/$Code
 
 # DNP3 master parametreleri
 DNP3_LOCAL_ADDRESS=1
 DNP3_TCP_PORT=20000
-DNP3_RESPONSE_TIMEOUT_SEC=8
-DNP3_READ_STRATEGY=event_driven
 DNP3_EVENT_BASELINE_INTERVAL_SEC=60
-DNP3_DISABLE_UNSOLICITED_ON_CONNECT=true
-DNP3_LINK_RESET_ON_CONNECT=true
+# opendnp3 IO thread sayisi: 0 = otomatik (min 4). 100+ cihazda 8 onerilir.
+DNP3_MANAGER_THREADS=0
+# Outstation saatlerini senkronize et (drift + guc kesintisi sonrasi RTC reset).
+DNP3_TIME_SYNC=lan
 
 # Loglama
 LOG_LEVEL=INFO
 LOG_FORMAT=text
+# NSSM ile servis olarak kurulacaksa rotation icin ZORUNLU. Bu satir
+# uretilmedigi icin sahada "zorunlu" denilen rotation aslinda yoktu:
+# RotatingFileHandler hic devreye girmiyor, tum cikti NSSM'in AppStdout
+# dosyasina siniersiz akiyordu.
+LOG_FILE_PATH=logs/$Code.log
 "@
 
 Set-Content -Path $OutFile -Value $envContent -Encoding utf8

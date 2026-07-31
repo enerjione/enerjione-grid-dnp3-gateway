@@ -56,6 +56,29 @@ Write-Host '[install] installing requirements.txt' -ForegroundColor Cyan
 & $pip -m pip install -r requirements.txt
 if ($LASTEXITCODE -ne 0) { throw 'pip install basarisiz (cikis kodu: ' + $LASTEXITCODE + ')' }
 
+# DNP3 master kutuphanesi (yadnp3 / OpenDNP3 native).
+#
+# ONEMLI: Bu adim EKSIKTI. Saha muhendisi dokumante edilen install.ps1'i
+# calistirip .env'de GATEWAY_MODE=dnp3 yaptiginda gateway boot ediyor, health
+# server aciliyor, sonra `Yadnp3AdapterError: yadnp3 (opendnp3) yuklu degil`
+# ile duruyordu — yani "hizli kurulum scripti" varsayilan konfigurasyonla
+# calisan bir kurulum uretmiyordu.
+Write-Host '[install] installing yadnp3 (OpenDNP3 native DNP3 master)' -ForegroundColor Cyan
+& $pip -m pip install "yadnp3==3.2.1.1"
+if ($LASTEXITCODE -ne 0) {
+    Write-Warning @'
+yadnp3 kurulamadi. Gateway GATEWAY_MODE=dnp3 ile CALISMAYACAKTIR.
+Olasi sebepler:
+  * Python surumu icin wheel yok (desteklenen: 3.10 - 3.12)
+  * Internet/proxy erisimi yok  -> wheel'i elle indirip:
+      .venv\Scripts\python.exe -m pip install <indirilen>.whl
+Alternatif (SINIRLI): DNP3_LIBRARY=dnp3py — saf Python, Group 110 string
+sinyalleri DESTEKLEMEZ ve OpenDNP3 outstation'larla tutarsiz davranabilir.
+'@
+} else {
+    Write-Host '[install] yadnp3 kurulumu tamam' -ForegroundColor Green
+}
+
 if (-not (Test-Path '.env')) {
     if (Test-Path '.env.example') {
         Write-Host '[install] creating .env from .env.example (UTF-8 no-BOM)' -ForegroundColor Green

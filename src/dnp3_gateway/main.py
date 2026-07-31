@@ -40,6 +40,7 @@ from dnp3_gateway.logging_setup import configure_logging, register_secret
 from dnp3_gateway.messaging import CommandLedger, Outbox, OutboxRetrier
 from dnp3_gateway.messaging.resilient_publisher import ResilientPublisher
 from dnp3_gateway.poller import run_poll_cycle
+from dnp3_gateway.resource_guard import ClockGuard, DiskGuard
 from dnp3_gateway.state import GatewayState
 
 logger = logging.getLogger("dnp3_gateway")
@@ -388,6 +389,62 @@ def _run_config_refresh(
         stop_event.wait(timeout=wait_time)
 
 
+class _MaintenanceStage:
+    """Periyodik bakim isleri icin son-calisma zamanlarini tutar (monotonic)."""
+
+    __slots__ = ("last_disk_check", "last_prune")
+
+    def __init__(self) -> None:
+        self.last_disk_check: float = 0.0
+        self.last_prune: float = 0.0
+
+
+# Bakim araliklari (saniye).
+_DISK_CHECK_INTERVAL_SEC = 60.0
+_PRUNE_INTERVAL_SEC = 6 * 3600.0
+
+
+def _run_periodic_maintenance(
+    *,
+    now: float,
+    stage: _MaintenanceStage,
+    disk_guard: Any,
+    outbox: Any,
+    ledger: Any,
+    cfg: Settings,
+) -> None:
+    """Disk olcumu + kalici tablo budamasi. Hicbir hata poll akisini durdurmaz.
+
+    NEDEN: "disk-full circuit breaker" mesaj sayiyordu, BAYT saymiyordu;
+    dead_letter ve command_ledger tablolarinda ise RETENTION YOKTU. Uc ayri
+    arizanin (retrier olumu, log rotation kirilmasi, poller durmasi) ortak
+    tetikleyicisi olan "disk" degiskeni hicbir yerde olculmuyordu.
+    """
+    try:
+        if now - stage.last_disk_check >= _DISK_CHECK_INTERVAL_SEC:
+            stage.last_disk_check = now
+            disk_guard.check()
+    except Exception:  # noqa: BLE001
+        logger.debug("disk_check_failed", exc_info=True)
+
+    try:
+        if now - stage.last_prune >= _PRUNE_INTERVAL_SEC:
+            stage.last_prune = now
+            removed_dl = outbox.prune_dead_letter(
+                retain_days=cfg.outbox_dead_letter_retain_days,
+                max_rows=cfg.outbox_dead_letter_max_rows,
+            )
+            removed_cmd = ledger.prune(retain_days=cfg.command_ledger_retain_days)
+            if removed_dl or removed_cmd:
+                logger.info(
+                    "state_pruned dead_letter=%d command_ledger=%d",
+                    removed_dl,
+                    removed_cmd,
+                )
+    except Exception:  # noqa: BLE001
+        logger.warning("state_prune_failed", exc_info=True)
+
+
 def _install_signal_handlers(stop_event: Event) -> None:
     def _handler(signum, _frame):  # type: ignore[no-untyped-def]
         logger.info("signal_received signum=%s shutdown=starting", signum)
@@ -535,6 +592,9 @@ def run(current_settings: Settings | None = None) -> int:
         config_ready_initial = True
     else:
         config_ready_initial = False
+    # Disk ve saat denetimi: /health'in gormedigi iki kor nokta.
+    disk_guard = DiskGuard(cfg.gateway_state_dir)
+    clock_guard = ClockGuard()
     config_ready = Event()
     if config_ready_initial:
         config_ready.set()
@@ -555,6 +615,13 @@ def run(current_settings: Settings | None = None) -> int:
 
     def _reader_provider() -> Any:
         return reader_holder["reader"]
+
+    # ledger_provider: /operate endpoint'i idempotency icin CommandLedger'a
+    # erisir. Ledger health server'dan SONRA olusturuldugu icin holder pattern.
+    ledger_holder: dict[str, Any] = {"ledger": None}
+
+    def _ledger_provider() -> Any:
+        return ledger_holder["ledger"]
 
     # /refresh-all endpoint icin auth token. GATEWAY_REFRESH_TOKEN set edilmemis
     # ise endpoint TAMAMEN DEVRE DISI kalir (health_server.py refresh_token
@@ -598,6 +665,7 @@ def run(current_settings: Settings | None = None) -> int:
         app_environment=identity.app_environment,
         publisher_provider=_publisher_provider,
         reader_provider=_reader_provider,
+        ledger_provider=_ledger_provider,
         # Backend bu endpoint'leri Bearer token ile cagirir.
         refresh_token=refresh_endpoint_token,
         command_token=command_endpoint_token,
@@ -610,6 +678,8 @@ def run(current_settings: Settings | None = None) -> int:
         # command-poll -> SCADA komut kanali olur) /health artik unhealthy doner.
         liveness=liveness,
         poll_interval_sec=cfg.default_poll_interval_sec,
+        disk_guard=disk_guard,
+        clock_guard=clock_guard,
     )
     # Banner: gercek (auto-assigned olabilir) health portunu yansitabilmek icin
     # health_server start sonrasi yazdirilir.
@@ -658,6 +728,8 @@ def run(current_settings: Settings | None = None) -> int:
     # yarim kalmis komutlari backend'e 'unknown' bildirir.
     ledger_path = Path(cfg.gateway_state_dir) / f"command_ledger_{identity.gateway_code}.db"
     command_ledger = CommandLedger(ledger_path)
+    # /operate endpoint'i idempotency icin ledger'a erissin (cift CROB onlemi).
+    ledger_holder["ledger"] = command_ledger
     _recovered = command_ledger.recover_unknown_results()
     if _recovered:
         logger.warning(
@@ -706,6 +778,15 @@ def run(current_settings: Settings | None = None) -> int:
     retrier.start()
     liveness.register("outbox-retrier", retrier)
 
+    # opendnp3 callback'leri (Now) native thread'lerden cagrilir; saat
+    # sapmasi gozlemcisini modul seviyesinde adapter'a baglariz.
+    try:
+        from dnp3_gateway.adapters import dnp3_yadnp3_master as _yadnp3_mod
+
+        _yadnp3_mod.set_clock_guard(clock_guard)
+    except Exception:  # noqa: BLE001 — yadnp3 kurulu olmayabilir
+        logger.debug("clock_guard_adapter_bind_skipped", exc_info=True)
+
     reader: TelemetryReader = build_adapter(cfg)
     # Health server /refresh-all endpoint'i icin injection
     reader_holder["reader"] = reader
@@ -745,6 +826,7 @@ def run(current_settings: Settings | None = None) -> int:
         verify=_tls_verify_param(cfg),
         response_max_bytes=cfg.backend_response_max_bytes,
         device_ip_allowlist=device_ip_allowlist,
+        clock_guard=clock_guard,
     )
 
     # Command-poll icin AYRI client + session. Config-refresh thread'i 5dk'da
@@ -815,6 +897,10 @@ def run(current_settings: Settings | None = None) -> int:
         identity.instance_id,
     )
 
+    # Ardisik cycle hatasi sayaci (log spam kontrolu icin).
+    cycle_failures = 0
+    maintenance = _MaintenanceStage()
+
     try:
         while not stop_event.is_set():
             now_monotonic = time.monotonic()
@@ -839,29 +925,63 @@ def run(current_settings: Settings | None = None) -> int:
 
             # NOT: Komut calistirma artik AYRI _run_command_poll thread'inde
             # (config'ten ayrildi, ~1sn). Ana dongu sadece DNP3 okuma/publish yapar.
-            due_count = len(state.due_devices(now_monotonic))
-            published = run_poll_cycle(
-                gateway_code=identity.gateway_code,
-                state=state,
-                reader=reader,
-                publisher=publisher,
-                now_monotonic=now_monotonic,
-                max_parallel=cfg.max_parallel_devices,
-                device_timeout_sec=cfg.device_poll_timeout_sec,
-                cycle_timeout_sec=cfg.cycle_timeout_sec,
-                stop_event=stop_event,
-                metrics=metrics,
-            )
-            if due_count or published:
-                metrics.record_cycle(devices=due_count, published=published)
-            if published:
-                logger.info(
-                    "poll_cycle gateway=%s published=%s devices=%s version=%s",
-                    identity.gateway_code,
-                    published,
-                    due_count,
-                    state.config_version(),
+            #
+            # CYCLE GOVDESI SARMALANMIS: eskiden yalnizca KeyboardInterrupt
+            # yakalaniyordu. Tek cihazli bir gateway'de disk dolarsa
+            # `outbox.enqueue` sqlite3.OperationalError firlatir, seri kol bunu
+            # yakalamaz, ana dongu de yakalamaz -> PROSES OLUR. Docker'da
+            # `restart: unless-stopped` ile crash-loop, Windows'ta NSSM'in
+            # restart ayari yoksa gateway kalici olarak durur.
+            # Artik dongu hatayi loglayip bir sonraki cycle'a gecer; kalici
+            # sorun /health uzerinden zaten gorunur (watchdog + thread durumu).
+            try:
+                due_count = len(state.due_devices(now_monotonic))
+                published = run_poll_cycle(
+                    gateway_code=identity.gateway_code,
+                    state=state,
+                    reader=reader,
+                    publisher=publisher,
+                    now_monotonic=now_monotonic,
+                    max_parallel=cfg.max_parallel_devices,
+                    device_timeout_sec=cfg.device_poll_timeout_sec,
+                    cycle_timeout_sec=cfg.cycle_timeout_sec,
+                    stop_event=stop_event,
+                    metrics=metrics,
                 )
+                if due_count or published:
+                    metrics.record_cycle(devices=due_count, published=published)
+                if published:
+                    logger.info(
+                        "poll_cycle gateway=%s published=%s devices=%s version=%s",
+                        identity.gateway_code,
+                        published,
+                        due_count,
+                        state.config_version(),
+                    )
+                cycle_failures = 0
+            except KeyboardInterrupt:
+                raise
+            except Exception:  # noqa: BLE001
+                cycle_failures += 1
+                # Ilk hatayi ve sonra seyrek olanlari logla (spam onlemi).
+                if cycle_failures in (1, 5, 50) or cycle_failures % 500 == 0:
+                    logger.exception(
+                        "poll_cycle_failed consecutive=%d — dongu devam ediyor",
+                        cycle_failures,
+                    )
+                metrics.inc_read_error()
+
+            # Periyodik bakim: disk olcumu, budama. Cycle'dan bagimsiz olarak
+            # hata versin diye ayri try; hicbiri poll akisini durdurmamali.
+            _run_periodic_maintenance(
+                now=now_monotonic,
+                stage=maintenance,
+                disk_guard=disk_guard,
+                outbox=outbox,
+                ledger=command_ledger,
+                cfg=cfg,
+            )
+
             stop_event.wait(timeout=max(1, cfg.default_poll_interval_sec))
     except KeyboardInterrupt:
         logger.info("dnp3_gateway_interrupted")

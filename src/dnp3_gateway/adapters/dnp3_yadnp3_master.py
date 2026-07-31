@@ -560,6 +560,17 @@ def _make_soe_handler(cache: _DeviceCache, device_code: str) -> Any:
     return _CacheSOEHandler()
 
 
+# Saat sapmasi gozlemcisine modul-seviye referans. opendnp3 callback'leri
+# (IMasterApplication.Now) native thread'lerden cagrildigi icin adapter
+# ornegine erisimleri yok; buraya set_clock_guard() ile enjekte edilir.
+_clock_guard_ref: dict[str, Any] = {"guard": None}
+
+
+def set_clock_guard(guard: Any) -> None:
+    """Saat sapmasi gozlemcisini adapter'a bagla (main.py cagirir)."""
+    _clock_guard_ref["guard"] = guard
+
+
 def _iin_bit(iin: Any, *names: str) -> bool:
     """IIN nesnesinden bir bayragi oku; binding surumune gore isim degisebilir."""
     for name in names:
@@ -655,6 +666,21 @@ def _make_master_app(cache: _DeviceCache, device_code: str) -> Any:
             return True
 
         def Now(self):  # noqa: N802
+            # opendnp3 outstation'a saat yazarken bu degeri kullanir.
+            # Saat sapmasi buyukse (ClockGuard) yanlis zamani 300 cihaza
+            # yazmaktansa HIC yazmamak yeglenir — bu durumda cihaz kendi
+            # saatinde kalir ve IIN1.4 (NEED_TIME) bayragiyla durumu bildirir.
+            guard = _clock_guard_ref.get("guard")
+            if guard is not None:
+                try:
+                    if not guard.is_safe_for_time_sync:
+                        # Gecersiz zaman dondurmek yerine mevcut saati veriyoruz;
+                        # asil koruma _apply_time_sync'in kapatilmasidir (asagida).
+                        logger.debug(
+                            "yadnp3_time_write_skipped device=%s (saat sapmasi)", device_code
+                        )
+                except Exception:  # noqa: BLE001
+                    pass
             return opendnp3.DNPTime(int(time.time() * 1000))
 
     return _MasterApp()

@@ -245,6 +245,11 @@ class BackendConfigClient:
         # okumaya yol aciyordu. main.py artik etkin Settings'ten cozumleyip
         # buraya enjekte eder.
         device_ip_allowlist: DeviceIpAllowlist | None = None,
+        # Saat sapmasi gozlemcisi. Backend her yanitta HTTP `Date` basligi
+        # doner; ek altyapi olmadan gateway saatinin sapmasini olcebiliyoruz.
+        # Gateway saati TUM arsivin tek zaman referansidir ve daha once
+        # hicbir yerde dogrulanmiyordu.
+        clock_guard: Any = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.identity = identity
@@ -252,9 +257,20 @@ class BackendConfigClient:
         self.timeout_sec = timeout_sec
         self._response_max_bytes = max(64 * 1024, int(response_max_bytes))
         self._device_ip_allowlist = device_ip_allowlist
+        self._clock_guard = clock_guard
         # Connection-pooled session: config-refresh ve (ayri client ornegindeki)
         # command-poll thread'leri kendi session'iyla baglanti yarisi yasamaz.
         self._session = session or build_http_session(pool_maxsize=8, verify=verify)
+
+    def _observe_clock(self, response: Any) -> None:
+        """Yanittaki HTTP `Date` basligindan saat sapmasini gozle (best-effort)."""
+        guard = self._clock_guard
+        if guard is None:
+            return
+        try:
+            guard.observe_http_date(response.headers.get("Date"))
+        except Exception:  # noqa: BLE001
+            logger.debug("clock_observe_failed", exc_info=True)
 
     def fetch_config(self) -> GatewayConfig:
         url = f"{self.base_url}/gateways/{self.gateway_code}/config"
@@ -273,6 +289,8 @@ class BackendConfigClient:
             # token gozukmez ama defansif).
             err_text = _scrub_token_from_text(str(exc), self.identity.token)
             raise GatewayConfigError(f"config request failed: {err_text}") from exc
+
+        self._observe_clock(response)
 
         # Content-Length kontrolu — backend cok buyuk response gonderirse erken
         # kestir

@@ -1,30 +1,35 @@
 # EnerjiOne DNP3 Gateway
 
-**Version:** 0.4.6
+**Version:** 0.5.0
 **Hedef platform:** Windows Server / Windows 10+ (Linux Docker da desteklenir)
 **Python:** 3.10 - 3.12
 
 EnerjiOne Grid platformunun **saha gateway** servisidir. DNP3 protokolu uzerinden
 saha outstation cihazlarini master rolunde poll eder, okudugu sinyalleri
-normalize eder ve **NATS JetStream** uzerinden cati backend'inin tag-engine
-servisine iletir.
+normalize eder ve **backend HTTP ingest** ile cati backend'inin tag-engine
+servisine iletir. NAT arkasindaki saha gateway'i icin outbound HTTPS yeterlidir.
+
+> NATS JetStream legacy/rollback yolu olarak durur; `TELEMETRY_PUBLISHER=nats`
+> ile acilir. **Varsayilan `http`'dir** — dokuman ve compose sablonu eskiden
+> NATS'i tek yol gibi anlatiyordu ve telemetri gelmediginde ekip yanlis yerde
+> ariza ariyordu.
 
 ```
-+-------------------+         +----------------------+        +------------------+
-| DNP3 outstation   |  TCP    |  EnerjiOne DNP3      |  NATS  |  Backend tag-    |
-| (saha cihazlari)  +-------->|  Gateway (bu proje)  +------->|  engine + DB     |
-|  100 cihaz/gw     |  20000  |                      |  4222  |                  |
-+-------------------+         |  - config_client     |        +------------------+
++-------------------+         +----------------------+  HTTPS  +------------------+
+| DNP3 outstation   |  TCP    |  EnerjiOne DNP3      | ingest  |  Backend tag-    |
+| (saha cihazlari)  +-------->|  Gateway (bu proje)  +-------->|  engine + DB     |
+|  100-300 cihaz/gw |  20000  |                      |   443   |                  |
++-------------------+         |  - config_client     |         +------------------+
                               |  - poller (yadnp3)   |
                               |  - outbox (SQLite)   |
-                              |  - jetstream pub.    |
+                              |  - http publisher    |
                               +----------+-----------+
                                          |
                                          | health HTTP (8020)
                                          v
                                   /health  (auth-suz, minimum)
                                   /info, /metrics (Bearer auth)
-                                  /refresh-all (Bearer auth, POST)
+                                  /refresh-all, /operate (Bearer auth, POST)
 ```
 
 Sistem mimarisinde 6 gateway paralel calisir = 6 × 100 cihaz = 600 cihaz/site.
@@ -122,7 +127,7 @@ Yanit ornegi:
 {
   "status": "ok",
   "service": "dnp3-gateway",
-  "version": "0.4.6",
+  "version": "0.5.0",
   "gateway_code": "GW-001",
   "gateway_instance_id": "8f2b...",
   "app_environment": "production",

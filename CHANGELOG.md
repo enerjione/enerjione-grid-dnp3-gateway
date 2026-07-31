@@ -2,6 +2,112 @@
 
 Semver'a gore tutulur. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.5.0] - 2026-07-31
+
+Production-oncesi kapsamli denetim (9 boyut, karsit dogrulama) sonrasi
+sertlestirme surumu. **Testler 93 -> 200.** Backend sozlesmesini degistiren
+4 kalem bilincli olarak ertelendi: [docs/BACKEND_TODO.md](docs/BACKEND_TODO.md).
+
+### Fixed — Uretimi durduran hatalar
+
+- **`config_client.py`'de modul-seviye `import logging` yoktu.** Uc kod yolunda
+  `NameError` uretiyordu: (a) `/pending` yanitinda tek bozuk komut TUM SCADA
+  komut kanalini sessizce olduruyor, (b) `DNP3_DEVICE_ALLOWED_SUBNETS` icinde
+  tek CIDR yazim hatasi gateway'i KALICI olarak config-cekemez yapiyor,
+  (c) allowlist tanimliyken ilk config fetch dusuyordu.
+- **Windows multi-instance lock ETKISIZDI.** `msvcrt.locking` konum-bagimli
+  byte-range kilidi kullanir; dosya append modunda acildigi ve lock alindiktan
+  sonra icine yazildigi icin ikinci proses FARKLI bir araligi kilitleyip
+  basariyla basliyordu. Sonuc: ayni outbox/ledger'a iki proses yazimi ve
+  `CommandLedger` proses-yerel oldugu icin **ayni cihaza cift CROB**.
+- **CI'da test kapisi yoktu.** main'e giden her commit test edilmeden
+  `:latest` olarak yayinlaniyordu.
+
+### Fixed — Kalici veri kaybi
+
+- **Yayin onayi artik kalicilastirmadan SONRA veriliyor** (commit-after-publish).
+  Dirty bayragi okuma aninda temizlendigi icin (a) okuma-yayin arasinda gelen
+  yeni olcum kalici kayboluyor (acilan kesici saatlerce kapali gorunuyordu),
+  (b) outbox dolunca yayinlanmayan deger "yayinlanmis" sayiliyordu.
+- **Head-of-line blocking kaldirildi.** Gecici/kalici ayrimi metin eslesmesiyle
+  yapiliyordu; kalici bir HTTP 500 "gecici" sayilip ayni satir sonsuza kadar
+  kuyrugun basinda kaliyor, arkasindaki TUM telemetri teslim edilemiyordu.
+  Artik tip + HTTP status ile siniflandirma, kalici satir `next_attempt_at`
+  ile erteleniyor.
+- **Outbox drenaj hizi.** Mesaj basina POST + commit + her batch sonrasi 2sn
+  uyku (~32 msg/sn) birikmis 500K mesaji saatlerce bosaltiyor, uretim hizini
+  yakalayamiyordu. Artik toplu POST + tek DELETE transaction + kuyruk doluyken
+  uyku atlama.
+- **`refresh_all_devices()` no-op'tu** — delta-only yayinin TEK telafi
+  mekanizmasi, degeri degismeyen sinyaller icin hicbir mesaj uretmiyordu.
+- **Outbox-full breaker histerezisi** (ac-kapa dongusu her turda okunan
+  degerleri bosa harciyordu).
+- **`publish_batch`** hata durumunda kalan item'lari sessizce dusuruyordu.
+
+### Fixed — Olcum dogrulugu (DNP3)
+
+- **Kalite bayraklari artik okunuyor.** `grep flags src/` daha once TAM SIFIR
+  sonuc veriyordu; outstation `RESTART` / `LOCAL_FORCED` / `OVER_RANGE` /
+  `REFERENCE_ERR` raporlasa bile SCADA'ya `quality="good"` gidiyordu.
+  Yayina baglanmasi `DNP3_PUBLISH_QUALITY_FLAGS` ile backend hazir olunca.
+- **DNP3 zaman senkronizasyonu eklendi** (`DNP3_TIME_SYNC=lan`). `timeSyncMode`
+  hicbir yerde set edilmiyordu; outstation saatleri serbest surukleniyordu.
+- **`OnReceiveIIN` bostu** — `EVENT_BUFFER_OVERFLOW` (outstation olay tamponu
+  doldu ve olaylari DUSURDU), `DEVICE_RESTART`, `NEED_TIME` artik loglaniyor.
+- **G3 DoubleBitBinary / G21 FrozenCounter** sessizce dusuruluyordu.
+- **Cihaz IP/port/DNP3 adresi degisince master yeniden kuruluyor.** Eskiden
+  yalnizca `device.code` ile anahtarlaniyordu: RTU IP'si degistirilince gateway
+  ESKI IP'ye baglanmaya devam ediyor, eski IP baska cihaza atanmissa O CIHAZDAN
+  okuyup degerleri ESKI `device_code` ile yayinliyordu.
+- **Kalici `lost` kilidi.** TCP hic kopmazsa cihaz DNP3'te saglikli konussa bile
+  gateway sonsuza kadar `comm_lost` yayinliyor ve komut gondermeyi reddediyordu.
+- **Production'da `GATEWAY_MODE=mock` artik reddediliyor.** Validator bunu
+  kontrol etmiyordu; operator satiri degistirmeyi unutursa uydurma telemetri
+  SCADA'ya akiyor ve mock adapter her komuta `ok=True` donduruyordu.
+
+### Added — Gozlemlenebilirlik
+
+- `/health`'e **cihaz haberlesme ozeti** (online/recovering/lost/unknown).
+  Eskiden 300 cihazin tamami kopukken bile `{"status":"ok"}` donuyordu.
+  Ozet SAYIMDIR; auth'suz endpoint cihaz kodu/IP sizdirmaz.
+- **Poll dongusu watchdog'u** (`poll_loop_stalled`) ve **thread canliligi**
+  (`thread_dead:<ad>`) — ikisi de `unhealthy`.
+- **Disk alani ve saat sapmasi denetimi** (`resource_guard.py`). "Disk-full
+  breaker" mesaj sayiyordu, BAYT saymiyordu; gateway saati tum arsivin tek
+  zaman referansiyken hicbir yerde dogrulanmiyordu. Sapma > 30sn ise DNP3
+  zaman yazimi durur.
+- **Olu metrik sayaclari gercekten besleniyor**; `signals_outboxed_total`
+  ayrildi (outbox'a dusen mesaj artik "published" sayilmiyor).
+
+### Added — Dayaniklilik
+
+- **SQLite sema surumleme** (`PRAGMA user_version` migration runner),
+  **butunluk kontrolu** (`quick_check`) ve **bozuk-DB karantinasi**. Yeni kolon
+  eklemek sahadaki mevcut `.db` dosyalarini crash-loop'a sokardi; bozuk dosya
+  kalici boot arizasiydi.
+- **`POST /operate` artik CommandLedger'a yaziliyor** (`command_id` ile
+  idempotency). Backend'in HTTP timeout'u cihazin CROB suresinden kisa oldugu
+  icin retry'da ayni kesici IKI KEZ surulebiliyordu.
+- **Ana poll dongusu beklenmedik hatada olmuyor** (eskiden yalnizca
+  `KeyboardInterrupt` yakalaniyordu; disk dolunca proses oluyordu).
+- **Sinirsiz buyume budandi**: `_seen_command_ids` (FIFO pencere),
+  `command_ledger` ve `outbox_dead_letter` (yas + adet retention).
+
+### Changed — Kurulum / dagitim
+
+- `.env.example` **30 eksik ayarla senkronlandi**; senkronu koruyan bir test
+  eklendi (yeni ayar dokumante edilmezse CI kirmizi).
+- `install.ps1` artik **yadnp3'u kuruyor** — eskiden dokumante edilen kurulum
+  varsayilan konfigurasyonla boot edemiyordu.
+- `new_gateway.ps1` artik `LOG_FILE_PATH` ve per-instance `GATEWAY_STATE_DIR`
+  uretiyor ("NSSM'de zorunlu" denilen rotation sahada yoktu).
+- Compose sablonu `TELEMETRY_PUBLISHER: "http"` set ediyor ve 300-cihaz
+  varsayilanlarini geri almiyor. Sablon NATS'i isaret edip HTTP kullaniyordu.
+- `:latest` **yalnizca surum tag'inde** uretiliyor; main push -> `:main` +
+  `:sha-*` (rollback mumkun).
+- Olu `DNP3_INTEGRITY_POLL_MIN` alani kaldirildi; yadnp3'un yok saydigi
+  legacy ayarlar set edilmisse boot'ta uyariliyor.
+
 ## [0.4.6] - 2026-05-13
 
 ### Security — Audit follow-up (sprint sonrasi 2. pas)

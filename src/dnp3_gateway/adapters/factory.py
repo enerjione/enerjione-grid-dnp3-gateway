@@ -29,7 +29,6 @@ _YADNP3_IGNORED_SETTINGS = (
     "dnp3_disable_unsolicited_on_connect",
     "dnp3_unsolicited_class_mask",
     "dnp3_log_raw_frames",
-    "dnp3_integrity_poll_min",
 )
 
 

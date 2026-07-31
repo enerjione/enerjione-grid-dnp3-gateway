@@ -407,6 +407,32 @@ class Settings(BaseSettings):
         le=60.0,
         description="OutboxRetrier saglikli durumda batch'ler arasi bekleme",
     )
+    outbox_dead_letter_retain_days: float = Field(
+        default=30.0,
+        ge=1.0,
+        le=3650.0,
+        description=(
+            "Dead-letter kayitlarinin saklanma suresi (gun). Tabloda RETENTION "
+            "YOKTU: uzun bir backend semantik hatasindan sonra yuz binlerce "
+            "satir birikip 100-200 MB kalici disk tuketiyor ve saha PC'sinde "
+            "disk dolmasinin ana kaynagi oluyordu."
+        ),
+    )
+    outbox_dead_letter_max_rows: int = Field(
+        default=50_000,
+        ge=1_000,
+        le=5_000_000,
+        description="Dead-letter tablosu ust satir siniri (yas siniri yetmezse en eskiler silinir)",
+    )
+    command_ledger_retain_days: float = Field(
+        default=90.0,
+        ge=1.0,
+        le=3650.0,
+        description=(
+            "Teslim EDILMIS komut kayitlarinin saklanma suresi (gun). Teslim "
+            "edilmemis sonuclar ve dead_letter kayitlari (denetim izi) budanmaz."
+        ),
+    )
     outbox_retrier_batch_size: int = Field(
         default=200,
         ge=1,
@@ -435,7 +461,6 @@ class Settings(BaseSettings):
             "cozumlemesini gateway yapmaz, IP olarak yapilandirin."
         ),
     )
-    dnp3_integrity_poll_min: int = Field(default=60, ge=1, le=86400)
     dnp3_response_timeout_sec: int = Field(
         default=15,
         ge=1,
