@@ -96,9 +96,7 @@ def builtin_profile(model: str) -> tuple[SignalConfig, ...]:
         if not isinstance(satir, dict) or not satir.get("key"):
             continue
         try:
-            sinyaller.append(
-                SignalConfig(**{alan: satir.get(alan) for alan in _ALANLAR})
-            )
+            sinyaller.append(SignalConfig(**{alan: satir.get(alan) for alan in _ALANLAR}))
         except (TypeError, ValueError) as exc:
             logger.warning(
                 "builtin_profile_signal_invalid model=%s key=%r error=%s",

@@ -171,9 +171,7 @@ class GatewayConfigError(RuntimeError):
     """Backend API config endpoint'inden gecerli bir yanit alinamadi."""
 
 
-def _parse_signal_list(
-    signals_raw: Any, *, alan: str = "signals"
-) -> list[SignalConfig]:
+def _parse_signal_list(signals_raw: Any, *, alan: str = "signals") -> list[SignalConfig]:
     """Ham sinyal listesini dogrulayarak SignalConfig listesine cevirir.
 
     Hem duz `signals` hem `signals_by_profile` degerleri BURADAN gecer.
@@ -183,8 +181,7 @@ def _parse_signal_list(
     """
     if not isinstance(signals_raw, list):
         raise GatewayConfigError(
-            f"config response {alan!r} list olmali "
-            f"(gelen tip: {type(signals_raw).__name__})"
+            f"config response {alan!r} list olmali (gelen tip: {type(signals_raw).__name__})"
         )
     if len(signals_raw) > _MAX_SIGNALS_HARD_LIMIT:
         logger.error(
@@ -418,8 +415,7 @@ class BackendConfigClient:
                 # kosulsuz gitsin ve kilitlenmeyelim.
                 self._last_etag = None
                 raise GatewayConfigError(
-                    "304 alindi ama onbellekte config yok — sonraki cagri "
-                    "kosulsuz yapilacak"
+                    "304 alindi ama onbellekte config yok — sonraki cagri kosulsuz yapilacak"
                 )
             logger.debug(
                 "config_not_modified etag=%s — ag uzerinden veri inmedi",
@@ -451,9 +447,7 @@ class BackendConfigClient:
             except Exception:  # noqa: BLE001
                 preview = ""
             preview = _scrub_token_from_text(preview[:200], self.identity.token)
-            raise GatewayConfigError(
-                f"config request returned {response.status_code}: {preview}"
-            )
+            raise GatewayConfigError(f"config request returned {response.status_code}: {preview}")
 
         # Body'i sinirli okuma: max_bytes'i asarsa raise
         try:
@@ -508,9 +502,7 @@ class BackendConfigClient:
             raise GatewayConfigError(f"config response is not json: {exc}") from exc
 
         if not isinstance(data, dict):
-            raise GatewayConfigError(
-                f"config response root must be object, got {type(data).__name__}"
-            )
+            raise GatewayConfigError(f"config response root must be object, got {type(data).__name__}")
 
         # Beklenmedik parse hatalari sozlesmeyi bozmasin: caller (config-refresh
         # thread'i) GatewayConfigError bekliyor. Ciplak bir NameError/TypeError
@@ -524,9 +516,7 @@ class BackendConfigClient:
         except GatewayConfigError:
             raise
         except Exception as exc:  # noqa: BLE001
-            raise GatewayConfigError(
-                f"config parse failed: {type(exc).__name__}: {exc}"
-            ) from exc
+            raise GatewayConfigError(f"config parse failed: {type(exc).__name__}: {exc}") from exc
 
         # Onbellegi yalnizca BASARILI ayristirmadan sonra tazele. Once
         # yazsaydik, bozuk bir payload'in ETag'i saklanir ve sonraki cagrilar
@@ -561,9 +551,7 @@ class BackendConfigClient:
 
         if response.status_code != 200:
             preview = _scrub_token_from_text((response.text or "")[:200], self.identity.token)
-            raise GatewayConfigError(
-                f"pending request returned {response.status_code}: {preview}"
-            )
+            raise GatewayConfigError(f"pending request returned {response.status_code}: {preview}")
 
         body_bytes = response.content
         if len(body_bytes) > self._response_max_bytes:
@@ -572,13 +560,9 @@ class BackendConfigClient:
         # HMAC imza dogrulama (fetch_config ile ayni; best-effort, header varsa).
         sig_header = (response.headers.get("X-Config-Signature") or "").strip().lower()
         if sig_header:
-            expected = _hmac.new(
-                self.identity.token.encode("utf-8"), body_bytes, _hashlib.sha256
-            ).hexdigest()
+            expected = _hmac.new(self.identity.token.encode("utf-8"), body_bytes, _hashlib.sha256).hexdigest()
             if not _hmac.compare_digest(sig_header, expected):
-                raise GatewayConfigError(
-                    "pending response signature mismatch — MITM/kompromize, reddedildi"
-                )
+                raise GatewayConfigError("pending response signature mismatch — MITM/kompromize, reddedildi")
 
         try:
             data: dict[str, Any] = _json.loads(body_bytes.decode("utf-8"))
@@ -608,9 +592,7 @@ class BackendConfigClient:
                         )
                     )
                 except (KeyError, TypeError, ValueError) as exc:
-                    logger.warning(
-                        "pending_command_parse_failed id=%r error=%s", item.get("id"), exc
-                    )
+                    logger.warning("pending_command_parse_failed id=%r error=%s", item.get("id"), exc)
 
         def _int(key: str) -> int:
             try:
@@ -649,9 +631,7 @@ class BackendConfigClient:
                 _scrub_token_from_text(f"command-results POST failed: {exc}", self.identity.token)
             ) from exc
         if response.status_code >= 400:
-            raise GatewayConfigError(
-                f"command-results POST rejected: HTTP {response.status_code}"
-            )
+            raise GatewayConfigError(f"command-results POST rejected: HTTP {response.status_code}")
 
 
 # Schema-defansif sabitler — backend kompromize olsa bile gateway'in
@@ -895,8 +875,12 @@ def _parse_gateway_config(
     # kapatilabilir (REWRITE_LOOPBACK_TO_HOST=false).
     import os as _os
 
-    rewrite = (_os.environ.get("REWRITE_LOOPBACK_TO_HOST", "true").strip().lower()
-               not in ("0", "false", "no", "off"))
+    rewrite = _os.environ.get("REWRITE_LOOPBACK_TO_HOST", "true").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
 
     devices_raw = data.get("devices") or []
     if not isinstance(devices_raw, list):
@@ -942,9 +926,7 @@ def _parse_gateway_config(
             # DNP3 link layer adresi: standart aralik 0-65519 (RFC: 65520-65535
             # rezerve). Disindaki degerler segfault uretebilir bazi binding'lerde.
             dnp3_addr = _safe_int(item.get("dnp3_address"), 1, lo=0, hi=65519)
-            if item.get("dnp3_address") not in (None, "") and dnp3_addr != int(
-                item.get("dnp3_address") or 0
-            ):
+            if item.get("dnp3_address") not in (None, "") and dnp3_addr != int(item.get("dnp3_address") or 0):
                 logger.warning(
                     "config_dnp3_address_out_of_range code=%r received=%r clamped=%d",
                     item.get("code"),
@@ -961,19 +943,19 @@ def _parse_gateway_config(
                     master_address=_parse_optional_master_address(item),
                     ip_endpoint_type=(
                         str(item.get("ip_endpoint_type") or "listening").strip().lower()
-                        if str(item.get("ip_endpoint_type") or "").strip().lower() in ("initiating", "listening")
+                        if str(item.get("ip_endpoint_type") or "").strip().lower()
+                        in ("initiating", "listening")
                         else "listening"
                     ),
                     master_ip_port=(
                         int(item["master_ip_port"])
-                        if item.get("master_ip_port") not in (None, "", 0) and 1 <= int(item["master_ip_port"]) <= 65535
+                        if item.get("master_ip_port") not in (None, "", 0)
+                        and 1 <= int(item["master_ip_port"]) <= 65535
                         else None
                     ),
                     # Reasonable defaults + clamping (poll_interval cok kucuk
                     # ise gateway cycle'i tikar; cok buyuk ise hic okumaz).
-                    poll_interval_sec=_safe_int(
-                        item.get("poll_interval_sec"), 2, lo=1, hi=3600
-                    ),
+                    poll_interval_sec=_safe_int(item.get("poll_interval_sec"), 2, lo=1, hi=3600),
                     timeout_ms=_safe_int(item.get("timeout_ms"), 3000, lo=100, hi=60000),
                     retry_count=_safe_int(item.get("retry_count"), 2, lo=0, hi=20),
                     signal_profile=_truncate(

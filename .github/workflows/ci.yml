@@ -46,9 +46,12 @@ jobs:
       - run: pip install "ruff>=0.5,<1.0"
       - name: ruff check
         run: ruff check .
+      # Artik GERCEK kapi. `continue-on-error: true` ile birlikte bu adim
+      # 30 dosyada surekli basarisiz oluyor ama CI'i yesil gosteriyordu; boyle
+      # bir adim uyari da vermez, yalnizca gurultu olur ve zamanla borc buyur.
+      # Borc odendi (30 dosya bicimlendirildi, 225 test etkilenmedi).
       - name: ruff format --check
         run: ruff format --check .
-        continue-on-error: true   # formatlama henuz zorunlu degil; once uyari
 
   test:
     name: pytest (py${{ matrix.python-version }})

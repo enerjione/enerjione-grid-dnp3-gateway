@@ -151,9 +151,7 @@ def apply_migrations(
             current,
             target,
         )
-        raise SqliteIntegrityError(
-            f"{label}: DB semasi (v{current}) koddan (v{target}) yeni"
-        )
+        raise SqliteIntegrityError(f"{label}: DB semasi (v{current}) koddan (v{target}) yeni")
 
     applied = 0
     for version, description, migrate in sorted(migrations, key=lambda m: m[0]):
@@ -242,16 +240,12 @@ def open_versioned_db(
                 pass
             conn = None
         if quarantine_corrupt_db(db_path, problem) is None:
-            raise SqliteIntegrityError(
-                f"{label}: DB bozuk ({problem}) ve karantinaya alinamadi: {db_path}"
-            )
+            raise SqliteIntegrityError(f"{label}: DB bozuk ({problem}) ve karantinaya alinamadi: {db_path}")
         conn = _connect()
         residual = check_integrity(conn)
         if residual is not None:
             conn.close()
-            raise SqliteIntegrityError(
-                f"{label}: karantina sonrasi temiz DB de bozuk: {residual}"
-            )
+            raise SqliteIntegrityError(f"{label}: karantina sonrasi temiz DB de bozuk: {residual}")
 
     # POSIX'te telemetri payload'u + cihaz IP'leri diger kullanicilara kapali.
     if os.name == "posix":

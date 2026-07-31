@@ -122,7 +122,9 @@ def ensure_credentials_allowed(settings: Settings) -> None:
         raise SystemExit("GATEWAY_TOKEN bos olamaz. Backend gateways.token ile ayni gizli degeri atayin.")
     env = settings.app_environment.strip().lower()
     if env not in ("development", "staging", "production", "dev", "stg", "prod"):
-        raise SystemExit("APP_ENVIRONMENT degeri development | staging | production olmali (veya kisa: dev, stg, prod).")
+        raise SystemExit(
+            "APP_ENVIRONMENT degeri development | staging | production olmali (veya kisa: dev, stg, prod)."
+        )
     if env in ("dev", "development"):
         return
     if token.lower() in {t.lower() for t in _PLACEHOLDER_TOKENS}:
@@ -137,9 +139,7 @@ def ensure_credentials_allowed(settings: Settings) -> None:
         else int(settings.gateway_token_min_length_production)
     )
     if len(token) < min_len:
-        raise SystemExit(
-            f"GATEWAY_TOKEN cok kisa: en az {min_len} karakter olmali (ortam: {env})."
-        )
+        raise SystemExit(f"GATEWAY_TOKEN cok kisa: en az {min_len} karakter olmali (ortam: {env}).")
 
 
 def bootstrap_gateway_identity(*, settings: Settings, app_version: str) -> GatewayIdentity:

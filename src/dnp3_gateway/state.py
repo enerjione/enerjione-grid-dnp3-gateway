@@ -117,9 +117,7 @@ class GatewayState:
             self._signals = list(config.signals)
             self._signals_by_profile = {
                 profil: list(satirlar)
-                for profil, satirlar in (
-                    getattr(config, "signals_by_profile", None) or {}
-                ).items()
+                for profil, satirlar in (getattr(config, "signals_by_profile", None) or {}).items()
             }
             self._gateway_active = config.is_active
             self._gateway_name = config.gateway_name
@@ -292,13 +290,7 @@ class GatewayState:
                     if not isinstance(ham, list):
                         continue
                     signals_by_profile[str(profil)] = [
-                        SignalConfig(
-                            **{
-                                k: v
-                                for k, v in s.items()
-                                if k in SignalConfig.__dataclass_fields__
-                            }
-                        )
+                        SignalConfig(**{k: v for k, v in s.items() if k in SignalConfig.__dataclass_fields__})
                         for s in ham
                         if isinstance(s, dict)
                     ]
@@ -383,9 +375,7 @@ class GatewayState:
                 # yanlis veri, hem de en kotu anda (backend yokken).
                 "signals_by_profile": {
                     profil: [asdict(s) for s in satirlar]
-                    for profil, satirlar in (
-                        getattr(config, "signals_by_profile", None) or {}
-                    ).items()
+                    for profil, satirlar in (getattr(config, "signals_by_profile", None) or {}).items()
                 },
             }
             # Atomic write: tmp + os.replace
@@ -505,10 +495,7 @@ class GatewayState:
                 return True
             if any(bool(v) for v in self._signals_by_profile.values()):
                 return True
-            profiller = {
-                (getattr(d, "signal_profile", None) or "").strip()
-                for d in self._devices
-            }
+            profiller = {(getattr(d, "signal_profile", None) or "").strip() for d in self._devices}
         # Yerlesik profiller de sayilir: backend katalogu tamamen bos olsa bile
         # bilinen modeller yoklanabilir, cycle erken cikmamali.
         return any(builtin_profile(p) for p in profiller if p)
@@ -581,9 +568,7 @@ class GatewayState:
                 "signal_count": len(self._signals),
                 "active": self._gateway_active,
                 "config_cache_age_sec": cache_age,
-                "config_cache_stale": (
-                    cache_age is not None and cache_age > self._cache_max_age_sec
-                ),
+                "config_cache_stale": (cache_age is not None and cache_age > self._cache_max_age_sec),
                 "config_cache_max_age_sec": self._cache_max_age_sec,
                 "last_refresh_error": self._last_refresh_error,
                 "seconds_since_last_refresh_ok": since_last_ok,

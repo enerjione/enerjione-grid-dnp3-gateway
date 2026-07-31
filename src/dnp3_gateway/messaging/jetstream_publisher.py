@@ -166,9 +166,7 @@ class JetStreamPublisher:
                 except Exception:  # noqa: BLE001
                     logger.debug("jetstream_loop_close_error", exc_info=True)
 
-        self._thread = threading.Thread(
-            target=_run, name=f"jetstream-{self.gateway_code}", daemon=True
-        )
+        self._thread = threading.Thread(target=_run, name=f"jetstream-{self.gateway_code}", daemon=True)
         self._thread.start()
 
         # Connect best-effort (block kisa sure, fail edince devam et).
@@ -353,8 +351,7 @@ class JetStreamPublisher:
             await asyncio.wait_for(self._nc.drain(), timeout=2.0)
         except asyncio.TimeoutError:
             logger.warning(
-                "jetstream_drain_timeout — broker drain 2sn icinde tamamlanmadi, "
-                "fallback close cagiriliyor"
+                "jetstream_drain_timeout — broker drain 2sn icinde tamamlanmadi, fallback close cagiriliyor"
             )
             try:
                 await self._nc.close()
@@ -398,9 +395,7 @@ class JetStreamPublisher:
         if not self._ready.is_set() or self._loop is None or self._js is None:
             with self._counter_lock:
                 self._publish_failures += 1
-            raise JetStreamNotReadyError(
-                "publisher not ready (NATS connection unavailable)"
-            )
+            raise JetStreamNotReadyError("publisher not ready (NATS connection unavailable)")
 
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         # JetStream dedup: Nats-Msg-Id ile broker tarafi 2dk pencerede ayni

@@ -109,12 +109,8 @@ def _migration_002_next_attempt_at(conn: sqlite3.Connection) -> None:
     """
     cols = {r[1] for r in conn.execute("PRAGMA table_info(outbox)").fetchall()}
     if "next_attempt_at" not in cols:
-        conn.execute(
-            "ALTER TABLE outbox ADD COLUMN next_attempt_at REAL NOT NULL DEFAULT 0"
-        )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS ix_outbox_next_attempt ON outbox(next_attempt_at, id)"
-    )
+        conn.execute("ALTER TABLE outbox ADD COLUMN next_attempt_at REAL NOT NULL DEFAULT 0")
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_outbox_next_attempt ON outbox(next_attempt_at, id)")
 
 
 _MIGRATIONS: list[Migration] = [
@@ -339,7 +335,9 @@ class Outbox:
         if removed:
             logger.info(
                 "outbox_dead_letter_pruned removed=%d retain_days=%.0f max_rows=%d",
-                removed, retain_days, max_rows,
+                removed,
+                retain_days,
+                max_rows,
             )
         return removed
 
@@ -348,9 +346,7 @@ class Outbox:
         ts = time.time() if now is None else now
         with self._lock:
             c = self._cached_connection()
-            (n,) = c.execute(
-                "SELECT COUNT(*) FROM outbox WHERE next_attempt_at <= ?", (ts,)
-            ).fetchone()
+            (n,) = c.execute("SELECT COUNT(*) FROM outbox WHERE next_attempt_at <= ?", (ts,)).fetchone()
             return int(n)
 
     def move_to_dead_letter(self, row_id: int, error: str) -> bool:
@@ -579,9 +575,7 @@ class OutboxRetrier:
                             err_str[:200],
                         )
                     continue
-                self._outbox.mark_retry(
-                    row["id"], err_str, retry_after_sec=self._row_retry_delay(next_retry)
-                )
+                self._outbox.mark_retry(row["id"], err_str, retry_after_sec=self._row_retry_delay(next_retry))
                 logger.debug(
                     "outbox_retry_deferred id=%s retry=%s/%s error=%s",
                     row["id"],

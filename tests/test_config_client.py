@@ -30,7 +30,7 @@ class _DummyRaw:
     def read(self, n: int = -1, decode_content: bool = False) -> bytes:
         _ = decode_content
         if n < 0:
-            chunk = self._body[self._offset:]
+            chunk = self._body[self._offset :]
             self._offset = len(self._body)
             return chunk
         chunk = self._body[self._offset : self._offset + n]

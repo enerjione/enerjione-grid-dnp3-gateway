@@ -150,8 +150,7 @@ class ResilientPublisher:
             self._outbox_full_since = None
             self._last_outbox_error = None
         logger.info(
-            "outbox_full_cleared pending=%d resume_threshold=%d limit=%d — "
-            "poller yeniden calisabilir",
+            "outbox_full_cleared pending=%d resume_threshold=%d limit=%d — poller yeniden calisabilir",
             pending,
             resume_at,
             limit,
@@ -182,9 +181,7 @@ class ResilientPublisher:
                 had_failures = self._consecutive_failures
                 self._consecutive_failures = 0
             if had_failures:
-                logger.info(
-                    "resilient_publisher_recovered after_failures=%s", had_failures
-                )
+                logger.info("resilient_publisher_recovered after_failures=%s", had_failures)
             # Basarili publish → outbox-full durumunu da temizlemeyi dene
             # (histerezis esigi saglanmissa gercekten kapanir).
             if self.outbox_full:

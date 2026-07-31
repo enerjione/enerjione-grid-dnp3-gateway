@@ -21,7 +21,10 @@ def main() -> None:
     health = f"http://{host}:{port}/health"
     cfg_url = f"{s.backend_api_url.rstrip('/')}/gateways/{s.gateway_code.strip()}/config"
     print(f"[run] GATEWAY_CODE={s.gateway_code.strip()}", flush=True)
-    print(f"[run] GATEWAY_MODE={s.gateway_mode.strip()}  APP_ENVIRONMENT={s.app_environment.strip()}", flush=True)
+    print(
+        f"[run] GATEWAY_MODE={s.gateway_mode.strip()}  APP_ENVIRONMENT={s.app_environment.strip()}",
+        flush=True,
+    )
     print(f"[run] Saglik (HTTP) .. {health}  (WORKER_HEALTH_PORT={port})", flush=True)
     print(
         f"[run] DNP3 (saha) .... varsayilan TCP .env DNP3_TCP_PORT={s.dnp3_tcp_port} "

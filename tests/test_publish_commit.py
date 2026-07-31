@@ -79,7 +79,7 @@ def test_commit_published_bayragi_temizler() -> None:
 def test_okuma_ile_onay_arasinda_gelen_deger_kaybolmaz() -> None:
     """REGRESYON (TOCTOU): eski kod bu senaryoda yeni degeri kalici kaybediyordu."""
     c = _DeviceCache()
-    c.set(_G, 1, 0.0)                       # kesici KAPALI
+    c.set(_G, 1, 0.0)  # kesici KAPALI
     raw, _s, _f, version = c.peek_if_dirty(_G, 1)
     assert raw == 0.0
 
@@ -216,12 +216,15 @@ def test_no_change_okumalar_yayinlanmaz_ve_onaylanmaz() -> None:
         committed=[],
     )
     pub = _OkPublisher()
-    assert poll_device(
-        gateway_code="GW-001",
-        device=_device(),
-        signals=[_signal("a", 1)],
-        reader=reader,
-        publisher=pub,
-    ) == 0
+    assert (
+        poll_device(
+            gateway_code="GW-001",
+            device=_device(),
+            signals=[_signal("a", 1)],
+            reader=reader,
+            publisher=pub,
+        )
+        == 0
+    )
     assert pub.batches == []
     assert reader.committed == []

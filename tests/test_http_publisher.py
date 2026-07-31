@@ -103,7 +103,7 @@ def test_http_publisher_batch_single_post() -> None:
 
     publisher.publish_batch(items)
 
-    assert session.last_json == [p1, p2, p3]     # tek POST, 3 payload
+    assert session.last_json == [p1, p2, p3]  # tek POST, 3 payload
     assert session.last_headers["X-Correlation-Id"] == "c1"
     # 3 basari sayilir
     assert publisher.counters_snapshot() == {"publish_failures": 0, "publish_successes": 3}

@@ -44,11 +44,11 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 # Serbest alan esikleri (byte).
-DISK_WARN_BYTES = 1024 * 1024 * 1024      # 1 GB  -> /health degraded
-DISK_CRITICAL_BYTES = 256 * 1024 * 1024   # 256 MB -> yeni yayin durdurulur
+DISK_WARN_BYTES = 1024 * 1024 * 1024  # 1 GB  -> /health degraded
+DISK_CRITICAL_BYTES = 256 * 1024 * 1024  # 256 MB -> yeni yayin durdurulur
 
 # Saat sapmasi esikleri (saniye).
-CLOCK_WARN_SKEW_SEC = 2.0     # /health degraded
+CLOCK_WARN_SKEW_SEC = 2.0  # /health degraded
 CLOCK_UNSAFE_SKEW_SEC = 30.0  # DNP3 zaman yazimi durdurulur
 
 
@@ -92,12 +92,11 @@ class DiskGuard:
                 logger.error(
                     "disk_space_critical path=%s free_mb=%.0f — yeni telemetri "
                     "diske yazilamayabilir; outbox/log/dead-letter temizligi GEREK",
-                    result["path"], free_mb,
+                    result["path"],
+                    free_mb,
                 )
             elif result["level"] == "low":
-                logger.warning(
-                    "disk_space_low path=%s free_mb=%.0f", result["path"], free_mb
-                )
+                logger.warning("disk_space_low path=%s free_mb=%.0f", result["path"], free_mb)
             elif result["level"] == "ok" and previous in ("low", "critical"):
                 logger.info("disk_space_recovered path=%s free_mb=%.0f", result["path"], free_mb)
         return result

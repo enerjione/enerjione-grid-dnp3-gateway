@@ -50,9 +50,7 @@ def _parse_trusted_proxies(raw: str) -> list[Any]:
         try:
             out.append(ipaddress.ip_network(s, strict=False))
         except ValueError:
-            logger.warning(
-                "health_trusted_proxies_parse_failed entry=%r — atlandi", s
-            )
+            logger.warning("health_trusted_proxies_parse_failed entry=%r — atlandi", s)
     return out
 
 
@@ -80,8 +78,8 @@ DEFAULT_REFRESH_DEGRADED_THRESHOLD_SEC = 150
 # Localhost (127.0.0.1, ::1) muaf — gateway ile ayni host'taki backend
 # proxy/cati paneli normal saglik probe'unu sinirsiz yapabilsin (kucuk-yuk
 # senaryo). Sınır yalnızca uzaktan gelen istekler icin.
-_HEALTH_RATE_LIMIT_PER_MIN = 120   # /health, /healthz, /info, /metrics
-_REFRESH_RATE_LIMIT_PER_MIN = 10   # POST /refresh-all
+_HEALTH_RATE_LIMIT_PER_MIN = 120  # /health, /healthz, /info, /metrics
+_REFRESH_RATE_LIMIT_PER_MIN = 10  # POST /refresh-all
 _RATE_LIMIT_WINDOW_SEC = 60.0
 
 _LOCALHOST_IPS: frozenset[str] = frozenset({"127.0.0.1", "::1", "localhost"})
@@ -465,9 +463,7 @@ def _make_handler(
 
             Bu trust model nginx/Caddy `real_ip` modulu mantigi ile aynidir.
             """
-            direct_ip = (
-                self.client_address[0] if self.client_address else ""
-            ).strip()
+            direct_ip = (self.client_address[0] if self.client_address else "").strip()
             if _trusted_networks and _ip_in_networks(direct_ip, _trusted_networks):
                 xff = self.headers.get("X-Forwarded-For", "").strip()
                 if xff:
@@ -475,9 +471,7 @@ def _make_handler(
                     return xff.split(",")[0].strip()
             return direct_ip
 
-        def _check_rate_limit(
-            self, limiter: _SlidingWindowRateLimiter | None, *, label: str
-        ) -> bool:
+        def _check_rate_limit(self, limiter: _SlidingWindowRateLimiter | None, *, label: str) -> bool:
             """Returns True if request allowed. Otherwise sends 429 + logs."""
             if limiter is None:
                 return True
@@ -620,17 +614,11 @@ def _make_handler(
                 return
             try:
                 ok, total = reader.refresh_all_devices()
-                logger.info(
-                    "manual_refresh_all_requested ok=%d total=%d", ok, total
-                )
-                self._respond_json(
-                    {"ok": True, "requested": ok, "total_devices": total}
-                )
+                logger.info("manual_refresh_all_requested ok=%d total=%d", ok, total)
+                self._respond_json({"ok": True, "requested": ok, "total_devices": total})
             except Exception as exc:  # noqa: BLE001
                 logger.exception("manual_refresh_all_failed")
-                self._respond_json(
-                    {"ok": False, "detail": str(exc)}, status_code=500
-                )
+                self._respond_json({"ok": False, "detail": str(exc)}, status_code=500)
 
         def _handle_operate(self) -> None:
             """POST /operate — tek cihaza DNP3 binary output (CROB) komutu.
@@ -663,16 +651,12 @@ def _make_handler(
                 length = 0
             # Komut body'si kucuk; buyuk payload'i reddet (DoS/hata onlemi).
             if length <= 0 or length > 4096:
-                self._respond_json(
-                    {"ok": False, "detail": "gecersiz veya bos body"}, status_code=400
-                )
+                self._respond_json({"ok": False, "detail": "gecersiz veya bos body"}, status_code=400)
                 return
             try:
                 payload = json.loads(self.rfile.read(length).decode("utf-8"))
             except (ValueError, UnicodeDecodeError):
-                self._respond_json(
-                    {"ok": False, "detail": "body JSON parse edilemedi"}, status_code=400
-                )
+                self._respond_json({"ok": False, "detail": "body JSON parse edilemedi"}, status_code=400)
                 return
             device_code = str(payload.get("device_code", "")).strip()
             if not device_code or "index" not in payload:
@@ -684,13 +668,9 @@ def _make_handler(
             try:
                 index = int(payload["index"])
             except (TypeError, ValueError):
-                self._respond_json(
-                    {"ok": False, "detail": "index tamsayi olmali"}, status_code=400
-                )
+                self._respond_json({"ok": False, "detail": "index tamsayi olmali"}, status_code=400)
                 return
-            device = next(
-                (d for d in state.devices() if d.code == device_code), None
-            )
+            device = next((d for d in state.devices() if d.code == device_code), None)
             if device is None:
                 self._respond_json(
                     {"ok": False, "detail": f"cihaz bulunamadi: {device_code}"},
@@ -733,7 +713,9 @@ def _make_handler(
                         logger.info(
                             "operate_duplicate_suppressed device=%s index=%s command_id=%s "
                             "— komut daha once gonderildi, CROB TEKRARLANMADI",
-                            device_code, index, ledger_key,
+                            device_code,
+                            index,
+                            ledger_key,
                         )
                         self._respond_json(
                             {
@@ -749,9 +731,9 @@ def _make_handler(
                     # Ledger erisilemezse komutu ENGELLEME (saha operasyonu
                     # durmasin) ama idempotency garantisi olmadigini logla.
                     logger.exception(
-                        "operate_ledger_unavailable device=%s command_id=%s — "
-                        "idempotency GARANTI EDILEMIYOR",
-                        device_code, ledger_key,
+                        "operate_ledger_unavailable device=%s command_id=%s — idempotency GARANTI EDILEMIYOR",
+                        device_code,
+                        ledger_key,
                     )
                     ledger_key = None
 
@@ -766,36 +748,48 @@ def _make_handler(
                     timeout_sec=float(payload.get("timeout_sec", 10.0)),
                 )
             except Exception as exc:  # noqa: BLE001
-                logger.exception(
-                    "operate_failed device=%s index=%s", device_code, index
-                )
+                logger.exception("operate_failed device=%s index=%s", device_code, index)
                 if ledger_key is not None:
-                    _ledger_record(ledger, ledger_key, {
-                        "id": ledger_key, "ok": False, "status": "error",
-                        "error": str(exc)[:400],
-                    })
-                self._respond_json(
-                    {"ok": False, "detail": str(exc)}, status_code=500
-                )
+                    _ledger_record(
+                        ledger,
+                        ledger_key,
+                        {
+                            "id": ledger_key,
+                            "ok": False,
+                            "status": "error",
+                            "error": str(exc)[:400],
+                        },
+                    )
+                self._respond_json({"ok": False, "detail": str(exc)}, status_code=500)
                 return
             ok = bool(result.get("ok"))
             if ledger_key is not None:
-                _ledger_record(ledger, ledger_key, {
-                    "id": ledger_key,
-                    "ok": ok,
-                    "status": str(result.get("status", "unknown")),
-                    "error": result.get("error"),
-                    "control": result.get("control"),
-                    "dnp3_status": result.get("dnp3_status"),
-                })
+                _ledger_record(
+                    ledger,
+                    ledger_key,
+                    {
+                        "id": ledger_key,
+                        "ok": ok,
+                        "status": str(result.get("status", "unknown")),
+                        "error": result.get("error"),
+                        "control": result.get("control"),
+                        "dnp3_status": result.get("dnp3_status"),
+                    },
+                )
             # Gonderilen CROB tipini de logla: olay sonrasi "hangi komut
             # gonderildi" sorusu eskiden log'dan cevaplanamiyordu.
             logger.info(
                 "operate_requested device=%s index=%s control=%s count=%s "
                 "on_time=%s off_time=%s command_id=%s ok=%s status=%s",
-                device_code, index, op_type, payload.get("count", 1),
-                payload.get("on_time_ms", 100), payload.get("off_time_ms", 100),
-                ledger_key, ok, result.get("status"),
+                device_code,
+                index,
+                op_type,
+                payload.get("count", 1),
+                payload.get("on_time_ms", 100),
+                payload.get("off_time_ms", 100),
+                ledger_key,
+                ok,
+                result.get("status"),
             )
             # Endpoint her zaman 200 doner; komut sonucu result.ok'ta. Cihaz
             # reddettiyse (unsupported/inactive/timeout) ok=False + status kalir,
@@ -1090,7 +1084,9 @@ def start_health_server(
                 if total > 0:
                     logger.debug(
                         "rate_limit_cleanup removed=%d (health=%d refresh=%d)",
-                        total, removed_h, removed_r,
+                        total,
+                        removed_h,
+                        removed_r,
                     )
             except Exception:  # noqa: BLE001
                 # Cleanup hatasi server'i durdurmamali

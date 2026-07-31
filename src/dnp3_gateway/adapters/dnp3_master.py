@@ -57,6 +57,7 @@ except Exception as _exc:  # noqa: BLE001
     _DNP3_AVAILABLE = False
     _DNP3_IMPORT_ERROR = _exc
 
+
 def _install_empty_frame_filter(master: Any) -> None:
     """Link-layer kontrol cercevelerini (ACK/NACK/RESET_LINK_ACK) transport'a beslemeden filtreler.
 
@@ -606,8 +607,7 @@ class Dnp3DeviceSession:
                 if ref is not None:
                     ref[0] = now
                 logger.info(
-                    "dnp3_event_baseline_refreshed device=%s cached_points=%s "
-                    "(direct range read)",
+                    "dnp3_event_baseline_refreshed device=%s cached_points=%s (direct range read)",
                     self.device.code,
                     absorbed,
                 )
@@ -691,9 +691,7 @@ class Dnp3DeviceSession:
             _OBJECT_GROUP_BINARY_OUTPUT: 3,
             _OBJECT_GROUP_ANALOG_OUTPUT: 4,
         }
-        ordered_groups = sorted(
-            by_group.keys(), key=lambda g: priority.get(g, 99)
-        )
+        ordered_groups = sorted(by_group.keys(), key=lambda g: priority.get(g, 99))
         for group in ordered_groups:
             if group == _OBJECT_GROUP_STRING:
                 continue
@@ -892,9 +890,7 @@ class Dnp3DeviceSession:
                 raise Dnp3AdapterError(f"counter index={index} yok")
             return float(p.value)
 
-        raise Dnp3AdapterError(
-            f"desteklenmeyen object_group={group} signal={signal.key}"
-        )
+        raise Dnp3AdapterError(f"desteklenmeyen object_group={group} signal={signal.key}")
 
     def _read_direct(self, master: Any, signal: SignalConfig) -> float:
         group = signal.dnp3_object_group
@@ -915,9 +911,7 @@ class Dnp3DeviceSession:
             elif group == _OBJECT_GROUP_COUNTER:
                 items = master.read_counters(index, index)
             else:
-                raise Dnp3AdapterError(
-                    f"desteklenmeyen object_group={group} signal={signal.key}"
-                )
+                raise Dnp3AdapterError(f"desteklenmeyen object_group={group} signal={signal.key}")
         except DNP3Error as exc:
             raise Dnp3AdapterError(str(exc)) from exc
 

@@ -150,9 +150,7 @@ def test_prod_rejects_change_me_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
     """`change-me...` prefix'i reddedilmeli."""
     monkeypatch.setenv("APP_ENVIRONMENT", "production")
     monkeypatch.setenv("GATEWAY_MODE", "dnp3")  # prod\'da mock yasak
-    monkeypatch.setenv(
-        "GATEWAY_TOKEN", "change-me-and-fill-with-real-token-32-chars-pls"
-    )
+    monkeypatch.setenv("GATEWAY_TOKEN", "change-me-and-fill-with-real-token-32-chars-pls")
     monkeypatch.setenv("BACKEND_API_URL", "https://api.enerjione.local/api/v1")
     monkeypatch.setenv("NATS_URL", "tls://nats.enerjione.local:4222")
     with pytest.raises(ValueError, match="placeholder"):

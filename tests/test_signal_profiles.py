@@ -34,7 +34,7 @@ from dnp3_gateway.state import GatewayState
 from .conftest import make_device, make_gateway_config, make_signal
 
 MODEL_A = "horstmann_sn_2_0"
-MODEL_B = "acme_rtu_9000"   # ayni protokol (DNP3), BASKA model
+MODEL_B = "acme_rtu_9000"  # ayni protokol (DNP3), BASKA model
 
 
 def _cihaz(code: str, profil: str) -> DeviceConfig:
@@ -224,8 +224,8 @@ def test_profil_sinyalleri_ayni_dogrulamadan_gecer():
                     "data_type": "analog",
                     "dnp3_object_group": 30,
                     "dnp3_index": 0,
-                    "scale": "Infinity",   # reddedilmeli
-                    "offset": "nan",       # reddedilmeli
+                    "scale": "Infinity",  # reddedilmeli
+                    "offset": "nan",  # reddedilmeli
                 }
             ]
         },
@@ -324,7 +324,7 @@ def test_yalnizca_profilde_sinyal_varsa_cycle_calisir():
     state.update(
         _config(
             devices=[_cihaz("DEV-A", MODEL_A)],
-            signals=[],                       # DUZ LISTE BOS
+            signals=[],  # DUZ LISTE BOS
             by_profile={MODEL_A: [a_sinyal]},
         )
     )
@@ -347,9 +347,7 @@ def test_yerlesik_horstmann_profili_yuklenir():
     sinyaller = builtin_profile(MODEL_A)
     assert len(sinyaller) == 193, f"beklenen 193, gelen {len(sinyaller)}"
     anahtarlar = {s.key for s in sinyaller}
-    assert "master.actual_current" in anahtarlar or any(
-        a.startswith("master.") for a in anahtarlar
-    )
+    assert "master.actual_current" in anahtarlar or any(a.startswith("master.") for a in anahtarlar)
 
 
 def test_bilinmeyen_model_yerlesik_profili_yok():
@@ -394,7 +392,7 @@ def test_backend_bos_gonderirse_yerlesik_devreye_girer():
         _config(
             devices=[_cihaz("DEV-A", MODEL_A)],
             signals=[make_signal("baska.model.sinyali")],
-            by_profile={MODEL_A: []},          # backend: "bu model icin sinyal yok"
+            by_profile={MODEL_A: []},  # backend: "bu model icin sinyal yok"
         )
     )
     secilen = state.signals_for(_cihaz("DEV-A", MODEL_A))
@@ -420,7 +418,5 @@ def test_bos_profil_ve_yerlesik_yoksa_yine_bos():
 def test_yalnizca_yerlesik_varsa_cycle_calisir():
     """Backend katalogu tamamen bos olsa bile bilinen model yoklanmali."""
     state = GatewayState()
-    state.update(
-        _config(devices=[_cihaz("DEV-A", MODEL_A)], signals=[], by_profile={MODEL_A: []})
-    )
+    state.update(_config(devices=[_cihaz("DEV-A", MODEL_A)], signals=[], by_profile={MODEL_A: []}))
     assert state.has_any_signals() is True

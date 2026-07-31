@@ -72,7 +72,7 @@ def test_filter_readable_signals_drops_commands_only() -> None:
         make_signal("b", data_type="binary"),
         make_signal("c", data_type="counter"),
         make_signal("d", data_type="binary_output"),  # KOMUT — dahil edilmez
-        make_signal("e", data_type="string"),         # Group 110 — dahil edilir
+        make_signal("e", data_type="string"),  # Group 110 — dahil edilir
         make_signal("f", data_type="analog_output"),  # analog setpoint okuma — dahil
     ]
     keys = [s.key for s in filter_readable_signals(signals)]
@@ -150,9 +150,9 @@ def test_poll_device_uses_batch_when_supported() -> None:
         publisher=publisher,
     )
     assert published == 3
-    assert len(publisher.batches) == 1          # tek batch cagrisi
-    assert len(publisher.batches[0]) == 3       # 3 item icinde
-    assert not publisher.single_calls           # tekli publish'e dusmedi
+    assert len(publisher.batches) == 1  # tek batch cagrisi
+    assert len(publisher.batches[0]) == 3  # 3 item icinde
+    assert not publisher.single_calls  # tekli publish'e dusmedi
     # Her item beklenen alanlari icermeli
     for item in publisher.batches[0]:
         assert set(item) >= {"payload", "message_id", "correlation_id", "headers"}
@@ -246,9 +246,11 @@ def test_run_poll_cycle_publishes_for_due_devices() -> None:
     state = GatewayState()
     state.update(make_gateway_config(devices=[device], signals=[signal]))
 
-    reader = _StubReader([
-        SignalReading(signal.key, signal.source, signal.data_type, 1.0, 1.0, "good"),
-    ])
+    reader = _StubReader(
+        [
+            SignalReading(signal.key, signal.source, signal.data_type, 1.0, 1.0, "good"),
+        ]
+    )
     publisher = _StubPublisher()
 
     published = run_poll_cycle(

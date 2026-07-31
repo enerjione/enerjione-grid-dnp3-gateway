@@ -110,9 +110,7 @@ DEFAULT_CYCLE_TIMEOUT_SEC: float = 120.0
 # gostergesi icin string tipi de tasinir; numeric value=0 olur, gercek metin
 # (varsa) `value_string` alaninda iletilir. binary_output komut kanali oldugu
 # icin yayindan haric kalir (master->outstation komut yonu).
-READABLE_DATA_TYPES = frozenset(
-    {"analog", "binary", "counter", "analog_output", "string"}
-)
+READABLE_DATA_TYPES = frozenset({"analog", "binary", "counter", "analog_output", "string"})
 
 
 def build_telemetry_payload(
@@ -250,7 +248,9 @@ def poll_device(
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "poll_device_publish_failed gateway=%s device=%s error=%s",
-                gateway_code, device.code, exc,
+                gateway_code,
+                device.code,
+                exc,
             )
             _bump(metrics, "inc_publish_error")
     _commit_published(reader=reader, device=device, readings=published)
@@ -351,6 +351,7 @@ def run_poll_cycle(
             onbellekli = filter_readable_signals(state.signals_for(dev))
             _profil_onbellek[anahtar] = onbellekli
         return onbellekli
+
     # Cycle basinda silinen cihazlarin acik master/channel'larini kapat.
     # Bu olmazsa zombie master'lar yeni cihazlarla TCP/DNP3 link layer
     # catismasina yol acar (ornek: ayni IP'de iki cihaz, biri silindiginde
@@ -445,6 +446,7 @@ def run_poll_cycle(
     # overhead'i yok. Pool capacity yetmezse yeniden create eder.
     pool = _get_or_create_pool(max_workers=workers)
     import time as _time
+
     # Her future'un baslama zamanini sakla → per-device timeout kontrolu
     submit_time = _time.monotonic()
     futures: dict = {}
@@ -488,9 +490,7 @@ def run_poll_cycle(
         # 2sn'lik quantum'lar: stop_event'i sik kontrol eder, ama yine de
         # done future'lari hemen topla
         quantum = min(2.0, max(0.1, remaining))
-        new_done, pending = wait(
-            pending, timeout=quantum, return_when=FIRST_COMPLETED
-        )
+        new_done, pending = wait(pending, timeout=quantum, return_when=FIRST_COMPLETED)
         done.update(new_done)
         # Per-device timeout: device_timeout_sec'i asan future'lari iptal
         # et + mark_read uygula. Pool worker'i hemen serbest kalmaz (cancel

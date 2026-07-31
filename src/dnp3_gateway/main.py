@@ -100,11 +100,16 @@ def _execute_pending_commands(reader, state: GatewayState, pending) -> list[dict
         if device is None:
             logger.warning(
                 "pending_command_device_not_found id=%s device=%s",
-                cmd.id, cmd.device_code,
+                cmd.id,
+                cmd.device_code,
             )
             results.append(
-                {"id": cmd.id, "ok": False, "status": "device_not_found",
-                 "error": f"cihaz config'te yok: {cmd.device_code}"}
+                {
+                    "id": cmd.id,
+                    "ok": False,
+                    "status": "device_not_found",
+                    "error": f"cihaz config'te yok: {cmd.device_code}",
+                }
             )
             continue
         try:
@@ -120,8 +125,14 @@ def _execute_pending_commands(reader, state: GatewayState, pending) -> list[dict
             logger.info(
                 "pending_command_executed id=%s device=%s index=%s control=%s ok=%s "
                 "status=%s dnp3_status=%s dnp3_state=%s",
-                cmd.id, cmd.device_code, cmd.dnp3_index, res.get("control"),
-                ok, res.get("status"), res.get("dnp3_status"), res.get("dnp3_state"),
+                cmd.id,
+                cmd.device_code,
+                cmd.dnp3_index,
+                res.get("control"),
+                ok,
+                res.get("status"),
+                res.get("dnp3_status"),
+                res.get("dnp3_state"),
             )
             results.append(
                 {
@@ -138,12 +149,8 @@ def _execute_pending_commands(reader, state: GatewayState, pending) -> list[dict
                 }
             )
         except Exception as exc:  # noqa: BLE001
-            logger.exception(
-                "pending_command_failed id=%s device=%s", cmd.id, cmd.device_code
-            )
-            results.append(
-                {"id": cmd.id, "ok": False, "status": "error", "error": str(exc)[:400]}
-            )
+            logger.exception("pending_command_failed id=%s device=%s", cmd.id, cmd.device_code)
+            results.append({"id": cmd.id, "ok": False, "status": "error", "error": str(exc)[:400]})
     return results
 
 
@@ -181,7 +188,8 @@ def _run_command_poll(
             if consecutive_errors:
                 logger.info(
                     "command_poll_recovered gateway=%s after_errors=%d",
-                    client.gateway_code, consecutive_errors,
+                    client.gateway_code,
+                    consecutive_errors,
                 )
                 consecutive_errors = 0
 
@@ -215,7 +223,9 @@ def _run_command_poll(
                 # Uzun sureli kesintide ~1dk'da bir hatirlatma (tamamen susmasin).
                 logger.warning(
                     "command_poll_error gateway=%s suruyor (%d ardisik) error=%s",
-                    client.gateway_code, consecutive_errors, exc,
+                    client.gateway_code,
+                    consecutive_errors,
+                    exc,
                 )
         except Exception:  # noqa: BLE001
             consecutive_errors += 1
@@ -239,7 +249,8 @@ def _deliver_ledger_results(client: BackendConfigClient, ledger) -> None:
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "command_result_delivery_failed count=%d error=%s — sonraki turda tekrar",
-            len(pending_results), exc,
+            len(pending_results),
+            exc,
         )
         return
     for res in pending_results:
@@ -760,11 +771,7 @@ def run(current_settings: Settings | None = None) -> int:
     # Toplu drenaj yolu: broker publish_batch destekliyorsa (HTTP ingest)
     # retrier 200 mesaji TEK POST + TEK DELETE transaction'i ile bosaltir.
     # Bu, birikmis outbox'in drenaj hizini onlarca kat artirir.
-    _batch_drain = (
-        publisher.publish_outbox_rows
-        if callable(getattr(broker, "publish_batch", None))
-        else None
-    )
+    _batch_drain = publisher.publish_outbox_rows if callable(getattr(broker, "publish_batch", None)) else None
     retrier = OutboxRetrier(
         outbox,
         publish_fn=publisher.publish_outbox_row,
@@ -880,7 +887,9 @@ def run(current_settings: Settings | None = None) -> int:
         liveness.register("command-poll", command_thread)
         logger.info(
             "command_poll_started gateway=%s poll_sec=%d (config_refresh_sec=%d)",
-            identity.gateway_code, cfg.command_poll_sec, cfg.config_refresh_sec,
+            identity.gateway_code,
+            cfg.command_poll_sec,
+            cfg.config_refresh_sec,
         )
 
     _install_signal_handlers(stop_event)
@@ -917,9 +926,7 @@ def run(current_settings: Settings | None = None) -> int:
                     and hasattr(reader, "refresh_all_devices")
                 ):
                     ok, total = reader.refresh_all_devices()  # type: ignore[attr-defined]
-                    logger.info(
-                        "manual_refresh_all_triggered ok=%d total=%d", ok, total
-                    )
+                    logger.info("manual_refresh_all_triggered ok=%d total=%d", ok, total)
             except Exception:  # noqa: BLE001
                 logger.exception("manual_refresh_all_dispatch_failed")
 
@@ -1012,8 +1019,7 @@ def run(current_settings: Settings | None = None) -> int:
                 refresh_thread.join(timeout=5.0)
                 if refresh_thread.is_alive():
                     logger.warning(
-                        "refresh_thread_join_timeout — thread 5s icinde sonlanmadi, "
-                        "shutdown'a devam ediliyor"
+                        "refresh_thread_join_timeout — thread 5s icinde sonlanmadi, shutdown'a devam ediliyor"
                     )
         except Exception:  # noqa: BLE001
             logger.debug("refresh_thread_join_error", exc_info=True)

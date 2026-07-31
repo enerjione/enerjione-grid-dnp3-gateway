@@ -50,15 +50,15 @@ _G = 30
 @pytest.mark.parametrize(
     ("flags", "beklenen"),
     [
-        (0x01, "good"),          # ONLINE
-        (None, "good"),          # bayrak yok -> geriye uyum
-        (0x00, "invalid"),       # ONLINE YOK -> deger gecersiz
-        (0x03, "restart"),       # ONLINE|RESTART
-        (0x05, "comm_lost"),     # ONLINE|COMM_LOST
-        (0x11, "forced"),        # ONLINE|LOCAL_FORCED
-        (0x09, "forced"),        # ONLINE|REMOTE_FORCED
-        (0x21, "invalid"),       # ONLINE|OVER_RANGE
-        (0x41, "invalid"),       # ONLINE|REFERENCE_ERR
+        (0x01, "good"),  # ONLINE
+        (None, "good"),  # bayrak yok -> geriye uyum
+        (0x00, "invalid"),  # ONLINE YOK -> deger gecersiz
+        (0x03, "restart"),  # ONLINE|RESTART
+        (0x05, "comm_lost"),  # ONLINE|COMM_LOST
+        (0x11, "forced"),  # ONLINE|LOCAL_FORCED
+        (0x09, "forced"),  # ONLINE|REMOTE_FORCED
+        (0x21, "invalid"),  # ONLINE|OVER_RANGE
+        (0x41, "invalid"),  # ONLINE|REFERENCE_ERR
     ],
 )
 def test_kalite_bayragi_eslemesi(flags: int | None, beklenen: str) -> None:
@@ -101,8 +101,8 @@ def test_double_bit_donusumu() -> None:
         def __init__(self, v: int) -> None:
             self.value = v
 
-    assert _double_bit_to_float(_E(0)) == 0.0   # INTERMEDIATE
-    assert _double_bit_to_float(_E(2)) == 2.0   # DETERMINED_ON
+    assert _double_bit_to_float(_E(0)) == 0.0  # INTERMEDIATE
+    assert _double_bit_to_float(_E(2)) == 2.0  # DETERMINED_ON
     assert _double_bit_to_float("bozuk") == 0.0
 
 
@@ -129,8 +129,12 @@ def test_baglanti_imzasi_ip_degisince_farklidir() -> None:
     yeni_ip = DeviceConfig(code="D1", name="d", ip_address="10.20.5.19", dnp3_address=4)
     yeni_addr = DeviceConfig(code="D1", name="d", ip_address="10.20.5.11", dnp3_address=7)
     yeni_mod = DeviceConfig(
-        code="D1", name="d", ip_address="10.20.5.11", dnp3_address=4,
-        ip_endpoint_type="initiating", master_ip_port=20100,
+        code="D1",
+        name="d",
+        ip_address="10.20.5.11",
+        dnp3_address=4,
+        ip_endpoint_type="initiating",
+        master_ip_port=20100,
     )
 
     assert fp(r, eski) == fp(r, eski)
@@ -200,12 +204,10 @@ def test_dead_letter_prune(tmp_path: Path) -> None:
     ob = Outbox(tmp_path / "o.db")
     try:
         for i in range(5):
-            rid = ob.enqueue(
-                message_id=f"m{i}", correlation_id=None, headers=None, payload={"v": i}
-            )
+            rid = ob.enqueue(message_id=f"m{i}", correlation_id=None, headers=None, payload={"v": i})
             ob.move_to_dead_letter(rid, "kalici hata")
         assert ob.dead_letter_count() == 5
-        assert ob.prune_dead_letter(retain_days=30) == 0        # hepsi taze
+        assert ob.prune_dead_letter(retain_days=30) == 0  # hepsi taze
         # Windows'ta time.time() cozunurlugu ~15.6ms; satirlar ayni tick'e
         # dusebiliyor. Kisa bir bekleme ile cutoff'un TUM satirlardan sonra
         # oldugundan emin oluyoruz (testi zamanlamaya duyarsiz kilar).
@@ -220,9 +222,7 @@ def test_dead_letter_adet_siniri(tmp_path: Path) -> None:
     ob = Outbox(tmp_path / "o.db")
     try:
         for i in range(20):
-            rid = ob.enqueue(
-                message_id=f"m{i}", correlation_id=None, headers=None, payload={"v": i}
-            )
+            rid = ob.enqueue(message_id=f"m{i}", correlation_id=None, headers=None, payload={"v": i})
             ob.move_to_dead_letter(rid, "hata")
         # max_rows alt siniri 1000; 20 satir icin silme olmamali
         assert ob.prune_dead_letter(retain_days=30, max_rows=5) == 0
@@ -246,14 +246,14 @@ def test_disk_guard_olcum_yapar(tmp_path: Path) -> None:
 
 def test_disk_guard_olmayan_yol_patlamaz(tmp_path: Path) -> None:
     g = DiskGuard(tmp_path / "yok" / "boyle" / "bir" / "yol")
-    snap = g.check()          # exception ATMAMALI
+    snap = g.check()  # exception ATMAMALI
     assert "level" in snap
 
 
 def test_clock_guard_sapma_hesaplar() -> None:
     g = ClockGuard()
     assert g.snapshot()["skew_sec"] is None
-    assert g.is_safe_for_time_sync is True   # olcum yoksa eski davranis
+    assert g.is_safe_for_time_sync is True  # olcum yoksa eski davranis
 
     from datetime import datetime, timedelta, timezone
     from email.utils import format_datetime
@@ -264,9 +264,7 @@ def test_clock_guard_sapma_hesaplar() -> None:
     snap = g.snapshot()
     assert snap["skew_sec"] is not None
     assert snap["skew_sec"] > 250
-    assert g.is_safe_for_time_sync is False, (
-        "buyuk sapmada yanlis saati 300 cihaza YAZMAMALIYIZ"
-    )
+    assert g.is_safe_for_time_sync is False, "buyuk sapmada yanlis saati 300 cihaza YAZMAMALIYIZ"
 
 
 def test_clock_guard_kucuk_sapma_guvenli() -> None:

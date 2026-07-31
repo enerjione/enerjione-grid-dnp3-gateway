@@ -232,9 +232,7 @@ def test_outbox_v1_dosyasi_v2ye_yukseltilir(tmp_path: Path) -> None:
         );
         """
     )
-    conn.execute(
-        "INSERT INTO outbox (message_id, payload, enqueued_at) VALUES ('m1', '{}', 1.0)"
-    )
+    conn.execute("INSERT INTO outbox (message_id, payload, enqueued_at) VALUES ('m1', '{}', 1.0)")
     conn.execute("PRAGMA user_version = 1")
     conn.commit()
     conn.close()

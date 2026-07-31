@@ -137,6 +137,7 @@ def map_dnp3_quality(flags: int | None) -> str:
         return "forced"
     return "good"
 
+
 # Recovery doğrulama suresi: OnOpen / stale-edge sonrasi cihazdan fresh frame
 # beklemek icin maksimum sure. Bu surede frame gelmezse cihaz tekrar "lost"
 # kabul edilir ve SCADA "comm_lost" gormeye devam eder. 15 sn:
@@ -288,9 +289,7 @@ class _DeviceCache:
 
     # ---- Atomik okuma / yayin onayi ------------------------------------------
 
-    def peek_if_dirty(
-        self, group: int, index: int
-    ) -> tuple[float, str | None, int | None, int] | None:
+    def peek_if_dirty(self, group: int, index: int) -> tuple[float, str | None, int | None, int] | None:
         """Degismisse (deger, metin, surum) doner; DEGISTIRMEZ.
 
         TEK lock altinda calisir. Eski kod ayni is icin lock'u UC KEZ aliyordu
@@ -489,33 +488,41 @@ def _make_soe_handler(cache: _DeviceCache, device_code: str) -> Any:
                 if isinstance(first, opendnp3.Binary):
                     for it in values:
                         cache.set(
-                            _OBJECT_GROUP_BINARY_INPUT, it.index,
+                            _OBJECT_GROUP_BINARY_INPUT,
+                            it.index,
                             1.0 if it.value.value else 0.0,
                             flags=_extract_flags(it.value),
                         )
                 elif isinstance(first, opendnp3.Analog):
                     for it in values:
                         cache.set(
-                            _OBJECT_GROUP_ANALOG_INPUT, it.index, float(it.value.value),
+                            _OBJECT_GROUP_ANALOG_INPUT,
+                            it.index,
+                            float(it.value.value),
                             flags=_extract_flags(it.value),
                         )
                 elif isinstance(first, opendnp3.Counter):
                     for it in values:
                         cache.set(
-                            _OBJECT_GROUP_COUNTER, it.index, float(it.value.value),
+                            _OBJECT_GROUP_COUNTER,
+                            it.index,
+                            float(it.value.value),
                             flags=_extract_flags(it.value),
                         )
                 elif isinstance(first, opendnp3.BinaryOutputStatus):
                     for it in values:
                         cache.set(
-                            _OBJECT_GROUP_BINARY_OUTPUT, it.index,
+                            _OBJECT_GROUP_BINARY_OUTPUT,
+                            it.index,
                             1.0 if it.value.value else 0.0,
                             flags=_extract_flags(it.value),
                         )
                 elif isinstance(first, opendnp3.AnalogOutputStatus):
                     for it in values:
                         cache.set(
-                            _OBJECT_GROUP_ANALOG_OUTPUT, it.index, float(it.value.value),
+                            _OBJECT_GROUP_ANALOG_OUTPUT,
+                            it.index,
+                            float(it.value.value),
                             flags=_extract_flags(it.value),
                         )
                 elif _DOUBLE_BIT_CLS is not None and isinstance(first, _DOUBLE_BIT_CLS):
@@ -527,14 +534,17 @@ def _make_soe_handler(cache: _DeviceCache, device_code: str) -> Any:
                     # logdan anlayamiyordu.
                     for it in values:
                         cache.set(
-                            _OBJECT_GROUP_DOUBLE_BIT_BINARY, it.index,
+                            _OBJECT_GROUP_DOUBLE_BIT_BINARY,
+                            it.index,
                             _double_bit_to_float(it.value.value),
                             flags=_extract_flags(it.value),
                         )
                 elif _FROZEN_COUNTER_CLS is not None and isinstance(first, _FROZEN_COUNTER_CLS):
                     for it in values:
                         cache.set(
-                            _OBJECT_GROUP_FROZEN_COUNTER, it.index, float(it.value.value),
+                            _OBJECT_GROUP_FROZEN_COUNTER,
+                            it.index,
+                            float(it.value.value),
                             flags=_extract_flags(it.value),
                         )
                 elif isinstance(first, opendnp3.OctetString):
@@ -547,7 +557,9 @@ def _make_soe_handler(cache: _DeviceCache, device_code: str) -> Any:
                         text = raw.rstrip(b"\x00").decode("utf-8", errors="replace") or None
                         logger.debug(
                             "yadnp3_g110_string device=%s index=%s text=%r",
-                            device_code, it.index, text,
+                            device_code,
+                            it.index,
+                            text,
                         )
                         cache.set(_OBJECT_GROUP_STRING, it.index, 0.0, value_string=text)
             except Exception as exc:  # noqa: BLE001
@@ -612,8 +624,7 @@ def _report_iin(cache: _DeviceCache, device_code: str, iin: Any) -> None:
         )
     if cache.note_iin("need_time", need_time) and need_time:
         logger.info(
-            "dnp3_need_time device=%s — cihaz saat yazilmasini bekliyor "
-            "(DNP3_TIME_SYNC ayarina bakin)",
+            "dnp3_need_time device=%s — cihaz saat yazilmasini bekliyor (DNP3_TIME_SYNC ayarina bakin)",
             device_code,
         )
 
@@ -676,9 +687,7 @@ def _make_master_app(cache: _DeviceCache, device_code: str) -> Any:
                     if not guard.is_safe_for_time_sync:
                         # Gecersiz zaman dondurmek yerine mevcut saati veriyoruz;
                         # asil koruma _apply_time_sync'in kapatilmasidir (asagida).
-                        logger.debug(
-                            "yadnp3_time_write_skipped device=%s (saat sapmasi)", device_code
-                        )
+                        logger.debug("yadnp3_time_write_skipped device=%s (saat sapmasi)", device_code)
                 except Exception:  # noqa: BLE001
                     pass
             return opendnp3.DNPTime(int(time.time() * 1000))
@@ -780,9 +789,7 @@ class _ManagedMaster:
         self._apply_time_sync(cfg, time_sync)
         cfg.link.LocalAddr = int(local_address)
         cfg.link.RemoteAddr = int(device.dnp3_address)
-        self._master = self._channel.AddMaster(
-            f"m_{device.code}", self._soe, self._app, cfg
-        )
+        self._master = self._channel.AddMaster(f"m_{device.code}", self._soe, self._app, cfg)
         # Saf event-driven mimari:
         #   1) BAGLANTI ANINDA: AssignClassDuringStartup=True ile OpenDNP3
         #      otomatik integrity poll (Class 0+1+2+3 hepsi) tetikler. Tum
@@ -861,9 +868,7 @@ class _ManagedMaster:
             if value is not None:
                 cfg.master.timeSyncMode = value
                 return
-        logger.warning(
-            "yadnp3_time_sync_enum_not_found mode=%s — saat senkronizasyonu kapali", want
-        )
+        logger.warning("yadnp3_time_sync_enum_not_found mode=%s — saat senkronizasyonu kapali", want)
 
     def _g110_gvid(self):
         """GroupVariationID(110, 0) — surum farki icin iki isim dener."""
@@ -899,12 +904,17 @@ class _ManagedMaster:
                 ok = True
                 logger.debug(
                     "yadnp3_g110_scan_queued device=%s range=%s-%s",
-                    self.device.code, start, stop,
+                    self.device.code,
+                    start,
+                    stop,
                 )
             except Exception:  # noqa: BLE001
                 logger.warning(
                     "yadnp3_g110_scan_once_failed device=%s range=%s-%s",
-                    self.device.code, start, stop, exc_info=True,
+                    self.device.code,
+                    start,
+                    stop,
+                    exc_info=True,
                 )
         return ok
 
@@ -1005,7 +1015,9 @@ class _ManagedMaster:
         if state != "online":
             logger.warning(
                 "yadnp3_operate_skipped_offline device=%s index=%s state=%s — komut GONDERILMEDI",
-                self.device.code, index, state,
+                self.device.code,
+                index,
+                state,
             )
             return {
                 "ok": False,
@@ -1026,12 +1038,21 @@ class _ManagedMaster:
         except Exception as exc:  # noqa: BLE001
             try:
                 crob = opendnp3.ControlRelayOutputBlock(
-                    opt, opendnp3.TripCloseCode.NUL, False,
-                    int(count), int(on_time_ms), int(off_time_ms),
+                    opt,
+                    opendnp3.TripCloseCode.NUL,
+                    False,
+                    int(count),
+                    int(on_time_ms),
+                    int(off_time_ms),
                 )
             except Exception:  # noqa: BLE001
                 logger.exception("yadnp3_crob_build_failed")
-                return {"ok": False, "status": "error", "error": f"CROB olusturulamadi: {exc}", "control": op_type}
+                return {
+                    "ok": False,
+                    "status": "error",
+                    "error": f"CROB olusturulamadi: {exc}",
+                    "control": op_type,
+                }
 
         mode_l = (mode or "direct").lower()
         if mode_l not in ("direct", "sbo"):
@@ -1065,11 +1086,13 @@ class _ManagedMaster:
                 for pr in plist:
                     st = getattr(pr, "status", None)
                     stt = getattr(pr, "state", None)
-                    points.append({
-                        "index": getattr(pr, "index", None),
-                        "status": str(st),
-                        "state": str(stt),
-                    })
+                    points.append(
+                        {
+                            "index": getattr(pr, "index", None),
+                            "status": str(st),
+                            "state": str(stt),
+                        }
+                    )
                     if first_status is None:
                         first_status = st
                         first_state = stt
@@ -1101,15 +1124,19 @@ class _ManagedMaster:
         except Exception as exc:  # noqa: BLE001
             logger.exception(
                 "yadnp3_operate_failed device=%s index=%s mode=%s",
-                self.device.code, index, mode_l,
+                self.device.code,
+                index,
+                mode_l,
             )
             return {"ok": False, "status": "error", "error": str(exc), "control": op_type, "mode": mode_l}
 
         if not done.wait(timeout=timeout_sec):
             return {
-                "ok": False, "status": "timeout",
+                "ok": False,
+                "status": "timeout",
                 "error": f"{timeout_sec}s icinde komut cevabi yok",
-                "control": op_type, "mode": mode_l,
+                "control": op_type,
+                "mode": mode_l,
             }
 
         ok = holder.get("status") == "ok"
@@ -1133,8 +1160,7 @@ class Yadnp3TelemetryReader(TelemetryReader):
     ) -> None:
         if not _YADNP3_AVAILABLE:
             raise Yadnp3AdapterError(
-                "yadnp3 (opendnp3) yuklu degil. Wheel kurulu olmali. "
-                f"Import error: {_YADNP3_IMPORT_ERROR}"
+                f"yadnp3 (opendnp3) yuklu degil. Wheel kurulu olmali. Import error: {_YADNP3_IMPORT_ERROR}"
             )
         self._local_address = int(local_address)
         self._default_dnp3_tcp_port = int(default_dnp3_tcp_port)
@@ -1237,9 +1263,7 @@ class Yadnp3TelemetryReader(TelemetryReader):
                 try:
                     existing.shutdown()
                 except Exception:  # noqa: BLE001
-                    logger.debug(
-                        "yadnp3_master_shutdown_error device=%s", device.code, exc_info=True
-                    )
+                    logger.debug("yadnp3_master_shutdown_error device=%s", device.code, exc_info=True)
                 self._masters.pop(device.code, None)
 
             port = self._resolve_tcp_port(device, self._default_dnp3_tcp_port)
@@ -1395,8 +1419,7 @@ class Yadnp3TelemetryReader(TelemetryReader):
                 pass
             redirty_count = cache.mark_all_dirty()
             logger.info(
-                "yadnp3_device_recovered device=%s ip=%s redirty=%d "
-                "(fresh frame ile dogrulandi)",
+                "yadnp3_device_recovered device=%s ip=%s redirty=%d (fresh frame ile dogrulandi)",
                 device.code,
                 device.ip_address,
                 redirty_count,
@@ -1556,10 +1579,18 @@ class Yadnp3TelemetryReader(TelemetryReader):
             "dnp3_command_result device=%s outstation=%s object=12 variation=1 "
             "index=%s control=%s mode=%s ok=%s status=%s dnp3_task=%s dnp3_status=%s "
             "dnp3_state=%s duration_ms=%s error=%s",
-            device.code, device.dnp3_address, index,
-            out.get("control"), out.get("mode"), out.get("ok"), out.get("status"),
-            out.get("dnp3_task"), out.get("dnp3_status"),
-            out.get("dnp3_state"), elapsed_ms, out.get("error"),
+            device.code,
+            device.dnp3_address,
+            index,
+            out.get("control"),
+            out.get("mode"),
+            out.get("ok"),
+            out.get("status"),
+            out.get("dnp3_task"),
+            out.get("dnp3_status"),
+            out.get("dnp3_state"),
+            elapsed_ms,
+            out.get("error"),
         )
         return out
 

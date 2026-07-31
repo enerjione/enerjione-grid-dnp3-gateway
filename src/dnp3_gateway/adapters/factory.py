@@ -96,8 +96,7 @@ def build_adapter(settings: Settings) -> TelemetryReader:
         from dnp3_gateway.adapters.dnp3_master import Dnp3TelemetryReader
 
         logger.warning(
-            "adapter_selected mode=dnp3 library=dnp3py (LEGACY, Group 110 yok). "
-            "Onerilen: DNP3_LIBRARY=yadnp3"
+            "adapter_selected mode=dnp3 library=dnp3py (LEGACY, Group 110 yok). Onerilen: DNP3_LIBRARY=yadnp3"
         )
         return Dnp3TelemetryReader(
             local_address=settings.dnp3_local_address,
@@ -114,6 +113,4 @@ def build_adapter(settings: Settings) -> TelemetryReader:
             log_raw_frames=settings.dnp3_log_raw_frames,
         )
 
-    raise ValueError(
-        f"desteklenmeyen DNP3_LIBRARY={settings.dnp3_library!r} (yadnp3 | dnp3py)"
-    )
+    raise ValueError(f"desteklenmeyen DNP3_LIBRARY={settings.dnp3_library!r} (yadnp3 | dnp3py)")

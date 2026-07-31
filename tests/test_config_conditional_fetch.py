@@ -141,7 +141,7 @@ def test_304_hata_sayilmaz():
 
 
 def test_degisince_tam_payload_iner_ve_onbellek_tazelenir():
-    """"Degisirse yine oku" tarafi."""
+    """ "Degisirse yine oku" tarafi."""
     oturum = _Oturum(
         [
             _Yanit(200, _PAYLOAD_V1, etag='"surum-1"'),
@@ -196,9 +196,7 @@ def test_bozuk_payload_etagi_saklanmaz():
 
     # Onbellek hala SAGLAM surumu tutuyor olmali
     ucuncu = istemci.fetch_config()
-    assert oturum.istek_headerlari[2].get("If-None-Match") == '"surum-1"', (
-        "bozuk payload'in etag'i saklanmis"
-    )
+    assert oturum.istek_headerlari[2].get("If-None-Match") == '"surum-1"', "bozuk payload'in etag'i saklanmis"
     assert ucuncu.config_version == "surum-1"
 
 

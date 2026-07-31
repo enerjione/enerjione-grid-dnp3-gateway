@@ -120,9 +120,7 @@ class _JsonFormatter(logging.Formatter):
         for key, value in record.__dict__.items():
             if key.startswith("ctx_"):
                 payload[key[4:]] = (
-                    _scrub_amqp_passwords(_scrub_message(value))
-                    if isinstance(value, str)
-                    else value
+                    _scrub_amqp_passwords(_scrub_message(value)) if isinstance(value, str) else value
                 )
         return json.dumps(payload, ensure_ascii=False)
 

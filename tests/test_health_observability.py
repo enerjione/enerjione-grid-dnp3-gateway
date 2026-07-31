@@ -103,9 +103,7 @@ def _body(**kwargs: Any) -> tuple[dict[str, Any], int]:
 
 def test_tum_cihazlar_comm_lost_ise_unhealthy() -> None:
     """REGRESYON: 300 cihazin tamami kopukken /health "ok" + HTTP 200 donuyordu."""
-    reader = _FakeReader(
-        {f"DEV-{i}": {"state": "lost", "last_frame_epoch": None} for i in (1, 2, 3)}
-    )
+    reader = _FakeReader({f"DEV-{i}": {"state": "lost", "last_frame_epoch": None} for i in (1, 2, 3)})
     m = GatewayMetrics()
     m.record_cycle(devices=3, published=0)
     body, code = _body(reader=reader, metrics=m)
@@ -134,9 +132,7 @@ def test_cogunluk_kopuksa_degraded() -> None:
 
 def test_hepsi_online_ise_ok() -> None:
     now = time.time()
-    reader = _FakeReader(
-        {f"DEV-{i}": {"state": "online", "last_frame_epoch": now} for i in (1, 2, 3)}
-    )
+    reader = _FakeReader({f"DEV-{i}": {"state": "online", "last_frame_epoch": now} for i in (1, 2, 3)})
     m = GatewayMetrics()
     m.record_cycle(devices=3, published=5)
     body, code = _body(reader=reader, metrics=m)
@@ -257,9 +253,17 @@ def test_poller_metrikleri_gercekten_besler() -> None:
         device=DeviceConfig(code="D1", name="d", ip_address="10.0.0.1"),
         signals=[
             SignalConfig(
-                key="a", label="a", unit=None, source="master", dnp3_class="Class 1",
-                data_type="analog", dnp3_object_group=30, dnp3_index=1,
-                scale=1.0, offset=0.0, supports_alarm=False,
+                key="a",
+                label="a",
+                unit=None,
+                source="master",
+                dnp3_class="Class 1",
+                data_type="analog",
+                dnp3_object_group=30,
+                dnp3_index=1,
+                scale=1.0,
+                offset=0.0,
+                supports_alarm=False,
             )
         ],
         reader=_BrokenReader(),

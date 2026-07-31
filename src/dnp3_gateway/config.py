@@ -593,8 +593,7 @@ class Settings(BaseSettings):
         ge=1,
         le=100,
         description=(
-            "Kac eski log dosyasi tutulsun (rotation sonrasi). 10 x 20MB = 200MB "
-            "instance basina ust sinir."
+            "Kac eski log dosyasi tutulsun (rotation sonrasi). 10 x 20MB = 200MB instance basina ust sinir."
         ),
     )
 
@@ -615,9 +614,7 @@ class Settings(BaseSettings):
         valid = {"http", "nats"}
         s = (v or "http").strip().lower()
         if s not in valid:
-            raise ValueError(
-                f"TELEMETRY_PUBLISHER gecersiz: '{v}'. Gecerli: {sorted(valid)}"
-            )
+            raise ValueError(f"TELEMETRY_PUBLISHER gecersiz: '{v}'. Gecerli: {sorted(valid)}")
         return s
 
     @field_validator("dnp3_read_strategy")
@@ -626,9 +623,7 @@ class Settings(BaseSettings):
         valid = {"event_driven", "direct", "class0", "integrity"}
         s = (v or "").strip().lower()
         if s not in valid:
-            raise ValueError(
-                f"DNP3_READ_STRATEGY gecersiz: '{v}'. Gecerli: {sorted(valid)}"
-            )
+            raise ValueError(f"DNP3_READ_STRATEGY gecersiz: '{v}'. Gecerli: {sorted(valid)}")
         return s
 
     @field_validator("dnp3_library")
@@ -637,9 +632,7 @@ class Settings(BaseSettings):
         valid = {"yadnp3", "dnp3py"}
         s = (v or "").strip().lower()
         if s not in valid:
-            raise ValueError(
-                f"DNP3_LIBRARY gecersiz: '{v}'. Gecerli: {sorted(valid)}"
-            )
+            raise ValueError(f"DNP3_LIBRARY gecersiz: '{v}'. Gecerli: {sorted(valid)}")
         return s
 
     @field_validator("gateway_mode")
@@ -648,9 +641,7 @@ class Settings(BaseSettings):
         valid = {"mock", "dnp3"}
         s = (v or "").strip().lower()
         if s not in valid:
-            raise ValueError(
-                f"GATEWAY_MODE gecersiz: '{v}'. Gecerli: {sorted(valid)}"
-            )
+            raise ValueError(f"GATEWAY_MODE gecersiz: '{v}'. Gecerli: {sorted(valid)}")
         return s
 
     @field_validator("log_format")
@@ -659,9 +650,7 @@ class Settings(BaseSettings):
         valid = {"text", "json"}
         s = (v or "").strip().lower()
         if s not in valid:
-            raise ValueError(
-                f"LOG_FORMAT gecersiz: '{v}'. Gecerli: {sorted(valid)}"
-            )
+            raise ValueError(f"LOG_FORMAT gecersiz: '{v}'. Gecerli: {sorted(valid)}")
         return s
 
     @field_validator("log_level")
@@ -670,9 +659,7 @@ class Settings(BaseSettings):
         valid = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
         s = (v or "INFO").strip().upper()
         if s not in valid:
-            raise ValueError(
-                f"LOG_LEVEL gecersiz: '{v}'. Gecerli: {sorted(valid)}"
-            )
+            raise ValueError(f"LOG_LEVEL gecersiz: '{v}'. Gecerli: {sorted(valid)}")
         return s
 
     @field_validator("backend_api_url")
@@ -685,9 +672,7 @@ class Settings(BaseSettings):
         except Exception as exc:  # noqa: BLE001
             raise ValueError(f"BACKEND_API_URL parse edilemedi: {exc}") from exc
         if parsed.scheme not in ("http", "https"):
-            raise ValueError(
-                f"BACKEND_API_URL scheme http/https olmali (gelen: '{parsed.scheme}')"
-            )
+            raise ValueError(f"BACKEND_API_URL scheme http/https olmali (gelen: '{parsed.scheme}')")
         if not parsed.netloc:
             raise ValueError(f"BACKEND_API_URL hostname icermiyor: '{v}'")
         return v.strip()
@@ -869,23 +854,19 @@ class Settings(BaseSettings):
                         "guncelleyin. Placeholder prefix listesi: "
                         f"{', '.join(_PLACEHOLDER_TOKEN_PREFIXES[:6])}..."
                     )
-                if self.gateway_refresh_token and _is_placeholder_token(
-                    self.gateway_refresh_token
-                ):
+                if self.gateway_refresh_token and _is_placeholder_token(self.gateway_refresh_token):
                     raise ValueError(
                         "GUVENLIK: APP_ENVIRONMENT=production'da GATEWAY_REFRESH_TOKEN "
                         "placeholder degerle baslayamaz. /refresh-all endpoint'i "
                         "kullanilacaksa yuksek-entropy yeni bir token uretin "
-                        "(`python -c \"import secrets;print(secrets.token_urlsafe(32))\"`)."
+                        '(`python -c "import secrets;print(secrets.token_urlsafe(32))"`).'
                     )
-                if self.gateway_command_token and _is_placeholder_token(
-                    self.gateway_command_token
-                ):
+                if self.gateway_command_token and _is_placeholder_token(self.gateway_command_token):
                     raise ValueError(
                         "GUVENLIK: APP_ENVIRONMENT=production'da GATEWAY_COMMAND_TOKEN "
                         "placeholder degerle baslayamaz. /operate endpoint'i "
                         "kullanilacaksa yuksek-entropy yeni bir token uretin "
-                        "(`python -c \"import secrets;print(secrets.token_urlsafe(32))\"`)."
+                        '(`python -c "import secrets;print(secrets.token_urlsafe(32))"`).'
                     )
                 # CR-3: RabbitMQ telemetri akisindan kaldirildi (0.4.x cutover).
                 # Eski .env'den `RABBITMQ_URL=amqp://...` gelirse production'da

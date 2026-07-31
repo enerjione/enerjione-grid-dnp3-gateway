@@ -63,9 +63,7 @@ def acquire_instance_lock(*, state_dir: str, gateway_code: str) -> IO[bytes]:
     try:
         base.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
-        raise SystemExit(
-            f"GATEWAY_STATE_DIR olusturulamadi: {base!s} hata={exc}"
-        ) from exc
+        raise SystemExit(f"GATEWAY_STATE_DIR olusturulamadi: {base!s} hata={exc}") from exc
 
     safe_code = re.sub(r"[^\w-]+", "_", gateway_code.strip())[:50] or "gw"
     lock_path = base / f"instance_{safe_code}.lock"
@@ -76,9 +74,7 @@ def acquire_instance_lock(*, state_dir: str, gateway_code: str) -> IO[bytes]:
         fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
         fh = os.fdopen(fd, "r+b")
     except OSError as exc:
-        raise SystemExit(
-            f"Lock dosyasi acilamadi: {lock_path!s} hata={exc}"
-        ) from exc
+        raise SystemExit(f"Lock dosyasi acilamadi: {lock_path!s} hata={exc}") from exc
 
     locked = _try_lock_exclusive(fh)
     if not locked:
@@ -104,9 +100,7 @@ def _info_path(lock_path: Path) -> Path:
 def _write_lock_holder(lock_path: Path) -> None:
     """Kilidi tutan prosesin pid'ini yan dosyaya yazar (yalniz teshis amacli)."""
     try:
-        _info_path(lock_path).write_text(
-            f"pid={os.getpid()}\n", encoding="utf-8"
-        )
+        _info_path(lock_path).write_text(f"pid={os.getpid()}\n", encoding="utf-8")
     except OSError:
         # Lock zaten alindi; metadata yazilamasa da calismaya devam.
         pass

@@ -174,8 +174,8 @@ def test_ertelenen_satir_suresi_dolunca_yeniden_denenir(tmp_path: Path) -> None:
 
         r = OutboxRetrier(ob, publish, max_retries=100, min_backoff_sec=10.0, max_backoff_sec=10.0)
         r._drain_batch(ob.fetch_batch(10))
-        assert ob.ready_count() == 0                       # ertelendi
-        assert ob.ready_count(now=time.time() + 60) == 1   # sure dolunca hazir
+        assert ob.ready_count() == 0  # ertelendi
+        assert ob.ready_count(now=time.time() + 60) == 1  # sure dolunca hazir
     finally:
         ob.close()
 
@@ -278,9 +278,7 @@ def test_dongu_hatasi_thread_i_oldurmez(tmp_path: Path) -> None:
             calls["n"] += 1
             raise RuntimeError("beklenmedik")
 
-        r = OutboxRetrier(
-            ob, publish, poll_interval_sec=0.5, min_backoff_sec=0.1, max_backoff_sec=0.1
-        )
+        r = OutboxRetrier(ob, publish, poll_interval_sec=0.5, min_backoff_sec=0.1, max_backoff_sec=0.1)
         r.start()
         try:
             deadline = time.time() + 5
