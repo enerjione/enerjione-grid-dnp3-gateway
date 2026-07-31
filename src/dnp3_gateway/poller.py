@@ -331,9 +331,26 @@ def run_poll_cycle(
     """
     if not state.is_active():
         return 0
-    signals = filter_readable_signals(state.signals())
-    if not signals:
+    # Sinyal seti artik CIHAZ BASINA secilir (profil/model bazli). Tek bir
+    # global liste tum cihazlara uygulanirsa, ayni (object_group, index) cifti
+    # iki DNP3 modelinde farkli buyuklugu gosterdigi icin okunan deger YANLIS
+    # `signal_key` ile yayinlanir — sessiz ve tehlikeli bir hata.
+    if not state.has_any_signals():
         return 0
+
+    # Ayni profilin filtresi cycle icinde BIR KEZ hesaplanir: 600 cihazda her
+    # cihaz icin 193 sinyali yeniden filtrelemek gereksiz is olurdu. Ayrica
+    # `signals_for` profil bulunamadiginda uyari basar; onbellek sayesinde bu
+    # uyari cihaz basina degil profil basina bir kez cikar.
+    _profil_onbellek: dict[str, list[SignalConfig]] = {}
+
+    def _cihaz_sinyalleri(dev: DeviceConfig) -> list[SignalConfig]:
+        anahtar = (getattr(dev, "signal_profile", None) or "").strip()
+        onbellekli = _profil_onbellek.get(anahtar)
+        if onbellekli is None:
+            onbellekli = filter_readable_signals(state.signals_for(dev))
+            _profil_onbellek[anahtar] = onbellekli
+        return onbellekli
     # Cycle basinda silinen cihazlarin acik master/channel'larini kapat.
     # Bu olmazsa zombie master'lar yeni cihazlarla TCP/DNP3 link layer
     # catismasina yol acar (ornek: ayni IP'de iki cihaz, biri silindiginde
@@ -403,7 +420,7 @@ def run_poll_cycle(
                 count = poll_device(
                     gateway_code=gateway_code,
                     device=device,
-                    signals=signals,
+                    signals=_cihaz_sinyalleri(device),
                     reader=reader,
                     publisher=publisher,
                     metrics=metrics,
@@ -437,7 +454,10 @@ def run_poll_cycle(
             poll_device,
             gateway_code=gateway_code,
             device=device,
-            signals=signals,
+            # Onbellek ana thread'de doldurulur (submit dongusu burada kosuyor),
+            # worker thread'e hazir liste gider — paylasilan dict'e worker'lar
+            # yazmaz, yaris durumu yok.
+            signals=_cihaz_sinyalleri(device),
             reader=reader,
             publisher=publisher,
             metrics=metrics,

@@ -58,6 +58,9 @@ class GatewayState:
         self._lock = Lock()
         self._devices: list[DeviceConfig] = []
         self._signals: list[SignalConfig] = []
+        # Profil (cihaz modeli) bazli sinyal setleri. Bos sozluk = backend bu
+        # alani gondermiyor (eski surum) -> duz `_signals` kullanilir.
+        self._signals_by_profile: dict[str, list[SignalConfig]] = {}
         self._last_read_at: dict[str, float] = {}
         self._config_version: str = ""
         self._gateway_active: bool = False
@@ -111,6 +114,12 @@ class GatewayState:
             changed = config.config_version != self._config_version
             self._devices = list(config.devices)
             self._signals = list(config.signals)
+            self._signals_by_profile = {
+                profil: list(satirlar)
+                for profil, satirlar in (
+                    getattr(config, "signals_by_profile", None) or {}
+                ).items()
+            }
             self._gateway_active = config.is_active
             self._gateway_name = config.gateway_name
             known = {device.code for device in self._devices}
@@ -273,6 +282,25 @@ class GatewayState:
                 SignalConfig(**{k: v for k, v in s.items() if k in SignalConfig.__dataclass_fields__})
                 for s in data.get("signals", [])
             ]
+            # Profil setleri (eski cache dosyasinda alan YOK -> bos sozluk ve
+            # duz listeye dusulur; davranis bugunkuyle ayni kalir).
+            signals_by_profile: dict[str, list[SignalConfig]] = {}
+            raw_profiles = data.get("signals_by_profile")
+            if isinstance(raw_profiles, dict):
+                for profil, ham in raw_profiles.items():
+                    if not isinstance(ham, list):
+                        continue
+                    signals_by_profile[str(profil)] = [
+                        SignalConfig(
+                            **{
+                                k: v
+                                for k, v in s.items()
+                                if k in SignalConfig.__dataclass_fields__
+                            }
+                        )
+                        for s in ham
+                        if isinstance(s, dict)
+                    ]
         except (OSError, ValueError, TypeError) as exc:
             logger.warning("config_cache_load_failed path=%s error=%s", self._cache_path, exc)
             return False
@@ -299,6 +327,7 @@ class GatewayState:
         with self._lock:
             self._devices = devices
             self._signals = signals
+            self._signals_by_profile = signals_by_profile
             self._gateway_active = bool(data.get("is_active", True))
             self._gateway_name = str(data.get("gateway_name") or "")
             self._config_version = str(data.get("config_version") or "")
@@ -346,6 +375,17 @@ class GatewayState:
                 "refresh_nonce": self._refresh_nonce,
                 "devices": [asdict(d) for d in config.devices],
                 "signals": [asdict(s) for s in config.signals],
+                # Profil setleri de persist edilir. Yazilmasaydi, backend
+                # erisilemezken yeniden baslayan bir gateway profilleri
+                # kaybeder ve TUM cihazlari duz listeyle yoklardi — yani
+                # cok modelli bir sahada tam olarak B3'un onledigi sessiz
+                # yanlis veri, hem de en kotu anda (backend yokken).
+                "signals_by_profile": {
+                    profil: [asdict(s) for s in satirlar]
+                    for profil, satirlar in (
+                        getattr(config, "signals_by_profile", None) or {}
+                    ).items()
+                },
             }
             # Atomic write: tmp + os.replace
             fd, tmp_path = tempfile.mkstemp(
@@ -375,8 +415,61 @@ class GatewayState:
             return list(self._devices)
 
     def signals(self) -> list[SignalConfig]:
+        """DUZ sinyal listesi.
+
+        DIKKAT: cihaz yoklarken bunu KULLANMA — `signals_for(device)` kullan.
+        Tum cihazlara ayni seti uygulamak yalnizca tek modelli kurulumda
+        dogrudur. Bu erisimci saglik/teshis ve geriye uyum icin duruyor.
+        """
         with self._lock:
             return list(self._signals)
+
+    def signals_for(self, device: DeviceConfig) -> list[SignalConfig]:
+        """Bu CIHAZIN modeline ait sinyal seti.
+
+        NEDEN CIHAZ BASINA: ayni (object_group, index) cifti iki DNP3 modelinde
+        FARKLI buyuklugu gosterir. Tek liste tum cihazlara uygulanirsa okunan
+        deger YANLIS `signal_key` ile yayinlanir. Hata sessizdir: telemetri
+        akar, deger makul gorunur, ama esik alarmi baska bir buyuklugun
+        uzerinden calisir.
+
+        Oncelik:
+          1. Cihazin profiline ait set (backend `signals_by_profile`)
+             — BOS LISTE DE GECERLI BIR CEVAPTIR: backend "bu model icin sinyal
+               tanimli degil" diyor. Duz listeye dusmek, KOMSU modelin
+               adreslerini yoklamak olurdu.
+          2. Profil hic bildirilmemisse duz liste (eski backend / tek model).
+        """
+        with self._lock:
+            if not self._signals_by_profile:
+                # Backend profil gondermiyor (eski surum) -> bugunku davranis.
+                return list(self._signals)
+            profil = (getattr(device, "signal_profile", None) or "").strip()
+            if profil in self._signals_by_profile:
+                return list(self._signals_by_profile[profil])
+            # Profil bildirilmis ama BU cihazin anahtari sozlukte yok. Backend
+            # her cihazin profilini yazar; buraya dusmek surum uyumsuzlugu ya
+            # da bozuk profil ayristirmasi demektir. Duz liste en az kotu
+            # secenek: cihaz karanliga dusmez, tek modelli kurulumda da zaten
+            # dogru sonuc verir.
+            logger.warning(
+                "signals_profile_missing device=%s profil=%r — duz listeye dusuldu",
+                getattr(device, "code", "?"),
+                profil,
+            )
+            return list(self._signals)
+
+    def has_any_signals(self) -> bool:
+        """Herhangi bir sinyal tanimli mi (duz liste ya da HERHANGI bir profil)?
+
+        Poll cycle'inin "yapacak is yok" erken cikisi icin. Yalnizca duz listeye
+        bakmak YETMEZ: profil bazli config'te duz liste bos birakilabilir ve
+        cycle hicbir cihazi yoklamadan donerdi.
+        """
+        with self._lock:
+            if self._signals:
+                return True
+            return any(bool(v) for v in self._signals_by_profile.values())
 
     def is_active(self) -> bool:
         with self._lock:

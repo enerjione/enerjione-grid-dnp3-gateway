@@ -143,7 +143,19 @@ class GatewayConfig:
     is_active: bool
     config_version: str
     devices: list[DeviceConfig] = field(default_factory=list)
+    # DUZ liste — profil bilgisi olmayan/eski backend'ler icin. Tum cihazlara
+    # ayni set uygulanir; bu yalnizca TEK modelli kurulumda dogrudur.
     signals: list[SignalConfig] = field(default_factory=list)
+    # PROFIL (cihaz modeli) bazli setler: {profil_anahtari: [sinyaller]}.
+    #
+    # NEDEN: duz liste tek modelli kurulumda dogru calisir ama ikinci bir DNP3
+    # modeli eklendigi anda bozulur — ayni (object_group, index) cifti iki
+    # modelde FARKLI buyuklugu gosterir. Set ayrilmazsa okunan deger YANLIS
+    # `signal_key` ile yayinlanir; hata sessizdir, esik alarmi baska bir
+    # buyuklugun uzerinden calisir.
+    #
+    # Bos sozluk = eski backend (alan yok) -> duz listeye dusulur.
+    signals_by_profile: dict[str, list[SignalConfig]] = field(default_factory=dict)
     # Operator "tum cihazlara sorgu at" sayaci. Bir oncekiyle karsilastirilarak
     # integrity poll tetiklemesi yapilir; kalici state.py icinde tutulur.
     refresh_nonce: int = 0
@@ -157,6 +169,77 @@ class GatewayConfig:
 
 class GatewayConfigError(RuntimeError):
     """Backend API config endpoint'inden gecerli bir yanit alinamadi."""
+
+
+def _parse_signal_list(
+    signals_raw: Any, *, alan: str = "signals"
+) -> list[SignalConfig]:
+    """Ham sinyal listesini dogrulayarak SignalConfig listesine cevirir.
+
+    Hem duz `signals` hem `signals_by_profile` degerleri BURADAN gecer.
+    Ayri bir kopya yazilsaydi profil listesi sessizce daha zayif
+    dogrulanirdi: scale/offset icin inf/nan reddi, DNP3 grup/index clamp'i
+    ve alan kirpma yalnizca duz listeye uygulanmis olurdu.
+    """
+    if not isinstance(signals_raw, list):
+        raise GatewayConfigError(
+            f"config response {alan!r} list olmali "
+            f"(gelen tip: {type(signals_raw).__name__})"
+        )
+    if len(signals_raw) > _MAX_SIGNALS_HARD_LIMIT:
+        logger.error(
+            "config_signals_overflow alan=%s received=%d hard_limit=%d — fazlasi yok sayilacak.",
+            alan,
+            len(signals_raw),
+            _MAX_SIGNALS_HARD_LIMIT,
+        )
+        signals_raw = signals_raw[:_MAX_SIGNALS_HARD_LIMIT]
+
+    signals: list[SignalConfig] = []
+    for item in signals_raw:
+        if not isinstance(item, dict) or not item.get("key"):
+            continue
+        try:
+            # scale / offset: inf/nan reddet — JetStream consumer'a sizar ve
+            # json.dumps `Infinity` cikarir (allow_nan=True default), bazi
+            # tag-engine parser'lari bunu reject eder veya sessizce drop eder.
+            raw_scale = item.get("scale")
+            raw_offset = item.get("offset")
+            scale_val = _safe_finite_float(raw_scale, 1.0)
+            offset_val = _safe_finite_float(raw_offset, 0.0)
+            # _safe_finite_float "inf"/"nan"/parse hatasinda default'a duser.
+            # Default'a indirilen anlamli bir degerse log atalim (saldiri /
+            # backend bozulmasi sinyali).
+            if raw_scale not in (None, "", 1.0, "1.0") and scale_val == 1.0:
+                logger.warning(
+                    "config_signal_scale_invalid key=%r received=%r -> default 1.0",
+                    item.get("key"),
+                    raw_scale,
+                )
+            signals.append(
+                SignalConfig(
+                    key=_truncate(item["key"], _MAX_CODE_LENGTH),
+                    label=_truncate(item.get("label") or item["key"], _MAX_LABEL_LENGTH),
+                    unit=(_truncate(item["unit"], _MAX_UNIT_LENGTH) if item.get("unit") else None),
+                    source=_truncate(item.get("source") or "master", _MAX_CODE_LENGTH),
+                    dnp3_class=_truncate(item.get("dnp3_class") or "Class 1", _MAX_CODE_LENGTH),
+                    data_type=_truncate(item.get("data_type") or "analog", _MAX_CODE_LENGTH),
+                    # DNP3 grup ID'leri standartta 1-120; saglik icin 0-255 clamp.
+                    dnp3_object_group=_safe_int(item.get("dnp3_object_group"), 30, lo=0, hi=255),
+                    # DNP3 index 16-bit (0-65535).
+                    dnp3_index=_safe_int(item.get("dnp3_index"), 0, lo=0, hi=65535),
+                    scale=scale_val,
+                    offset=offset_val,
+                    supports_alarm=bool(item.get("supports_alarm", False)),
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            logger.warning(
+                "config_signal_parse_failed key=%r error=%s — sinyal atlandi",
+                item.get("key"),
+                exc,
+            )
+    return signals
 
 
 def _parse_optional_dnp3_tcp_port(item: dict[str, Any]) -> int | None:
@@ -849,63 +932,38 @@ def _parse_gateway_config(
             rejected_ips,
         )
 
-    signals_raw = data.get("signals") or []
-    if not isinstance(signals_raw, list):
-        raise GatewayConfigError(
-            f"config response 'signals' list olmali (gelen tip: {type(signals_raw).__name__})"
-        )
-    if len(signals_raw) > _MAX_SIGNALS_HARD_LIMIT:
-        logger.error(
-            "config_signals_overflow received=%d hard_limit=%d — fazlasi yok sayilacak.",
-            len(signals_raw),
-            _MAX_SIGNALS_HARD_LIMIT,
-        )
-        signals_raw = signals_raw[:_MAX_SIGNALS_HARD_LIMIT]
+    signals = _parse_signal_list(data.get("signals") or [], alan="signals")
 
-    signals: list[SignalConfig] = []
-    for item in signals_raw:
-        if not isinstance(item, dict) or not item.get("key"):
-            continue
-        try:
-            # scale / offset: inf/nan reddet — JetStream consumer'a sizar ve
-            # json.dumps `Infinity` cikarir (allow_nan=True default), bazi
-            # tag-engine parser'lari bunu reject eder veya sessizce drop eder.
-            raw_scale = item.get("scale")
-            raw_offset = item.get("offset")
-            scale_val = _safe_finite_float(raw_scale, 1.0)
-            offset_val = _safe_finite_float(raw_offset, 0.0)
-            # _safe_finite_float "inf"/"nan"/parse hatasinda default'a duser.
-            # Default'a indirilen anlamli bir degerse log atalim (saldiri /
-            # backend bozulmasi sinyali).
-            if raw_scale not in (None, "", 1.0, "1.0") and scale_val == 1.0:
+    # Profil bazli setler (opsiyonel; eski backend'de alan YOK -> bos sozluk ve
+    # duz listeye dusulur). Bozuk bir profil TUM config'i dusurmez: o profil
+    # atlanir, digerleri yasar — cihazlarin tamaminin karanliga dusmesindense
+    # bir modelin duz listeye dusmesi yeglenir.
+    signals_by_profile: dict[str, list[SignalConfig]] = {}
+    raw_profiles = data.get("signals_by_profile")
+    if isinstance(raw_profiles, dict):
+        for profil, ham in raw_profiles.items():
+            anahtar = _truncate(str(profil), _MAX_CODE_LENGTH)
+            if not anahtar:
+                continue
+            try:
+                # BOS LISTE DE KABUL EDILIR ve saklanir. Backend "bu model icin
+                # sinyal tanimli degil" demek icin bilerek bos gonderir; burada
+                # atlarsak cihaz duz listeye duser ve KOMSU modelin adreslerini
+                # yoklar — B3'un onlemek istedigi sessiz yanlis veri.
+                signals_by_profile[anahtar] = _parse_signal_list(
+                    ham or [], alan=f"signals_by_profile[{anahtar}]"
+                )
+            except GatewayConfigError as exc:
                 logger.warning(
-                    "config_signal_scale_invalid key=%r received=%r -> default 1.0",
-                    item.get("key"),
-                    raw_scale,
+                    "config_profile_parse_failed profil=%r error=%s — profil atlandi",
+                    anahtar,
+                    exc,
                 )
-            signals.append(
-                SignalConfig(
-                    key=_truncate(item["key"], _MAX_CODE_LENGTH),
-                    label=_truncate(item.get("label") or item["key"], _MAX_LABEL_LENGTH),
-                    unit=(_truncate(item["unit"], _MAX_UNIT_LENGTH) if item.get("unit") else None),
-                    source=_truncate(item.get("source") or "master", _MAX_CODE_LENGTH),
-                    dnp3_class=_truncate(item.get("dnp3_class") or "Class 1", _MAX_CODE_LENGTH),
-                    data_type=_truncate(item.get("data_type") or "analog", _MAX_CODE_LENGTH),
-                    # DNP3 grup ID'leri standartta 1-120; saglik icin 0-255 clamp.
-                    dnp3_object_group=_safe_int(item.get("dnp3_object_group"), 30, lo=0, hi=255),
-                    # DNP3 index 16-bit (0-65535).
-                    dnp3_index=_safe_int(item.get("dnp3_index"), 0, lo=0, hi=65535),
-                    scale=scale_val,
-                    offset=offset_val,
-                    supports_alarm=bool(item.get("supports_alarm", False)),
-                )
-            )
-        except (TypeError, ValueError) as exc:
-            logger.warning(
-                "config_signal_parse_failed key=%r error=%s — sinyal atlandi",
-                item.get("key"),
-                exc,
-            )
+    elif raw_profiles is not None:
+        logger.warning(
+            "config_signals_by_profile_invalid tip=%s — yok sayildi",
+            type(raw_profiles).__name__,
+        )
 
     try:
         refresh_nonce = int(data.get("refresh_nonce", 0) or 0)
@@ -954,6 +1012,7 @@ def _parse_gateway_config(
         config_version=str(data.get("config_version") or ""),
         devices=devices,
         signals=signals,
+        signals_by_profile=signals_by_profile,
         refresh_nonce=refresh_nonce,
         config_nonce=config_nonce,
         pending_commands=tuple(pending_commands),
