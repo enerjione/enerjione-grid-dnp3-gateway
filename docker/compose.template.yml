@@ -8,7 +8,7 @@
 #   {{BACKEND_API_URL}} — backend public URL (orn. https://api.enerjione.local/api/v1)
 #   {{NATS_URL}}        — JetStream URL (orn. nats://enerjione-nats:4222)
 #   {{HOST_HEALTH_PORT}}— host tarafinda exposed port (her instance icin farkli)
-#   {{IMAGE}}           — docker image tag (orn. ghcr.io/fikretsafak/enerjionegrid-dnp3-gateway:0.4.6)
+#   {{IMAGE}}           — docker image tag (orn. ghcr.io/enerjione/enerjione-grid-dnp3-gateway:0.4.6)
 #   {{APP_ENVIRONMENT}} — production | staging | development
 #
 # Uretilen dosya tek basina calisir: `docker compose -f gw-001.yml up -d`.

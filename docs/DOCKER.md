@@ -45,30 +45,40 @@ Her container:
 Image GitHub Container Registry'de yayinlanir:
 
 ```
-ghcr.io/fikretsafak/enerjionegrid-dnp3-gateway:latest    # her main push'unda taze
-ghcr.io/fikretsafak/enerjionegrid-dnp3-gateway:0.4.6     # surume kilitli (ONERILEN)
+ghcr.io/enerjione/enerjione-grid-dnp3-gateway:0.4.6     # surume kilitli (URETIM)
+ghcr.io/enerjione/enerjione-grid-dnp3-gateway:main      # main'in son hali (DENEME)
 ```
 
-Production deploy'larda **semver tag** kullanin (`:0.4.6`); `:latest` rollback
-yapamaz. CI workflow (`.github/workflows/release-image.yml`):
+Production deploy'larda **semver tag** kullanin (`:0.4.6`). Etiket politikasi
+(`.github/workflows/release-image.yml`):
 
-| Trigger             | Etiketler                          |
-|---------------------|------------------------------------|
-| `main` push         | `:latest`, `:sha-<short>`         |
-| `git tag v0.4.6`    | `:0.4.6`, `:0.4`, `:latest`       |
+| Trigger             | Etiketler                        | Kullanim          |
+|---------------------|----------------------------------|-------------------|
+| `main` push         | `:main`, `:sha-<short>`          | deneme / CI       |
+| `git tag v0.4.6`    | `:0.4.6`, `:0.4`, `:latest`      | **uretim**        |
 
-Multi-arch: `linux/amd64` + `linux/arm64`. yadnp3 (OpenDNP3 native) ile
-derlenir, Group 110 string sinyaller dahil tam DNP3 destegi.
+> **`:latest` artik main push'unda GUNCELLENMEZ.** Eskiden her main commit'i
+> `:latest`'i eziyordu ve test kapisi da yoktu; `docker compose pull` yapan
+> operator test edilmemis bir imaji uretime aliyordu. Artik `:latest` yalnizca
+> bilincli bir surum tag'iyle olusur ve her surumun kendi semver etiketi
+> bulundugu icin rollback mumkundur.
+
+Hicbir imaj testler gecmeden yayinlanmaz: `release-image.yml` icindeki
+`needs: ci` adimi `ruff` + `pytest` (Linux ve Windows) kapisini calistirir.
+
+Mimari: `linux/amd64`. yadnp3 (OpenDNP3 native) ile derlenir, Group 110 string
+sinyaller dahil tam DNP3 destegi. (arm64 yok — yadnp3 PyPI'de arm64 wheel
+saglamiyor.)
 
 ### Kaynaktan build (gelistirme)
 
 ```bash
-git clone https://github.com/fikretsafak/EnerjiOneGrid-DNP3-Gateway.git
-cd EnerjiOneGrid-DNP3-Gateway
+git clone https://github.com/enerjione/enerjione-grid-dnp3-gateway.git
+cd enerjione-grid-dnp3-gateway
 
 docker build \
     --build-arg DNP3_LIBRARY=yadnp3 \
-    -t ghcr.io/fikretsafak/enerjionegrid-dnp3-gateway:dev .
+    -t ghcr.io/enerjione/enerjione-grid-dnp3-gateway:dev .
 ```
 
 ## 2. Yeni gateway ekle (frontend akisi)
@@ -83,7 +93,7 @@ Operator/installer panelinde "Yeni Gateway Ekle":
      `https://api.enerjione.local/api/v1`).
    - `nats_url` (zorunlu): NATS JetStream URL (orn. `nats://nats.local:4222`).
    - `host_port` (varsayilan 8020): Bu instance icin host portu.
-   - `image` (varsayilan `ghcr.io/fikretsafak/enerjionegrid-dnp3-gateway:0.4.6`).
+   - `image` (varsayilan `ghcr.io/enerjione/enerjione-grid-dnp3-gateway:0.4.6`).
    - `app_environment` (varsayilan `production`).
 3. Inen dosya `gw-<code>.yml`.
 4. Sunucuya kopyalanir + `docker compose -f gw-<code>.yml up -d`.
@@ -100,7 +110,7 @@ python scripts/render_compose.py \
     --backend-url https://api.enerjione.local/api/v1 \
     --nats-url nats://nats.local:4222 \
     --host-port 8021 \
-    --image ghcr.io/fikretsafak/enerjionegrid-dnp3-gateway:0.4.6 \
+    --image ghcr.io/enerjione/enerjione-grid-dnp3-gateway:0.4.6 \
     --output ./gateways/gw-002.yml
 ```
 
