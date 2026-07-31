@@ -204,17 +204,21 @@ def poll_device(
                 "device_code": device.code,
                 "signal_key": reading.signal_key,
             },
+            "reading": reading,
         }
         for reading in to_publish
     ]
     batch_fn = getattr(publisher, "publish_batch", None)
     if callable(batch_fn):
-        # publish_batch hata durumunda outbox'a yazar (raise etmez), sadece
-        # OutboxFullError yayar -> cycle breaker. Basari = tum item yayinlandi.
+        # publish_batch normal donerse mesaj KALICIDIR: ya broker ack verdi ya
+        # da outbox'a (SQLite) yazildi. Sadece OutboxFullError / disk hatasi
+        # raise eder -> cycle breaker. Bu yuzden yayin onayini ancak buradan
+        # sonra veriyoruz.
         batch_fn(items)
+        _commit_published(reader=reader, device=device, readings=to_publish)
         return len(items)
     # Fallback: batch yok -> tek tek publish (eski davranis).
-    published = 0
+    published: list[SignalReading] = []
     for it in items:
         try:
             publisher.publish(
@@ -223,15 +227,45 @@ def poll_device(
                 correlation_id=it["correlation_id"],
                 headers=it["headers"],
             )
-            published += 1
+            published.append(it["reading"])
         except OutboxFullError:
+            # Kalicilastirilamayanlarin onayini VERME; degerleri dirty kalir ve
+            # bir sonraki cycle'da yeniden yayinlanir.
+            _commit_published(reader=reader, device=device, readings=published)
             raise
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "poll_device_publish_failed gateway=%s device=%s error=%s",
                 gateway_code, device.code, exc,
             )
-    return published
+    _commit_published(reader=reader, device=device, readings=published)
+    return len(published)
+
+
+def _commit_published(
+    *,
+    reader: TelemetryReader,
+    device: DeviceConfig,
+    readings: list[SignalReading],
+) -> None:
+    """Adapter'a "bu okumalar kalicilasti" de; degisiklik bayraklari temizlensin.
+
+    Bu cagri BASARILI yayindan SONRA yapilir. Eskiden adapter bayragi okuma
+    aninda temizliyordu; yayin basarisiz olursa (outbox dolu / disk hatasi)
+    deger sessizce ve KALICI olarak kayboluyordu — cihazda deger tekrar
+    degisene kadar bir daha yayinlanmiyordu.
+
+    Adapter destegi yoksa (mock) no-op'tur; hata yayin akisini bozmamali.
+    """
+    if not readings:
+        return
+    commit = getattr(reader, "commit_published", None)
+    if not callable(commit):
+        return
+    try:
+        commit(device=device, readings=readings)
+    except Exception:  # noqa: BLE001
+        logger.debug("commit_published_failed device=%s", device.code, exc_info=True)
 
 
 def run_poll_cycle(

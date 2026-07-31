@@ -41,6 +41,12 @@ from dnp3_gateway.messaging.outbox import Outbox, OutboxFullError
 
 logger = logging.getLogger(__name__)
 
+# Outbox-full breaker histerezisi (low-water mark). Breaker acildiktan sonra
+# poller ancak pending sayisi limitin bu oranina DUSTUGUNDE devam eder.
+# Tek basarili gonderimde acmak, dolu bir outbox'ta "ac-kapa" dongusu yaratiyor
+# ve her turda okunan olcumler bosa gidiyordu.
+_OUTBOX_RESUME_RATIO = 0.80
+
 
 class ResilientPublisher:
     def __init__(
@@ -63,6 +69,11 @@ class ResilientPublisher:
         self._broker = broker
         self._outbox = outbox
         self._secondary = secondary_publisher
+        # Sayaclar KILIT ALTINDA: 100 poll worker'i es zamanli publish cagirir.
+        # Kilitsizken `+= 1` kayip artislarla ilerliyor, "1/5/50/500" esikli
+        # uyari loglari atlanabiliyordu — yani surekli hata veren bir broker
+        # loglarda neredeyse sessiz kaliyordu.
+        self._counter_lock = threading.Lock()
         self._consecutive_failures = 0
         # Disk-full / outbox-full circuit breaker durumu (health endpoint
         # ve poller cycle bunu okur).
@@ -99,12 +110,43 @@ class ResilientPublisher:
             self._last_outbox_error = error[:500]
 
     def _clear_outbox_full(self) -> None:
+        """Breaker'i kapat — ANCAK HISTEREZIS ile.
+
+        ESKI DAVRANIS — KAYIP DONGUSU:
+        Tek bir basarili gonderim breaker'i temizliyordu. Outbox 500.000
+        limitindeyken retrier bir satiri gonderip breaker'i sifirliyor, poller
+        hemen 300 cihazi birden okumaya basliyor, ilk batch tekrar limite
+        carpiyor ve breaker yeniden aciliyordu. Bu dongu dakikada onlarca kez
+        tekrarliyor, her turunda okunan degerler bosa gidiyordu.
+
+        Artik breaker yalnizca outbox gercekten NEFES ALDIGINDA kapanir:
+        pending, limitin `_RESUME_RATIO`'su altina inmeli (low-water mark).
+        """
         with self._lock:
-            if self._outbox_full:
-                logger.info("outbox_full_cleared — disk-full durumu sona erdi")
+            if not self._outbox_full:
+                return
+        try:
+            pending = int(self._outbox.pending_count())
+            limit = int(self._outbox.max_pending)
+        except Exception:  # noqa: BLE001
+            pending, limit = 0, 0
+        resume_at = int(limit * _OUTBOX_RESUME_RATIO) if limit > 0 else 0
+        if limit > 0 and pending > resume_at:
+            # Henuz yeterince bosalmadi; breaker acik kalsin.
+            return
+        with self._lock:
+            if not self._outbox_full:
+                return
             self._outbox_full = False
             self._outbox_full_since = None
             self._last_outbox_error = None
+        logger.info(
+            "outbox_full_cleared pending=%d resume_threshold=%d limit=%d — "
+            "poller yeniden calisabilir",
+            pending,
+            resume_at,
+            limit,
+        )
 
     def publish(
         self,
@@ -127,15 +169,16 @@ class ResilientPublisher:
                 correlation_id=correlation_id,
                 headers=headers,
             )
-            if self._consecutive_failures:
-                logger.info(
-                    "resilient_publisher_recovered after_failures=%s",
-                    self._consecutive_failures,
-                )
+            with self._counter_lock:
+                had_failures = self._consecutive_failures
                 self._consecutive_failures = 0
-            # Basarili publish → outbox-full durumunu da temizle (broker normal'e
-            # dondu, retrier outbox'i bosaltacak)
-            if self._outbox_full:
+            if had_failures:
+                logger.info(
+                    "resilient_publisher_recovered after_failures=%s", had_failures
+                )
+            # Basarili publish → outbox-full durumunu da temizlemeyi dene
+            # (histerezis esigi saglanmissa gercekten kapanir).
+            if self.outbox_full:
                 self._clear_outbox_full()
             # Secondary publisher (legacy dual-publish; default kullanilmaz) —
             # best-effort. Hata primary akisi ETKILEMEZ; sadece sayac+log.
@@ -146,7 +189,9 @@ class ResilientPublisher:
                 headers=headers,
             )
         except Exception as exc:  # noqa: BLE001
-            self._consecutive_failures += 1
+            with self._counter_lock:
+                self._consecutive_failures += 1
+                consecutive = self._consecutive_failures
             try:
                 self._outbox.enqueue(
                     message_id=message_id,
@@ -184,13 +229,13 @@ class ResilientPublisher:
                 )
                 raise enq_exc
             # Outbox enqueue basarili — sessiz fail edilmedi, retrier alir
-            if self._consecutive_failures in (1, 5, 50, 500):
+            if consecutive in (1, 5, 50, 500) or consecutive % 1000 == 0:
                 logger.warning(
                     "publish_failed_outboxed message_id=%s error=%s consecutive=%s "
                     "(retrier arka planda yeniden deneyecek)",
                     message_id,
                     exc,
-                    self._consecutive_failures,
+                    consecutive,
                 )
 
     def publish_batch(self, items: list[dict[str, Any]]) -> None:
@@ -219,15 +264,32 @@ class ResilientPublisher:
             return
         try:
             batch_fn(items)
-            if self._consecutive_failures:
-                logger.info("resilient_publisher_recovered after_failures=%s", self._consecutive_failures)
+            with self._counter_lock:
+                had_failures = self._consecutive_failures
                 self._consecutive_failures = 0
-            if self._outbox_full:
+            if had_failures:
+                logger.info("resilient_publisher_recovered after_failures=%s", had_failures)
+            if self.outbox_full:
                 self._clear_outbox_full()
         except Exception as exc:  # noqa: BLE001
-            # Batch POST basarisiz -> her item'i tek tek outbox'a yaz. Ilk
-            # OutboxFullError'da breaker tetiklenir ve raise edilir (poller durur).
-            self._consecutive_failures += 1
+            # Batch POST basarisiz -> her item'i tek tek outbox'a yaz.
+            #
+            # ESKI DAVRANIS — SESSIZ VERI KAYBI:
+            # Ilk OutboxFullError'da dongu HEMEN raise ediyordu; kalan item'lar
+            # ne broker'a ne diske gidiyordu ve hicbir yerde sayilmiyordu.
+            # Ustelik o degerlerin cache'teki dirty bayragi ZATEN temizlenmis
+            # oldugu icin kayip telafi edilemiyordu.
+            #
+            # Artik: (a) dirty bayragi yayin onaylanana kadar temizlenmiyor
+            # (bkz. poller._commit_published), (b) hata durumunda kalan item'lar
+            # yine de best-effort enqueue ediliyor, (c) gercekten diske
+            # yazilamayanlarin SAYISI acikca ERROR loglaniyor — sessiz degil.
+            with self._counter_lock:
+                self._consecutive_failures += 1
+                consecutive = self._consecutive_failures
+            first_fatal: Exception | None = None
+            enqueued = 0
+            dropped = 0
             for it in items:
                 try:
                     self._outbox.enqueue(
@@ -237,25 +299,35 @@ class ResilientPublisher:
                         payload=it["payload"],
                         last_error=str(exc),
                     )
-                except OutboxFullError as full_exc:
-                    self._set_outbox_full(str(full_exc))
-                    logger.error(
-                        "outbox_full_circuit_breaker (batch) pending=%d limit=%d error=%s",
-                        self._outbox.pending_count(),
-                        self._outbox.max_pending,
-                        exc,
-                    )
-                    raise full_exc
-                except Exception as enq_exc:  # noqa: BLE001
-                    self._set_outbox_full(f"outbox_io_error: {enq_exc}")
-                    logger.error("outbox_enqueue_failed_batch error=%s outbox_error=%s", exc, enq_exc)
-                    raise enq_exc
-            if self._consecutive_failures in (1, 5, 50, 500):
+                    enqueued += 1
+                except (OutboxFullError, Exception) as enq_exc:  # noqa: BLE001
+                    dropped += 1
+                    if first_fatal is None:
+                        first_fatal = enq_exc
+                        if isinstance(enq_exc, OutboxFullError):
+                            self._set_outbox_full(str(enq_exc))
+                        else:
+                            self._set_outbox_full(f"outbox_io_error: {enq_exc}")
+            if first_fatal is not None:
+                logger.error(
+                    "outbox_enqueue_failed_batch enqueued=%d dropped=%d pending=%d "
+                    "limit=%d publish_error=%s outbox_error=%s — POLLER DURDURULUYOR; "
+                    "kalicilastirilamayan olcumler cihaz cache'inde 'degismis' olarak "
+                    "kalir ve broker geri gelince yeniden yayinlanir",
+                    enqueued,
+                    dropped,
+                    self._outbox.pending_count(),
+                    self._outbox.max_pending,
+                    exc,
+                    first_fatal,
+                )
+                raise first_fatal from exc
+            if consecutive in (1, 5, 50, 500):
                 logger.warning(
                     "publish_batch_failed_outboxed count=%d error=%s consecutive=%s",
                     len(items),
                     exc,
-                    self._consecutive_failures,
+                    consecutive,
                 )
 
     def close(self) -> None:
@@ -297,9 +369,9 @@ class ResilientPublisher:
             correlation_id=row.get("correlation_id"),
             headers=row.get("headers"),
         )
-        # Outbox'tan basarili gonderim → broker calisiyor demek; circuit
-        # breaker'i da temizle.
-        if self._outbox_full:
+        # Outbox'tan basarili gonderim → broker calisiyor demek; breaker'i
+        # kapatmayi dene (histerezis esigi saglaninca gercekten kapanir).
+        if self.outbox_full:
             self._clear_outbox_full()
         # Secondary publish: outbox'tan gec de olsa JetStream'e kopya gonderelim.
         # Nats-Msg-Id (message_id) dedup'i sayesinde tekrarli denemeler sorun

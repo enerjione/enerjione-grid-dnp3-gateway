@@ -84,8 +84,14 @@ class _DeviceCache:
         self._lock = threading.Lock()
         # (group, index) -> (raw_float, value_string_or_None)
         self._values: dict[tuple[int, int], tuple[float, str | None]] = {}
-        # Son read_device'tan beri degismis sinyaller. read_device basarili
-        # publish sonrasi clear eder.
+        # (group, index) -> surum sayaci. `set()` her DEGER DEGISIKLIGINDE
+        # artirir. Poller yayini onaylarken (`commit_published`) okudugu surumu
+        # geri verir; surum degismisse bayrak TEMIZLENMEZ — yani okuma ile
+        # yayin arasinda gelen yeni deger kaybolmaz (TOCTOU korumasi).
+        self._versions: dict[tuple[int, int], int] = {}
+        self._version_seq: int = 0
+        # Yayinlanmayi bekleyen (degismis) sinyaller. Bayrak SADECE yayin
+        # kalicilastiktan sonra, commit_published ile temizlenir.
         self._dirty: set[tuple[int, int]] = set()
         self._connected = False
         self._last_update_at: float = 0.0
@@ -141,6 +147,12 @@ class _DeviceCache:
             self._last_update_at = now
             if prev is None or prev[0] != raw or prev[1] != value_string:
                 self._dirty.add(key)
+                # Surumu ilerlet: poller okudugu surumu commit_published ile
+                # geri verir. Okuma ile yayin arasinda buraya yeni bir deger
+                # gelirse surum uyusmaz ve bayrak temizlenmez — eski degerin
+                # yayinlanmasi yeni degeri KAYBETMEZ.
+                self._version_seq += 1
+                self._versions[key] = self._version_seq
             # Recovery confirmation: cihaz "recovering" durumundaysa ve bu
             # frame OnOpen/stale-edge anchor'indan sonra geldiyse, bu cihazin
             # gercekten DNP3 cevapladiginin ispatidir → online'a yukselt ve
@@ -157,10 +169,9 @@ class _DeviceCache:
             if self._state == "recovering" and now >= self._recovery_anchor_at:
                 self._state = "online"
                 self._pending_recovery_publish = True
-                # Tum cache'i dirty isaretle. Boylece bir sonraki cycle'da
-                # (scan_interval_sec sonra) butun sinyaller yayinlanir; read_
-                # device'in mark_all_dirty cagirmasini beklemeye gerek yok.
-                self._dirty.update(self._values.keys())
+                # Tum cache'i dirty isaretle (surumleri de ilerleterek).
+                # Boylece bir sonraki cycle'da butun sinyaller yayinlanir.
+                self._mark_all_dirty_unsafe()
 
     def get(self, group: int, index: int) -> tuple[float, str | None] | None:
         with self._lock:
@@ -174,21 +185,87 @@ class _DeviceCache:
         with self._lock:
             self._dirty.discard((group, index))
 
+    # ---- Atomik okuma / yayin onayi ------------------------------------------
+
+    def peek_if_dirty(
+        self, group: int, index: int
+    ) -> tuple[float, str | None, int] | None:
+        """Degismisse (deger, metin, surum) doner; DEGISTIRMEZ.
+
+        TEK lock altinda calisir. Eski kod ayni is icin lock'u UC KEZ aliyordu
+        (`get` -> `is_dirty` -> `clear_dirty`) ve aralarda DNP3 IO thread'i
+        yazabildigi icin yeni degerler kaliciyla kayboluyordu.
+
+        Bayrak burada TEMIZLENMEZ; temizleme yayin kalicilastiktan sonra
+        `commit_published` ile yapilir.
+        """
+        key = (group, index)
+        with self._lock:
+            if key not in self._dirty:
+                return None
+            entry = self._values.get(key)
+            if entry is None:
+                return None
+            return entry[0], entry[1], self._versions.get(key, 0)
+
+    def commit_published(self, items: list[tuple[int, int, int]]) -> int:
+        """Yayini onayla: surum HALA AYNIYSA dirty bayragini temizle.
+
+        `items`: (group, index, yayinlanan_surum) uclulari.
+        Surum degismisse (arada yeni olcum geldi) bayrak KORUNUR ve yeni deger
+        bir sonraki cycle'da yayinlanir. Donus: temizlenen bayrak sayisi.
+        """
+        cleared = 0
+        with self._lock:
+            for group, index, version in items:
+                key = (group, index)
+                if key not in self._dirty:
+                    continue
+                if self._versions.get(key, 0) != version:
+                    # Okuma ile yayin arasinda yeni deger geldi — bayragi
+                    # temizleme, yeni deger yayinlansin.
+                    continue
+                self._dirty.discard(key)
+                cleared += 1
+        return cleared
+
+    def dirty_count(self) -> int:
+        with self._lock:
+            return len(self._dirty)
+
+    def _mark_all_dirty_unsafe(self) -> int:
+        """Tum kayitlari dirty isaretle + SURUMLERINI ILERLET.
+
+        Surum ilerletmek sart: o sirada uctan uca devam eden bir yayin
+        (`read_device` -> publish -> `commit_published`) eski surumle geri
+        donup bu yeni dirty bayragini temizleyebilirdi — yani recovery
+        sonrasi toplu yeniden yayin sessizce iptal olurdu.
+        Caller'in lock'u tutuyor olmasi gerekir.
+        """
+        count = 0
+        for key in self._values:
+            self._dirty.add(key)
+            self._version_seq += 1
+            self._versions[key] = self._version_seq
+            count += 1
+        return count
+
     def mark_all_dirty(self) -> int:
         """Cache'deki tum (group, index) ciftlerini dirty isaretler.
 
         Recovery anlik kullanim: cihaz iletisimi koptuktan sonra geri geldiginde
         cihazin sinyal degerleri ayni kalmis olabilir; saf event-driven mantikta
         hicbir sinyal "degisti" olmadigindan publish edilmez ve dis SCADA
-        cihazi hala "comm_lost" gorur. Recovery'de bu method cagrilirsa bir
-        sonraki read_device cycle'inda son bilinen tum degerler `quality=good`
-        ile yayinlanir → tag-engine → outbound (IEC 104, REST, MQTT) → SCADA
+        cihazi hala "comm_lost" gorur. Bu method cagrilirsa bir sonraki
+        read_device cycle'inda son bilinen tum degerler `quality=good` ile
+        yayinlanir → tag-engine → outbound (IEC 104, REST, MQTT) → SCADA
         cihazi tekrar "online" gorur. Donus: dirty isaretlenen kayit sayisi.
+
+        Ayni mekanizma operator tetikli "tum cihazlara sorgu at" (refresh-all)
+        icin de kullanilir; delta-only yayinin TEK telafi mekanizmasidir.
         """
         with self._lock:
-            count = len(self._values)
-            self._dirty.update(self._values.keys())
-            return count
+            return self._mark_all_dirty_unsafe()
 
     def set_connected(self, ok: bool) -> None:
         with self._lock:
@@ -957,10 +1034,15 @@ class Yadnp3TelemetryReader(TelemetryReader):
 
         readings: list[SignalReading] = []
         for s in signals:
-            entry = cache.get(s.dnp3_object_group, s.dnp3_index)
-            if entry is None:
-                # Henuz okunmadi (yeni bagi/yeni nokta): 'no_change' — frontend
-                # son iyi degeri korur, poller bunu yayinlamaz.
+            # TEK atomik cagri: dirty kontrolu + deger okuma + surum, hepsi ayni
+            # lock altinda. Eski kod bunu uc ayri lock alimiyla yapiyordu
+            # (get -> is_dirty -> clear_dirty) ve aralarda DNP3 IO thread'i
+            # yazabildigi icin yeni olcumler KALICI olarak kayboluyordu.
+            taken = cache.peek_if_dirty(s.dnp3_object_group, s.dnp3_index)
+            if taken is None:
+                # Ya henuz hic okunmadi (yeni bagi/yeni nokta) ya da bu cycle'da
+                # degismedi: 'no_change' — frontend son iyi degeri korur,
+                # poller bunu yayinlamaz.
                 readings.append(
                     SignalReading(
                         signal_key=s.key,
@@ -973,22 +1055,7 @@ class Yadnp3TelemetryReader(TelemetryReader):
                     )
                 )
                 continue
-            # Event-driven: degisiklik yoksa 'no_change' — bu cycle'da yayinlama.
-            # Son set()'ten beri ayni deger okunmadi mi? Dirty flag ile karar.
-            if not cache.is_dirty(s.dnp3_object_group, s.dnp3_index):
-                readings.append(
-                    SignalReading(
-                        signal_key=s.key,
-                        source=s.source,
-                        data_type=s.data_type,
-                        raw_value=0.0,
-                        scaled_value=0.0,
-                        quality="no_change",
-                        value_string=None,
-                    )
-                )
-                continue
-            raw, value_string = entry
+            raw, value_string, version = taken
             scaled = raw * s.scale + s.offset
             readings.append(
                 SignalReading(
@@ -1003,12 +1070,38 @@ class Yadnp3TelemetryReader(TelemetryReader):
                     scaled_value=round(scaled, 6),
                     quality="good",
                     value_string=value_string,
+                    # Dirty bayragi BURADA TEMIZLENMEZ. Poller yayini
+                    # kalicilastirdiktan sonra commit_published ile bu token'i
+                    # geri verir; ancak o zaman ve surum hala ayniysa temizlenir.
+                    read_token=(s.dnp3_object_group, s.dnp3_index, version),
                 )
             )
-            # Bu sinyal su an yayinlanacak — dirty flag'i temizle. Bir sonraki
-            # cycle'a kadar tekrar set() cagirilmazsa "no_change" donecek.
-            cache.clear_dirty(s.dnp3_object_group, s.dnp3_index)
         return readings
+
+    def commit_published(
+        self,
+        *,
+        device: DeviceConfig,
+        readings: list[SignalReading],
+    ) -> int:
+        """Yayin kalicilastiktan sonra dirty bayraklarini temizle.
+
+        Yalnizca `read_token` tasiyan (yani gercekten yayinlanan) okumalar
+        dikkate alinir. Surum uyusmuyorsa — okuma ile yayin arasinda cihazdan
+        yeni bir olcum geldiyse — bayrak KORUNUR ve yeni deger bir sonraki
+        cycle'da yayinlanir.
+        """
+        mm = self._masters.get(device.code)
+        if mm is None:
+            return 0
+        items: list[tuple[int, int, int]] = []
+        for r in readings:
+            token = r.read_token
+            if isinstance(token, tuple) and len(token) == 3:
+                items.append(token)
+        if not items:
+            return 0
+        return mm.cache.commit_published(items)
 
     def operate_device(
         self,
@@ -1089,28 +1182,58 @@ class Yadnp3TelemetryReader(TelemetryReader):
         return cleaned
 
     def refresh_all_devices(self) -> tuple[int, int]:
-        """Aktif tum cihazlara ANINDA full integrity poll (Class 0+1+2+3).
+        """Aktif tum cihazlara ANINDA full integrity poll + son bilinen tum
+        degerleri yeniden yayinlat.
 
         Kullanim: SCADA/operator "tum cihazlara sorgu at" tetiklerse, ya da
-        haberlesme bir sure kopuk kalip yeniden gelirse, hat boyunca tum
-        sinyallerin guncel degerini DB'ye yazmak icin manuel tetik.
+        backend tarafinda veri kaybolduysa (DB restore, tag-engine sifirlanmasi)
+        hat boyunca tum sinyallerin guncel degerini DB'ye yazmak icin manuel
+        tetik.
 
-        Returns: (basarili_count, toplam_master_count). Basarili = task
-        kuyruga alindigi cihazlar; gercek frame yaniti ayri bir asenkron
-        akista cache'e yazilir.
+        ONEMLI — ESKI DAVRANIS NO-OP IDI:
+        Bu fonksiyon eskiden SADECE `request_integrity_poll()` cagiriyordu.
+        Integrity poll cevabi `_DeviceCache.set()`'e duser ve orada deger
+        DEGISMEDIYSE dirty isaretlenmez; dolayisiyla degeri sabit olan tum
+        sinyaller icin refresh-all HICBIR mesaj uretmiyordu. Yani delta-only
+        yayinin TEK telafi mekanizmasi calismiyordu: backend'i restore eden
+        operator "tum cihazlara sorgu at" dedikten sonra da eksik degerlerle
+        kaliyordu ve durum ancak sahada deger fiziksel olarak degisirse
+        duzeliyordu (kesici pozisyonu gibi statik sinyallerde: hic).
+
+        Artik integrity poll ISTEGIYLE BIRLIKTE `mark_all_dirty()` cagirilir;
+        cihaz cevap vermese bile son bilinen degerler bir sonraki cycle'da
+        quality=good ile yayinlanir.
+
+        Returns: (basarili_count, toplam_master_count).
         """
         ok = 0
+        redirty_total = 0
+        # Lock'u yalnizca master listesinin ANLIK kopyasini almak icin tut;
+        # integrity poll / mark_all_dirty cagrilari lock DISINDA yapilir.
+        # Aksi halde bu islemler (native IO dahil) adapter lock'unu saniyelerce
+        # tutar ve o sirada _ensure_master bekleyen poll worker'lari + komut
+        # thread'i bloke olur.
         with self._lock:
-            total = len(self._masters)
-            for code, mm in list(self._masters.items()):
-                try:
-                    if mm.request_integrity_poll():
-                        ok += 1
-                        logger.info("yadnp3_integrity_poll_requested device=%s", code)
-                    else:
-                        logger.warning("yadnp3_integrity_poll_failed device=%s", code)
-                except Exception:  # noqa: BLE001
-                    logger.exception("yadnp3_integrity_poll_error device=%s", code)
+            masters = list(self._masters.items())
+        total = len(masters)
+        for code, mm in masters:
+            try:
+                # Once yeniden-yayin bayraklari: cihaz cevap vermese bile son
+                # bilinen degerler yayinlanir (asil telafi budur).
+                redirty_total += mm.cache.mark_all_dirty()
+                if mm.request_integrity_poll():
+                    ok += 1
+                    logger.info("yadnp3_integrity_poll_requested device=%s", code)
+                else:
+                    logger.warning("yadnp3_integrity_poll_failed device=%s", code)
+            except Exception:  # noqa: BLE001
+                logger.exception("yadnp3_integrity_poll_error device=%s", code)
+        logger.info(
+            "yadnp3_refresh_all devices=%d poll_queued=%d redirty_signals=%d",
+            total,
+            ok,
+            redirty_total,
+        )
         return ok, total
 
     def close(self) -> None:
