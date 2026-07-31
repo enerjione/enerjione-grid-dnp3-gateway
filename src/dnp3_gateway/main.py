@@ -677,9 +677,18 @@ def run(current_settings: Settings | None = None) -> int:
     # Health server'in /health/metrics endpoint'leri publisher uzerinden
     # outbox + circuit breaker durumunu okuyabilsin diye holder'a yaz
     publisher_holder["publisher"] = publisher
+    # Toplu drenaj yolu: broker publish_batch destekliyorsa (HTTP ingest)
+    # retrier 200 mesaji TEK POST + TEK DELETE transaction'i ile bosaltir.
+    # Bu, birikmis outbox'in drenaj hizini onlarca kat artirir.
+    _batch_drain = (
+        publisher.publish_outbox_rows
+        if callable(getattr(broker, "publish_batch", None))
+        else None
+    )
     retrier = OutboxRetrier(
         outbox,
         publish_fn=publisher.publish_outbox_row,
+        publish_batch_fn=_batch_drain,
         poll_interval_sec=cfg.outbox_retrier_poll_interval_sec,
         batch_size=cfg.outbox_retrier_batch_size,
         max_retries=cfg.outbox_max_retries,

@@ -15,16 +15,32 @@ import requests
 
 from dnp3_gateway.auth import GatewayIdentity, build_config_request_headers
 from dnp3_gateway.backend.http_session import build_http_session
+from dnp3_gateway.messaging.errors import (
+    TRANSIENT_HTTP_STATUSES,
+    PermanentPublishError,
+    TransientPublishError,
+)
 
 logger = logging.getLogger(__name__)
 
 
-class HttpTelemetryPublishError(Exception):
-    """HTTP ingest kalici/semantik hata verdi."""
+class HttpTelemetryPublishError(PermanentPublishError):
+    """HTTP ingest KALICI/semantik hata verdi (mesaja ozgu).
+
+    Retry sayaci artar; max_retries sonrasi dead-letter'a tasinir ve kuyruk
+    ilerler. Eskiden bu sinif `transient` bilgisi tasimiyordu ve retrier
+    karari metin eslesmesiyle veriyordu.
+    """
 
 
-class HttpTelemetryNotReadyError(HttpTelemetryPublishError):
-    """Backend ingest su an hazir degil; retry_count artmamali."""
+class HttpTelemetryNotReadyError(TransientPublishError):
+    """Backend ingest su an hazir degil (ag/kapasite); retry_count artmamali.
+
+    DIKKAT: Artik yalnizca GERCEKTEN gecici durumlar icin kullanilir —
+    baglanti hatasi, timeout, 408/425/429/502/503/504. HTTP 500'ler KALICI
+    kabul edilir; eskiden hepsi buraya dusuyordu ve payload'a ozgu tek bir
+    500 tum kuyrugu sonsuza kadar tikayabiliyordu (head-of-line blocking).
+    """
 
 
 def _scrub_token(text: str, token: str | None) -> str:
@@ -107,13 +123,20 @@ class HttpTelemetryPublisher:
 
         preview = _scrub_token((response.text or "")[:500], self.identity.token)
         self._mark_failure()
-        if response.status_code == 429 or response.status_code >= 500:
+        # GECICI mi KALICI mi? Karar TEK yerden (messaging.errors) gelir.
+        # 500 artik KALICI sayilir: payload'a ozgu bir 500 (NaN deger, silinmis
+        # device_code, sema ihlali) eskiden "gecici" siniflanip retry_count'u
+        # artirmadigi icin ayni satir kuyrugun basinda sonsuza kadar kaliyor,
+        # arkasindaki TUM telemetriyi bloke ediyordu.
+        if response.status_code in TRANSIENT_HTTP_STATUSES:
             self._set_ready(False)
             raise HttpTelemetryNotReadyError(
-                f"backend ingest not ready: HTTP {response.status_code}: {preview}"
+                f"backend ingest not ready: HTTP {response.status_code}: {preview}",
+                http_status=response.status_code,
             )
         raise HttpTelemetryPublishError(
-            f"backend ingest rejected: HTTP {response.status_code}: {preview}"
+            f"backend ingest rejected: HTTP {response.status_code}: {preview}",
+            http_status=response.status_code,
         )
 
     def publish_batch(self, items: list[dict[str, Any]]) -> None:
@@ -170,13 +193,20 @@ class HttpTelemetryPublisher:
 
         preview = _scrub_token((response.text or "")[:500], self.identity.token)
         self._mark_failure()
-        if response.status_code == 429 or response.status_code >= 500:
+        # GECICI mi KALICI mi? Karar TEK yerden (messaging.errors) gelir.
+        # 500 artik KALICI sayilir: payload'a ozgu bir 500 (NaN deger, silinmis
+        # device_code, sema ihlali) eskiden "gecici" siniflanip retry_count'u
+        # artirmadigi icin ayni satir kuyrugun basinda sonsuza kadar kaliyor,
+        # arkasindaki TUM telemetriyi bloke ediyordu.
+        if response.status_code in TRANSIENT_HTTP_STATUSES:
             self._set_ready(False)
             raise HttpTelemetryNotReadyError(
-                f"backend ingest not ready: HTTP {response.status_code}: {preview}"
+                f"backend ingest not ready: HTTP {response.status_code}: {preview}",
+                http_status=response.status_code,
             )
         raise HttpTelemetryPublishError(
-            f"backend ingest rejected: HTTP {response.status_code}: {preview}"
+            f"backend ingest rejected: HTTP {response.status_code}: {preview}",
+            http_status=response.status_code,
         )
 
     def close(self) -> None:

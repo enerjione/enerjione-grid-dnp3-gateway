@@ -373,6 +373,7 @@ class ResilientPublisher:
         # kapatmayi dene (histerezis esigi saglaninca gercekten kapanir).
         if self.outbox_full:
             self._clear_outbox_full()
+        self._after_outbox_send()
         # Secondary publish: outbox'tan gec de olsa JetStream'e kopya gonderelim.
         # Nats-Msg-Id (message_id) dedup'i sayesinde tekrarli denemeler sorun
         # cikarmaz.
@@ -382,6 +383,42 @@ class ResilientPublisher:
             correlation_id=row.get("correlation_id"),
             headers=row.get("headers"),
         )
+
+    def publish_outbox_rows(self, rows: list[dict[str, Any]]) -> None:
+        """Outbox satirlarini TOPLU gonder (broker destekliyorsa tek POST).
+
+        Drenaj hizinin ana kaldiraci: eskiden retrier her satiri ayri POST +
+        ayri DELETE/commit ile gonderiyordu. LAN RTT 20ms ile bu, 200'luk bir
+        batch'te ~4 saniye + 200 fsync demekti; her batch sonrasi da 2 saniye
+        uyunuyordu (~32 mesaj/sn). 500.000 mesajlik bir birikim saatler suruyor,
+        bu sirada uretim devam ettigi icin net drenaj sifira yaklasiyordu.
+
+        Broker toplu gonderimi desteklemiyorsa AttributeError yerine acik bir
+        hata veririz; retrier tekil yola duser.
+        """
+        batch_fn = getattr(self._broker, "publish_batch", None)
+        if not callable(batch_fn):
+            raise NotImplementedError("broker publish_batch desteklemiyor")
+        if not rows:
+            return
+        batch_fn(
+            [
+                {
+                    "payload": r["payload"],
+                    "message_id": r["message_id"],
+                    "correlation_id": r.get("correlation_id"),
+                    "headers": r.get("headers"),
+                }
+                for r in rows
+            ]
+        )
+        if self.outbox_full:
+            self._clear_outbox_full()
+        self._after_outbox_send()
+
+    def _after_outbox_send(self) -> None:
+        """Outbox'tan basarili gonderim sonrasi ortak kanca (alt siniflar icin)."""
+        return None
 
     # ------------------------------------------------------------------ ---
     def _publish_secondary_best_effort(

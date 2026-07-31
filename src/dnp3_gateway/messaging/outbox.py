@@ -36,6 +36,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from dnp3_gateway.messaging.errors import is_transient
 from dnp3_gateway.messaging.sqlite_support import Migration, open_versioned_db
 
 logger = logging.getLogger(__name__)
@@ -231,14 +232,22 @@ class Outbox:
             self._pending_estimate += 1
             return int(cur.lastrowid or 0)
 
-    def fetch_batch(self, limit: int = 200) -> list[dict[str, Any]]:
-        """En eski mesajlardan limit kadarini doner."""
+    def fetch_batch(self, limit: int = 200, *, now: float | None = None) -> list[dict[str, Any]]:
+        """Gonderilmeye HAZIR en eski mesajlardan limit kadarini doner.
+
+        `next_attempt_at` gelecekte olan satirlar ATLANIR. Bu, kalici hatali
+        tek bir satirin kuyrugun basini tikamasini (head-of-line blocking)
+        engeller: hatali satir ertelenirken arkasindaki telemetri akmaya
+        devam eder.
+        """
+        ts = time.time() if now is None else now
         with self._lock:
             c = self._cached_connection()
             rows = c.execute(
-                "SELECT id, message_id, correlation_id, headers, payload, retry_count, enqueued_at, last_error "
-                "FROM outbox ORDER BY id ASC LIMIT ?",
-                (limit,),
+                "SELECT id, message_id, correlation_id, headers, payload, retry_count, "
+                "enqueued_at, last_error "
+                "FROM outbox WHERE next_attempt_at <= ? ORDER BY id ASC LIMIT ?",
+                (ts, limit),
             ).fetchall()
         return [
             {
@@ -262,15 +271,53 @@ class Outbox:
             if cur.rowcount > 0:
                 self._pending_estimate = max(0, self._pending_estimate - cur.rowcount)
 
-    def mark_retry(self, row_id: int, error: str) -> None:
-        # Hata mesaji 2KB'a kadar saklanir — full traceback genelde yeterli.
+    def delete_many(self, row_ids: list[int]) -> int:
+        """Birden fazla satiri TEK transaction'da siler.
+
+        Batch drenajda kritik: eskiden her mesaj icin ayri DELETE + commit
+        yapiliyordu (mesaj basina bir fsync). 200'luk bir batch'te bu, tek
+        commit yerine 200 commit demekti.
+        """
+        if not row_ids:
+            return 0
+        with self._lock:
+            c = self._cached_connection()
+            placeholders = ",".join("?" * len(row_ids))
+            cur = c.execute(
+                f"DELETE FROM outbox WHERE id IN ({placeholders})",  # noqa: S608 — ids int
+                tuple(int(i) for i in row_ids),
+            )
+            c.commit()
+            removed = int(cur.rowcount or 0)
+            if removed > 0:
+                self._pending_estimate = max(0, self._pending_estimate - removed)
+            return removed
+
+    def mark_retry(self, row_id: int, error: str, *, retry_after_sec: float = 0.0) -> None:
+        """retry_count++ ve (istege bagli) satiri `retry_after_sec` kadar ertele.
+
+        Erteleme, kalici hatali satirin her turda yeniden denenip kuyrugu
+        tikamasini onler; `fetch_batch` bu satiri suresi dolana kadar atlar.
+        """
+        next_at = time.time() + max(0.0, float(retry_after_sec))
         with self._lock:
             c = self._cached_connection()
             c.execute(
-                "UPDATE outbox SET retry_count = retry_count + 1, last_error = ? WHERE id = ?",
-                (error[:2000], row_id),
+                "UPDATE outbox SET retry_count = retry_count + 1, last_error = ?, "
+                "next_attempt_at = ? WHERE id = ?",
+                (error[:2000], next_at, row_id),
             )
             c.commit()
+
+    def ready_count(self, *, now: float | None = None) -> int:
+        """Su an gonderilmeye hazir (ertelenmemis) satir sayisi."""
+        ts = time.time() if now is None else now
+        with self._lock:
+            c = self._cached_connection()
+            (n,) = c.execute(
+                "SELECT COUNT(*) FROM outbox WHERE next_attempt_at <= ?", (ts,)
+            ).fetchone()
+            return int(n)
 
     def move_to_dead_letter(self, row_id: int, error: str) -> bool:
         """Bir mesaj MAX kez denenip hala basarisiz oldugunda dead-letter
@@ -364,9 +411,12 @@ class OutboxRetrier:
         min_backoff_sec: float = DEFAULT_MIN_BACKOFF_SEC,
         max_backoff_sec: float = DEFAULT_MAX_BACKOFF_SEC,
         backoff_multiplier: float = DEFAULT_BACKOFF_MULTIPLIER,
+        publish_batch_fn: Callable[[list[dict[str, Any]]], None] | None = None,
     ) -> None:
         self._outbox = outbox
         self._publish_fn = publish_fn
+        # Toplu gonderim yolu (HTTP ingest icin). Yoksa mesaj basina POST.
+        self._publish_batch_fn = publish_batch_fn
         self._poll_interval = max(0.5, float(poll_interval_sec))
         self._batch_size = max(1, int(batch_size))
         self._max_retries = max(1, int(max_retries))
@@ -376,6 +426,35 @@ class OutboxRetrier:
         self._current_backoff: float = self._min_backoff
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        # Saglik gorunurlugu: /health thread'in yasadigini ve son hatayi gorsun.
+        self._state_lock = threading.Lock()
+        self._last_error: str | None = None
+        self._last_error_at: float | None = None
+
+    # ---- Saglik gorunurlugu --------------------------------------------------
+
+    def _record_error(self, error: str) -> None:
+        with self._state_lock:
+            self._last_error = error[:500]
+            self._last_error_at = time.time()
+
+    def is_alive(self) -> bool:
+        """Retrier thread'i hala yasiyor mu? (/health icin)
+
+        Thread sessizce olurse telemetri teslimi kalici olarak durur; eskiden
+        bunu disaridan gorebilecek HICBIR gosterge yoktu.
+        """
+        t = self._thread
+        return bool(t is not None and t.is_alive())
+
+    def status_snapshot(self) -> dict[str, Any]:
+        with self._state_lock:
+            return {
+                "alive": self.is_alive(),
+                "last_error": self._last_error,
+                "last_error_at": self._last_error_at,
+                "current_backoff_sec": round(self._current_backoff, 2),
+            }
 
     def start(self) -> None:
         if self._thread is not None:
@@ -413,6 +492,83 @@ class OutboxRetrier:
     def _reset_backoff(self) -> None:
         self._current_backoff = self._min_backoff
 
+    def _drain_batch(self, rows: list[dict[str, Any]]) -> tuple[int, bool]:
+        """Bir batch'i gondermeye calis. Doner: (gonderilen, gecici_hata_var_mi).
+
+        Once TOPLU gonderim denenir (`publish_batch_fn`): 200 mesaj = 1 POST +
+        1 DELETE transaction. Toplu gonderim yoksa ya da hata verirse mesaj
+        basina yola dusulur (hangi satirin sorunlu oldugunu ancak boyle
+        ayirt edebiliriz).
+        """
+        # --- Hizli yol: toplu gonderim -------------------------------------
+        if self._publish_batch_fn is not None and len(rows) > 1:
+            try:
+                self._publish_batch_fn(rows)
+            except Exception as exc:  # noqa: BLE001
+                # Toplu gonderim basarisiz: hangi satirin sorunlu oldugunu
+                # bilmiyoruz. Tekil yola dusup ayikla.
+                logger.debug("outbox_batch_publish_failed error=%s — tekil yola dusuluyor", exc)
+            else:
+                removed = self._outbox.delete_many([r["id"] for r in rows])
+                return removed, False
+
+        # --- Tekil yol: satir basina siniflandirma -------------------------
+        sent_ids: list[int] = []
+        transient_seen = False
+        for row in rows:
+            if self._stop.is_set():
+                break
+            try:
+                self._publish_fn(row)
+            except Exception as exc:  # noqa: BLE001
+                err_str = str(exc)
+                if is_transient(exc):
+                    # GECICI: broker/backend erisilemez. Mesajin ICERIGIYLE
+                    # ilgisi yok -> retry_count ARTIRILMAZ (aksi halde uzun bir
+                    # kesintide tum kuyruk sessizce dead-letter'a dusebilirdi).
+                    # Batch'i kir, backoff'a gec.
+                    transient_seen = True
+                    break
+                # KALICI: mesaja ozgu hata (sema, silinmis cihaz, NaN deger...).
+                # retry_count artar VE satir ertelenir; boylece kuyrugun basini
+                # tikamaz, arkasindaki telemetri akmaya devam eder.
+                next_retry = row["retry_count"] + 1
+                if next_retry >= self._max_retries:
+                    if self._outbox.move_to_dead_letter(row["id"], err_str):
+                        logger.error(
+                            "outbox_dead_letter id=%s message_id=%s retries=%s "
+                            "last_error=%s — mesaj poison kabul edildi, "
+                            "dead-letter tablosuna tasindi",
+                            row["id"],
+                            row["message_id"],
+                            next_retry,
+                            err_str[:200],
+                        )
+                    continue
+                self._outbox.mark_retry(
+                    row["id"], err_str, retry_after_sec=self._row_retry_delay(next_retry)
+                )
+                logger.debug(
+                    "outbox_retry_deferred id=%s retry=%s/%s error=%s",
+                    row["id"],
+                    next_retry,
+                    self._max_retries,
+                    exc,
+                )
+                # KUYRUGU KIRMIYORUZ: kalici hatali satir ertelendi, siradaki
+                # mesaj denenmeli. Eski kod burada `break` yapiyordu ve tek bir
+                # bozuk satir tum telemetriyi durduruyordu.
+                continue
+            sent_ids.append(row["id"])
+        removed = self._outbox.delete_many(sent_ids)
+        return removed, transient_seen
+
+    def _row_retry_delay(self, retry_count: int) -> float:
+        """Kalici hatali satir icin erteleme suresi (exponential, cap'li)."""
+        delay = self._min_backoff * (self._backoff_multiplier ** min(retry_count, 20))
+        jitter = 1.0 + random.uniform(-DEFAULT_BACKOFF_JITTER, DEFAULT_BACKOFF_JITTER)
+        return min(self._max_backoff, delay) * jitter
+
     def _run(self) -> None:
         while not self._stop.is_set():
             try:
@@ -426,83 +582,39 @@ class OutboxRetrier:
                 self._reset_backoff()
                 self._stop.wait(self._poll_interval)
                 continue
-            sent = 0
-            failed_in_batch = False
-            broker_not_ready = False
-            for row in rows:
-                if self._stop.is_set():
-                    break
-                try:
-                    self._publish_fn(row)
-                except Exception as exc:  # noqa: BLE001
-                    err_str = str(exc)
-                    # "Not ready" TRANSIENT hata: broker baglantisi yok demek;
-                    # bu mesajin icerigiyle ilgili degil. retry_count artirma
-                    # (aksi takdirde 100dk outage'da 500K mesaj sessizce
-                    # dead-letter'a dusurulebilir). Sadece batch'i kir,
-                    # backoff'a gec — baglanti gelince bir sonraki cycle'da
-                    # ayni mesaj yeniden denenecek.
-                    is_not_ready = (
-                        type(exc).__name__ == "JetStreamNotReadyError"
-                        or "not ready" in err_str.lower()
-                    )
-                    if is_not_ready:
-                        broker_not_ready = True
-                        failed_in_batch = True
-                        break
-                    next_retry = row["retry_count"] + 1
-                    if next_retry >= self._max_retries:
-                        # Poison message — dead-letter tablosuna tasi, ana
-                        # kuyrugu bloke etmesin
-                        moved = self._outbox.move_to_dead_letter(row["id"], err_str)
-                        if moved:
-                            logger.error(
-                                "outbox_dead_letter id=%s message_id=%s retries=%s "
-                                "last_error=%s — mesaj poison kabul edildi, "
-                                "dead-letter tablosuna tasindi",
-                                row["id"],
-                                row["message_id"],
-                                next_retry,
-                                err_str[:200],
-                            )
-                        # Basarisizlik sayilmaz; cunku mesaj artik dead-letter'da
-                        # ve sonraki mesajlar publish edilmeli — break etmiyoruz.
-                        continue
-                    self._outbox.mark_retry(row["id"], err_str)
-                    logger.debug(
-                        "outbox_retry_failed id=%s retry=%s/%s error=%s",
-                        row["id"],
-                        next_retry,
-                        self._max_retries,
-                        exc,
-                    )
-                    # Broker hala dusukse alttaki mesajlar da fail eder;
-                    # batch'i kir, backoff'a gec
-                    failed_in_batch = True
-                    break
-                self._outbox.delete(row["id"])
-                sent += 1
-            if broker_not_ready:
-                # Sadece "outage" durumunu seyrek logla — log spam'i onle
+
+            try:
+                sent, transient_seen = self._drain_batch(rows)
+            except Exception as exc:  # noqa: BLE001
+                # Retrier thread'i BU DONGUDE OLMEMELI. Eskiden _drain_batch
+                # icindeki bir SQLite hatasi (disk dolu, DB locked) thread'i
+                # sessizce oldururdu ve telemetri teslimi kalici olarak dururdu;
+                # /health bunu hic gostermiyordu.
+                logger.exception("outbox_retrier_cycle_failed — dongu devam ediyor")
+                self._record_error(str(exc))
+                self._stop.wait(self._next_backoff())
+                continue
+
+            if sent:
+                logger.info("outbox_drained sent=%s batch=%s", sent, len(rows))
+
+            if transient_seen:
+                wait = self._next_backoff()
                 if self._current_backoff <= self._min_backoff * 1.5:
                     logger.warning(
-                        "outbox_retrier_broker_not_ready pending=%d — "
-                        "baglanti bekleniyor, retry_count artirilmiyor",
+                        "outbox_retrier_broker_not_ready batch=%d — baglanti "
+                        "bekleniyor, retry_count artirilmiyor",
                         len(rows),
                     )
-            if sent:
-                logger.info("outbox_drained sent=%s remaining_in_batch=%s", sent, len(rows) - sent)
-            if failed_in_batch:
-                # Broker hala saglik degil — exponential backoff
-                wait = self._next_backoff()
-                logger.warning(
-                    "outbox_backoff sent=%s wait=%.2fs current_cap=%.0fs",
-                    sent,
-                    wait,
-                    self._current_backoff,
-                )
+                logger.debug("outbox_backoff sent=%s wait=%.2fs", sent, wait)
                 self._stop.wait(wait)
-            else:
-                # Tum batch basarili — broker saglikli, normal interval
-                self._reset_backoff()
-                self._stop.wait(self._poll_interval)
+                continue
+
+            self._reset_backoff()
+            if len(rows) >= self._batch_size and sent > 0:
+                # Kuyruk hala dolu ve akis saglikli -> UYUMA, hemen sonraki
+                # batch'e gec. Eskiden her batch sonrasi sabit 2sn uyunuyordu;
+                # 500.000 mesajlik bir birikim bu yuzden saatler suruyor ve
+                # uretim hizini yakalayamiyordu (net drenaj ~sifir).
+                continue
+            self._stop.wait(self._poll_interval)
