@@ -126,7 +126,40 @@ gateway eski formati da anlamaya devam etsin), sonra gateway.
 
 ---
 
-## B4. Gateway → backend saglik heartbeat'i
+## B4. Gateway → backend saglik heartbeat'i — ✅ TAMAMLANDI
+
+**Durum:** (a) secenegi uygulandi. Saglik ozeti `GET /gateways/{code}/pending`
+istegine `X-E1-Gateway-Health` basligiyla biniyor (bkz.
+`backend/health_header.py`). Ek istek YOK.
+
+Baslik CONFIG client'a degil KOMUT client'ina bindi: config-refresh 5 dakikada
+bir, komut-poll saniyede bir kosar. Govde `_build_health_body` ile ayni
+kaynaktan uretiliyor (10 sn onbellekli) — `status` ve `issues` `/health` ile
+BIREBIR ayni, elle yazilmiyor.
+
+**Spesifikasyondan iki sapma (bilerek):**
+
+1. `devices.states` EKLENDI — cihaz KODU bazinda link durumu. Sayimlar
+   "hangi cihaz" sorusunu cevaplamiyordu; backend cihazi ancak telemetri
+   gelince guncelleyebildigi icin sessiz ama saglikli bir gosterge ile kopmus
+   bir gosterge ayirt edilemiyordu. Kodlar YALNIZCA bu kimlik dogrulamali
+   baslikta gider; `/health` auth'suz oldugu icin orada hala sadece sayim var.
+
+2. Yalnizca `online` OLMAYAN cihazlar gonderiliyor. 600 cihazin tamamini
+   gondermek ~9 KB eder; nginx tavanina yaklasan bir baslik ISTEGIN TAMAMINI
+   reddettirir, yani KOMUTLAR DA GITMEZ. Tavan asilirsa kademeli kuculuyor
+   (cihaz listesi -> sorun metinleri -> yalnizca sayimlar) ve kirpma
+   `states_truncated` ile bildiriliyor.
+
+**Backend yarisi:** `gateway_health_service.record_health` (25 sn yazma
+kisitiyla) + `device_link_states` + `gateway_staleness_watchdog.apply_link_states`.
+`apply_link_states` v2.34.0'dan SONRA girdi — saha 2.34.0'da oldugu surece
+`gateway_health` satiri dolar ama cihaz durumuna yansimaz.
+
+**Kalan:** bu veriden alarm kurali (orn. `lost/total > 0.5` 5 dakikadan uzun
+surerse ENGINEER'a bildirim) — backend isi.
+
+<details><summary>Ozgun kayit</summary>
 
 **Gateway durumu:** ✅ Tum saglik verisi hazir ve `/health`'te yayinlaniyor;
 sadece backend'e ULASTIRACAK kanal yok.
@@ -167,6 +200,8 @@ ogreniyor.
 **Deploy sirasi:** ONCE BACKEND (endpoint/alan hazir olsun), sonra gateway.
 Gateway tarafi 404/400'e toleransli yazilacak (eski backend'de sessizce atlar).
 
+</details>
+
 ---
 
 ## Ozet tablo
@@ -176,6 +211,6 @@ Gateway tarafi 404/400'e toleransli yazilacak (eski backend'de sessizce atlar).
 | B1 | Kalite bayraklari | ✅ (bayrakla kapali) | Backend → Gateway | Yuksek — olcum dogrulugu |
 | B2 | Cihaz zaman damgasi | ⚠️ zaman-senk var | Backend → Gateway (**B1'den SONRA**) | Yuksek — SOE/ariza analizi |
 | B3 | Per-device katalog | ❌ kontrat sart | Backend → Gateway | Orta — cok markali filoda kritik |
-| B4 | Saglik heartbeat | ✅ veri hazir | Backend → Gateway | Yuksek — kor nokta |
+| B4 | Saglik heartbeat | ✅ **TAMAMLANDI** | — | ~~Yuksek — kor nokta~~ |
 
-**Onerilen calisma sirasi:** B4 (en kolay, en hizli fayda) → B1 → B2 → B3.
+**Onerilen calisma sirasi:** ~~B4~~ (tamamlandi) → B1 → B2 → B3.

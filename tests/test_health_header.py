@@ -244,3 +244,39 @@ def test_kimlik_basliklari_saglik_yuzunden_bozulmaz() -> None:
     assert session.gonderilen_headers.get("X-Gateway-Token") == "tok"
     assert session.gonderilen_headers.get("X-Gateway-Code") == "GW-001"
     assert health_header.HEADER_NAME in session.gonderilen_headers
+
+
+# --------------------------------------------------------------------------
+# `main.py` baglantisi — "yesil yalan" nobetcisi
+# --------------------------------------------------------------------------
+
+
+def test_status_sabit_yazilmamis_gercek_saglik_govdesinden_geliyor() -> None:
+    """`status` ve `issues` ELLE degil `_build_health_body`'den gelmeli.
+
+    Ilk yazimda burada duz `status="ok"` vardi: outbox dolarken, bir thread
+    olmusken ya da disk biterken bile backend'e "iyiyim" derdi — duzeltmeye
+    calistigimiz yalanin ta kendisi. Metin araması bunu yakalayamaz (yorumda
+    da "ok" gecer), bu yuzden CAGRININ kendisi AST ile inceleniyor.
+    """
+    import ast
+    import pathlib
+
+    kaynak = (pathlib.Path(__file__).resolve().parents[1] / "src" / "dnp3_gateway" / "main.py").read_text(
+        encoding="utf-8"
+    )
+
+    cagrilar = [
+        d
+        for d in ast.walk(ast.parse(kaynak))
+        if isinstance(d, ast.Call) and isinstance(d.func, ast.Attribute) and d.func.attr == "build_payload"
+    ]
+    assert len(cagrilar) == 1, "build_payload cagrisi bulunamadi ya da birden fazla"
+
+    kw = {k.arg: k.value for k in cagrilar[0].keywords}
+    assert "status" in kw, "status hic gecilmiyor"
+    assert not isinstance(kw["status"], ast.Constant), (
+        "status SABIT yazilmis — gercek saglik durumu yerine sabit deger gidiyor"
+    )
+    # `issues` olmadan backend 'degraded'in NEDENINI hic ogrenemez.
+    assert "issues" in kw and not isinstance(kw["issues"], ast.Constant), "issues gecilmiyor ya da sabit"

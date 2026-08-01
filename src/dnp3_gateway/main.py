@@ -38,7 +38,7 @@ from dnp3_gateway.backend import (
 from dnp3_gateway.config import Settings, settings
 from dnp3_gateway.health_server import (
     ThreadLiveness,
-    _device_health_snapshot,
+    _build_health_body,
     start_health_server,
 )
 from dnp3_gateway.logging_setup import configure_logging, register_secret
@@ -838,14 +838,45 @@ def run(current_settings: Settings | None = None) -> int:
     # guncelleyebiliyor. Ariza bekleyen bir gosterge saatlerce sessiz kalabilir;
     # "veri gelmiyor" ile "haberlesme koptu" ayrimini yapabilecek tek yer
     # gateway, cunku DNP3 link durumu burada tutuluyor.
-    baslangic_ts = time.time()
+    # Durum ve sorun listesi `/health` ile AYNI kaynaktan geliyor. Burada
+    # elle "ok" yazmak, outbox dolarken ya da bir thread olmusken bile
+    # backend'e "iyiyim" dedirtirdi — duzeltmeye calistigimiz yalanin ta
+    # kendisi. Tek dogruluk kaynagi `_build_health_body`.
+    #
+    # ONBELLEK: govde uretimi outbox/metrik/thread anlik goruntusu aliyor;
+    # komut-poll saniyede bir kosuyor ve bu kutu 2 cekirdekli. Backend zaten
+    # 25 saniyede birden sik yazmiyor, dolayisiyla saniyede bir uretmenin
+    # karsiligi yok. 10 saniye, yazma araliginin yarisindan kisa — bayat
+    # veri gonderme riski yok.
+    saglik_onbellek_sec = 10.0
+    saglik_onbellek: dict[str, Any] = {"ts": 0.0, "govde": None}
 
     def _saglik_govdesi() -> dict[str, Any]:
+        simdi = time.monotonic()
+        if saglik_onbellek["govde"] is not None and (simdi - saglik_onbellek["ts"]) < saglik_onbellek_sec:
+            return saglik_onbellek["govde"]
+
         okuyucu = reader_holder.get("reader")
-        cihaz_sayisi = len(state.devices)
-        ozet = _device_health_snapshot(okuyucu, cihaz_sayisi)
-        # Cihaz kodlari YALNIZCA bu kimlik dogrulamali baslikta gider;
-        # /health auth'suz oldugu icin orada asla yer almaz.
+        govde, _http = _build_health_body(
+            state=state,
+            gateway_code=identity.gateway_code,
+            gateway_mode=cfg.gateway_mode,
+            config_ready=config_ready,
+            instance_id=identity.instance_id,
+            app_environment=identity.app_environment,
+            health_port=actual_health_port,
+            publisher=publisher_holder.get("publisher"),
+            metrics=metrics,
+            reader=okuyucu,
+            liveness=liveness,
+            poll_interval_sec=cfg.default_poll_interval_sec,
+            disk_guard=disk_guard,
+            clock_guard=clock_guard,
+        )
+
+        # Cihaz KODLARI yalnizca bu kimlik dogrulamali baslikta gider.
+        # `/health` auth'suz oldugu icin govdedeki `devices` sadece sayim
+        # tasir; kod bazli durumu adapter'dan ayrica aliyoruz.
         per_device: dict[str, Any] = {}
         saglik_fn = getattr(okuyucu, "device_health", None)
         if callable(saglik_fn):
@@ -853,16 +884,21 @@ def run(current_settings: Settings | None = None) -> int:
                 per_device = saglik_fn() or {}
             except Exception:  # noqa: BLE001
                 per_device = {}
-        return health_header.build_payload(
-            status="ok",
-            device_summary=ozet,
+
+        outbox_snap = govde.get("outbox") or {}
+        sonuc = health_header.build_payload(
+            status=str(govde.get("status") or "unknown"),
+            device_summary=govde.get("devices"),
             per_device=per_device,
-            # Ucuz sayac (tahmini); her saniye calisacagi icin COUNT(*) degil.
-            outbox_pending=outbox.pending_count(),
-            outbox_dead_letter=outbox.dead_letter_count(),
-            uptime_sec=int(time.time() - baslangic_ts),
+            outbox_pending=outbox_snap.get("outbox_pending"),
+            outbox_dead_letter=outbox_snap.get("outbox_dead_letter"),
+            uptime_sec=(govde.get("metrics") or {}).get("uptime_sec"),
             gateway_version=__version__,
+            issues=govde.get("issues"),
         )
+        saglik_onbellek["ts"] = simdi
+        saglik_onbellek["govde"] = sonuc
+        return sonuc
 
     config_client = BackendConfigClient(
         base_url=cfg.backend_api_url,
