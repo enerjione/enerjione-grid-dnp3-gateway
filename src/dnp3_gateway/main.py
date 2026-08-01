@@ -32,10 +32,15 @@ from dnp3_gateway.backend import (
     BackendConfigClient,
     GatewayConfigError,
     _log_allowlist_state,
+    health_header,
     parse_device_ip_allowlist,
 )
 from dnp3_gateway.config import Settings, settings
-from dnp3_gateway.health_server import ThreadLiveness, start_health_server
+from dnp3_gateway.health_server import (
+    ThreadLiveness,
+    _device_health_snapshot,
+    start_health_server,
+)
 from dnp3_gateway.logging_setup import configure_logging, register_secret
 from dnp3_gateway.messaging import CommandLedger, Outbox, OutboxRetrier
 from dnp3_gateway.messaging.resilient_publisher import ResilientPublisher
@@ -826,6 +831,39 @@ def run(current_settings: Settings | None = None) -> int:
             "ornek: DNP3_DEVICE_ALLOWED_SUBNETS=192.168.10.0/24,10.0.5.0/24"
         )
 
+    # Saglik ozeti: saniyede bir zaten atilan `/pending` istegine baslik olarak
+    # biner (bkz. backend/health_header.py). Ek istek, ek baglanti YOK.
+    #
+    # NEDEN GEREKLI: backend cihaz durumunu yalnizca telemetri geldiginde
+    # guncelleyebiliyor. Ariza bekleyen bir gosterge saatlerce sessiz kalabilir;
+    # "veri gelmiyor" ile "haberlesme koptu" ayrimini yapabilecek tek yer
+    # gateway, cunku DNP3 link durumu burada tutuluyor.
+    baslangic_ts = time.time()
+
+    def _saglik_govdesi() -> dict[str, Any]:
+        okuyucu = reader_holder.get("reader")
+        cihaz_sayisi = len(state.devices)
+        ozet = _device_health_snapshot(okuyucu, cihaz_sayisi)
+        # Cihaz kodlari YALNIZCA bu kimlik dogrulamali baslikta gider;
+        # /health auth'suz oldugu icin orada asla yer almaz.
+        per_device: dict[str, Any] = {}
+        saglik_fn = getattr(okuyucu, "device_health", None)
+        if callable(saglik_fn):
+            try:
+                per_device = saglik_fn() or {}
+            except Exception:  # noqa: BLE001
+                per_device = {}
+        return health_header.build_payload(
+            status="ok",
+            device_summary=ozet,
+            per_device=per_device,
+            # Ucuz sayac (tahmini); her saniye calisacagi icin COUNT(*) degil.
+            outbox_pending=outbox.pending_count(),
+            outbox_dead_letter=outbox.dead_letter_count(),
+            uptime_sec=int(time.time() - baslangic_ts),
+            gateway_version=__version__,
+        )
+
     config_client = BackendConfigClient(
         base_url=cfg.backend_api_url,
         identity=identity,
@@ -847,6 +885,10 @@ def run(current_settings: Settings | None = None) -> int:
         verify=_tls_verify_param(cfg),
         response_max_bytes=cfg.backend_response_max_bytes,
         device_ip_allowlist=device_ip_allowlist,
+        # Saglik ozeti komut-poll'e biner: config-refresh 5 dakikada bir kosar,
+        # komut-poll saniyede bir. Cihaz kaybini 5 dakika gec ogrenmek, "double
+        # check" olmasi gereken mekanizmanin amacini bosa cikarirdi.
+        health_provider=_saglik_govdesi,
     )
 
     refresh_thread = Thread(
