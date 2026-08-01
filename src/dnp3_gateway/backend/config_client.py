@@ -24,6 +24,7 @@ from typing import Any
 import requests
 
 from dnp3_gateway.auth import GatewayIdentity, build_config_request_headers
+from dnp3_gateway.backend import health_header
 from dnp3_gateway.backend.http_session import build_http_session
 
 # Modul-seviye logger. ONEMLI: eskiden bazi fonksiyonlar `import logging as
@@ -330,6 +331,13 @@ class BackendConfigClient:
         # Gateway saati TUM arsivin tek zaman referansidir ve daha once
         # hicbir yerde dogrulanmiyordu.
         clock_guard: Any = None,
+        # Saglik ozeti saglayicisi: cagirildiginda backend'e gonderilecek
+        # govdeyi dondurur (bkz. backend/health_header.py). None ise baslik
+        # HIC eklenmez ve davranis eskisiyle ayni kalir.
+        #
+        # Callable secildi cunku saglik anlik bir durum; client'in icinde
+        # kopya tutmak bayat veri gondermek olurdu.
+        health_provider: Any = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.identity = identity
@@ -338,6 +346,7 @@ class BackendConfigClient:
         self._response_max_bytes = max(64 * 1024, int(response_max_bytes))
         self._device_ip_allowlist = device_ip_allowlist
         self._clock_guard = clock_guard
+        self._health_provider = health_provider
         # Sartli istek onbellegi (ETag). Config nadiren degisir; her yoklamada
         # 193 sinyali indirmemek icin son ETag ve son AYRISTIRILMIS config
         # saklanir. 304 gelince ag uzerinden hicbir sey inmez ve JSON yeniden
@@ -528,6 +537,20 @@ class BackendConfigClient:
         self._last_etag = etag or None
         return config
 
+    def _build_health_header(self) -> str | None:
+        """Saglik basligini uretir; HER hata sessizce yutulur."""
+        saglayici = self._health_provider
+        if saglayici is None:
+            return None
+        try:
+            govde = saglayici()
+        except Exception:  # noqa: BLE001
+            logger.debug("saglik saglayicisi patladi", exc_info=True)
+            return None
+        if not isinstance(govde, dict):
+            return None
+        return health_header.encode_header(govde)
+
     def fetch_pending_commands(self) -> PendingPoll:
         """Hafif komut-poll — GET /gateways/{code}/pending.
 
@@ -543,6 +566,14 @@ class BackendConfigClient:
 
         url = f"{self.base_url}/gateways/{self.gateway_code}/pending"
         headers = build_config_request_headers(self.identity)
+        # SAGLIK OZETI — bu istege biner, ek istek yok.
+        #
+        # KOMUT KANALI KUTSAL: buradaki hicbir sey `/pending` cagrisini
+        # dusurmemeli. Saglayici patlarsa, govde uretilemezse ya da baslik
+        # tavani asarsa sessizce vazgecilir ve komutlar normal gider.
+        saglik = self._build_health_header()
+        if saglik:
+            headers[health_header.HEADER_NAME] = saglik
         try:
             response = self._session.get(url, headers=headers, timeout=self.timeout_sec)
         except requests.RequestException as exc:
