@@ -137,6 +137,24 @@ def build_telemetry_payload(
         "value": None if is_string else reading.scaled_value,
         "value_string": reading.value_string,
         "quality": reading.quality,
+        # KALITENIN KAPSAMINI BU ALAN BELIRLER — gonderilmesi SART.
+        #
+        # Backend, bir kalitenin NOKTA seviyesinde mi CIHAZ seviyesinde mi
+        # oldugunu bu alanin VARLIGINDAN anliyor
+        # (bkz. backend schemas/telemetry.py + tag_engine_service):
+        #
+        #   dnp3_flags is not None  -> nokta seviyesi; `invalid` / `restart` /
+        #                              `forced` gelse bile CIHAZ ONLINE kalir
+        #   dnp3_flags is None      -> cihaz seviyesi (0.4.x / legacy davranis)
+        #
+        # Alan gonderilmezse `GATEWAY_PUBLISH_DNP3_QUALITY` acildigi anda tek
+        # bir noktanin REFERENCE_ERR'i TUM CIHAZI OFFLINE yapardi: adapter
+        # bayragi okuyup tasiyordu ama govde onu dusuruyordu. Backend bu ayrimi
+        # v2.28.0'dan beri bekliyor.
+        #
+        # `comm_lost` her iki kapsamda da CIHAZ seviyesidir; bayrak tasisa
+        # bile OFFLINE kalir (backend tarafinda kilitli).
+        "dnp3_flags": reading.dnp3_flags,
         "source_timestamp": now_iso or datetime.now(timezone.utc).isoformat(),
     }
 

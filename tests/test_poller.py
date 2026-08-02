@@ -274,3 +274,60 @@ def test_run_poll_cycle_publishes_for_due_devices() -> None:
         )
         == 0
     )
+
+
+def test_dnp3_flags_govdeye_giriyor() -> None:
+    """`dnp3_flags` telemetri govdesinde OLMAK ZORUNDA.
+
+    Backend kalitenin NOKTA mi CIHAZ seviyesinde mi oldugunu bu alanin
+    VARLIGINDAN anliyor (schemas/telemetry.py + tag_engine_service):
+
+        dnp3_flags is not None -> nokta seviyesi; `invalid`/`restart`/`forced`
+                                  gelse bile cihaz ONLINE kalir
+        dnp3_flags is None     -> cihaz seviyesi (legacy)
+
+    Adapter bayragi okuyup `SignalReading`de tasiyordu ama govde onu
+    dusuruyordu. Bu haliyle `GATEWAY_PUBLISH_DNP3_QUALITY` acilsaydi TEK bir
+    noktanin REFERENCE_ERR'i TUM CIHAZI OFFLINE yapardi.
+    """
+    device = make_device("DEV-1")
+    reading = SignalReading(
+        signal_key="master.actual_current",
+        source="master",
+        data_type="analog",
+        raw_value=0.0,
+        scaled_value=0.0,
+        quality="invalid",
+        dnp3_flags=0x21,  # ONLINE | REFERENCE_ERR
+    )
+    payload = build_telemetry_payload(
+        gateway_code="GW-001",
+        device=device,
+        reading=reading,
+        correlation_id="corr-1",
+    )
+    assert payload["dnp3_flags"] == 0x21
+    assert payload["quality"] == "invalid"
+
+
+def test_dnp3_flags_yoksa_none_gider_anahtar_yine_var() -> None:
+    """Bayrak okunamamis olabilir; anahtar yine bulunmali, degeri None olmali.
+
+    Anahtarin HIC olmamasi ile `None` olmasi backend'de AYNI sonucu verir
+    (legacy/cihaz seviyesi), ama alani her zaman gondermek sozlesmeyi
+    tek bicimli tutar ve "gonderilmeyi unuttuk mu" sorusunu ortadan kaldirir.
+    """
+    device = make_device("DEV-1")
+    reading = SignalReading(
+        signal_key="master.actual_current",
+        source="master",
+        data_type="analog",
+        raw_value=1.0,
+        scaled_value=1.0,
+        quality="good",
+    )
+    payload = build_telemetry_payload(
+        gateway_code="GW-001", device=device, reading=reading, correlation_id="c"
+    )
+    assert "dnp3_flags" in payload
+    assert payload["dnp3_flags"] is None

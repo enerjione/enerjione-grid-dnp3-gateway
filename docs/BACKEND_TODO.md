@@ -13,7 +13,40 @@ diger tum production riskleri kapatildi (bkz. `CHANGELOG.md` 0.5.0).
 
 ---
 
-## B1. DNP3 kalite bayraklari yayina eklenecek
+## B1. DNP3 kalite bayraklari yayina eklenecek — ⚙️ TEK ENV BAYRAGI KALDI
+
+**Backend durumu:** ✅ HAZIR — ve dusunuldugunden cok once. `invalid`,
+`restart`, `forced` token'lari **v2.28.0**'dan beri taniniyor; dahasi
+backend NOKTA/CIHAZ kapsam ayrimini da yapiyor
+(`map_quality_to_status_scoped`, `_POINT_LEVEL_QUALITIES`,
+`ALARM_BLOCKING_QUALITIES`). Bu maddenin "backend'de yapilacak" kismi
+YAZILDIGINDA ZATEN YAPILMISTI.
+
+**Gateway'de eksik olan neydi:** `poller.build_telemetry_payload` govdeye
+`dnp3_flags` KOYMUYORDU. Adapter bayragi okuyup `SignalReading`de tasiyor,
+govde onu dusuruyordu.
+
+Bu, bayragi acmayi TEHLIKELI yapiyordu: backend kalitenin nokta mi cihaz
+seviyesinde mi oldugunu `dnp3_flags`in VARLIGINDAN anliyor. Alan gitmeyince
+tek bir noktanin `REFERENCE_ERR`i CIHAZ seviyesi sayilip TUM CIHAZI OFFLINE
+yapardi — harita kirmizi, "son veri" sayaci donar.
+
+Iki depo birlikte kosturularak dogrulandi:
+
+| senaryo | kalite | cihaz (`dnp3_flags` VAR) | cihaz (YOKKEN) |
+|---|---|---|---|
+| CT referans hatasi | `invalid` | **online** ✅ | offline ❌ |
+| operator zorlamis | `forced` | online ✅ | online |
+| cihaz reboot etti | `restart` | **online** ✅ | offline ❌ |
+| link koptu | `comm_lost` | **offline** ✅ | offline ✅ |
+
+Dordunde de alarm degerlendirmesi BLOKE — olcume guvenilmiyor, alarm durumu
+donuyor. `comm_lost` her iki kapsamda da cihaz seviyesi kaliyor (dogru).
+
+**KALAN TEK IS:** `GATEWAY_PUBLISH_DNP3_QUALITY=true`. Saha genelinde ya da
+gateway bazinda acilabilir; backend yillardir hazir, govde artik dogru.
+
+<details><summary>Ozgun kayit</summary>
 
 **Gateway durumu:** ✅ Adapter kalite bayraklarini artik OKUYOR ve tasiyor
 (`SignalReading.dnp3_flags`), ancak yayinlanan `quality` alani geriye uyum icin
@@ -46,6 +79,8 @@ backend bunlari tanimiyorsa olcumleri reddedebilir veya yanlis isleyebilir.
 
 **Gecis kolayligi:** `GATEWAY_PUBLISH_DNP3_QUALITY` env bayragi eklendi
 (default `false`). Backend hazir olunca saha genelinde tek tek acilabilir.
+
+</details>
 
 ---
 
@@ -208,9 +243,9 @@ Gateway tarafi 404/400'e toleransli yazilacak (eski backend'de sessizce atlar).
 
 | # | Konu | Gateway hazir mi | Deploy sirasi | Onceligi |
 |---|---|---|---|---|
-| B1 | Kalite bayraklari | ✅ (bayrakla kapali) | Backend → Gateway | Yuksek — olcum dogrulugu |
+| B1 | Kalite bayraklari | ⚙️ **tek env bayragi kaldi** | — (backend v2.28.0'dan hazir) | Yuksek — olcum dogrulugu |
 | B2 | Cihaz zaman damgasi | ⚠️ zaman-senk var | Backend → Gateway (**B1'den SONRA**) | Yuksek — SOE/ariza analizi |
 | B3 | Per-device katalog | ❌ kontrat sart | Backend → Gateway | Orta — cok markali filoda kritik |
 | B4 | Saglik heartbeat | ✅ **TAMAMLANDI** | — | ~~Yuksek — kor nokta~~ |
 
-**Onerilen calisma sirasi:** ~~B4~~ (tamamlandi) → B1 → B2 → B3.
+**Onerilen calisma sirasi:** ~~B4~~ (tamamlandi) → ~~B1~~ (bayrak acilinca biter) → B2 → B3.
