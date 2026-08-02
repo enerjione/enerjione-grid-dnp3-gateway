@@ -345,9 +345,7 @@ def test_saat_sicramasi_cihazi_bayat_yapmaz(monkeypatch) -> None:
     monkeypatch.setattr(time, "time", lambda: gercek_time() + 365 * 86400)
 
     # Bayatlik karari ETKILENMEMELI: monotonic damga yerinde duruyor.
-    assert time.monotonic() - c.last_update_at() < 5.0, (
-        "bayatlik hesabi duvar saatinden etkilenmis"
-    )
+    assert time.monotonic() - c.last_update_at() < 5.0, "bayatlik hesabi duvar saatinden etkilenmis"
 
 
 def test_recovery_grace_saat_sicramasindan_etkilenmez(monkeypatch) -> None:

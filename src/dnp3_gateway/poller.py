@@ -547,6 +547,7 @@ def run_poll_cycle(
     def _baslamis_mi(device: DeviceConfig) -> float | None:
         with baslama_lock:
             return baslama.get(device.code)
+
     # Tum cycle icin global timeout: belirlenen sure asilirsa pending
     # future'lar iptal edilir. stop_event set'lenirse erken cik.
     #

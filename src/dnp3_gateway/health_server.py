@@ -1116,9 +1116,7 @@ def _build_health_body(
     if ledger_snap:
         # Komut defteri ozeti: sifirlanma bayragi + bekleyen/olu sonuc sayisi.
         # Karantina dosyasinin YOLU burada YOK — /health auth'suz.
-        body["command_ledger"] = {
-            k: v for k, v in ledger_snap.items() if k != "journal_reset_path"
-        }
+        body["command_ledger"] = {k: v for k, v in ledger_snap.items() if k != "journal_reset_path"}
     return body, http_code
 
 

@@ -200,9 +200,7 @@ def test_devre_acikken_aga_gidilmez() -> None:
     for _ in range(20):
         with pytest.raises(HttpTelemetryNotReadyError):
             publisher.publish(_payload(), message_id="m2")
-    assert session.post_sayisi == 1, (
-        f"devre acikken {session.post_sayisi - 1} gereksiz POST denendi"
-    )
+    assert session.post_sayisi == 1, f"devre acikken {session.post_sayisi - 1} gereksiz POST denendi"
 
     # Hata GECICI kalmali: mesaj outbox'a yazilir, retry_count artmaz,
     # dead-letter'a dusmez. Veri kaybi yok.

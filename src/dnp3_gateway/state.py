@@ -504,9 +504,7 @@ class GatewayState:
         # dusurmemis oluruz. Aksi halde cihaz yoklanmaz.
         with self._lock:
             grup_sayisi = len(self._signals_by_profile)
-            filo_profilleri = {
-                (getattr(d, "signal_profile", None) or "").strip() for d in self._devices
-            }
+            filo_profilleri = {(getattr(d, "signal_profile", None) or "").strip() for d in self._devices}
             duz_liste = list(self._signals)
 
         tek_model = grup_sayisi <= 1 and len(filo_profilleri) <= 1
