@@ -45,6 +45,12 @@ class SignalReading:
     # `quality` alanina yansitilmasi backend tag-engine hazir olunca acilacak
     # (bkz. docs/BACKEND_TODO.md#B1). None = adapter bayrak saglamiyor.
     dnp3_flags: int | None = None
+    #: Cihazin KENDI olay zaman damgasi (epoch saniye). Yalnizca cihaz
+    #: gonderdiyse ve damga makul araliktaysa dolu — bkz.
+    #: `dogrula_cihaz_zamani`. RTC'si olmus cihaz 2000-01-01 damgalar.
+    device_event_at: float | None = None
+    #: "synchronized" | "unsynchronized" | "invalid" | None (damga yok)
+    timestamp_quality: str | None = None
 
 
 class TelemetryReader(ABC):

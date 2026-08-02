@@ -69,7 +69,7 @@ def test_peek_if_dirty_bayragi_temizlemez() -> None:
 def test_commit_published_bayragi_temizler() -> None:
     c = _DeviceCache()
     c.set(_G, 1, 5.0)
-    raw, _s, _f, version = c.peek_if_dirty(_G, 1)
+    raw, _s, _f, version, _dt, _tq = c.peek_if_dirty(_G, 1)
     assert raw == 5.0
     assert c.commit_published([(_G, 1, version)]) == 1
     assert c.peek_if_dirty(_G, 1) is None
@@ -80,7 +80,7 @@ def test_okuma_ile_onay_arasinda_gelen_deger_kaybolmaz() -> None:
     """REGRESYON (TOCTOU): eski kod bu senaryoda yeni degeri kalici kaybediyordu."""
     c = _DeviceCache()
     c.set(_G, 1, 0.0)  # kesici KAPALI
-    raw, _s, _f, version = c.peek_if_dirty(_G, 1)
+    raw, _s, _f, version, _dt, _tq = c.peek_if_dirty(_G, 1)
     assert raw == 0.0
 
     # Tam bu sirada cihaz ACILIYOR — DNP3 IO thread'i yeni degeri yaziyor
@@ -100,7 +100,7 @@ def test_ayni_deger_tekrar_yazilirsa_surum_ilerlemez() -> None:
     """Class 0 baseline scan ayni degeri yazdiginda gereksiz yayin olmamali."""
     c = _DeviceCache()
     c.set(_G, 1, 5.0)
-    _r, _s, _f, v1 = c.peek_if_dirty(_G, 1)
+    _r, _s, _f, v1, _dt, _tq = c.peek_if_dirty(_G, 1)
     c.commit_published([(_G, 1, v1)])
     c.set(_G, 1, 5.0)  # ayni deger
     assert c.peek_if_dirty(_G, 1) is None
@@ -110,7 +110,7 @@ def test_mark_all_dirty_surumleri_ilerletir() -> None:
     """Ucus halindeki bir onay, recovery yeniden-yayinini iptal etmemeli."""
     c = _DeviceCache()
     c.set(_G, 1, 5.0)
-    _r, _s, _f, version = c.peek_if_dirty(_G, 1)
+    _r, _s, _f, version, _dt, _tq = c.peek_if_dirty(_G, 1)
 
     # refresh-all / recovery: her sey yeniden yayinlanacak
     assert c.mark_all_dirty() == 1

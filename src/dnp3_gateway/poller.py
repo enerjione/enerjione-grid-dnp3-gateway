@@ -166,7 +166,31 @@ def build_telemetry_payload(
         # `comm_lost` her iki kapsamda da CIHAZ seviyesidir; bayrak tasisa
         # bile OFFLINE kalir (backend tarafinda kilitli).
         "dnp3_flags": reading.dnp3_flags,
+        # `source_timestamp` GATEWAY saatidir ve anlami DEGISMEDI. Bu alan
+        # backend'de historian'in birincil anahtarinin parcasi, TimescaleDB
+        # partition kolonu ve retention/disk-guard silme kriteri. Anlamini
+        # "cihaz zamani" yapmak gecmise damgali satirlarla INSERT'i
+        # patlatabilir, ileriye damgali satirlari ise retention'a gorunmez
+        # kilardi (bkz. backend migration 0025).
         "source_timestamp": now_iso or datetime.now(timezone.utc).isoformat(),
+        # Cihazin KENDI olay damgasi — AYRI alan.
+        #
+        # NEDEN GEREKLI: 4G link 10 dakika koparsa outstation olaylari kendi
+        # damgalariyla biriktirir; link gelince hepsi tek fragment'ta bosalir
+        # ve gateway hepsine ayni saniyeyi basar. Ariza SURESI ve olay SIRASI
+        # kaybolur. Bu alan o bilgiyi korur.
+        #
+        # DAMGA DOGRULANMIS gelir: cihaz saatine guvenilmiyor. RTC pili biten
+        # gosterge 2000-01-01 damgalar; makul araligin disindaki damga
+        # adapter'da DUSURULDU ve `timestamp_quality` "invalid" oldu — burada
+        # None gorulur. Olcumun kendisi HER ZAMAN yayinlanir.
+        "device_event_at": (
+            datetime.fromtimestamp(reading.device_event_at, timezone.utc).isoformat()
+            if reading.device_event_at is not None
+            else None
+        ),
+        # "synchronized" | "unsynchronized" | "invalid" | None (damga yok)
+        "timestamp_quality": reading.timestamp_quality,
     }
 
 

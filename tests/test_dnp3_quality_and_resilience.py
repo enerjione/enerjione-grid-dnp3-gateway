@@ -79,7 +79,7 @@ def test_cache_bayraklari_tasir() -> None:
     c.set(_G, 1, 5.0, flags=0x41)
     taken = c.peek_if_dirty(_G, 1)
     assert taken is not None
-    raw, _text, flags, _version = taken
+    raw, _text, flags, _version, _dt, _tq = taken
     assert raw == 5.0
     assert flags == 0x41
 
@@ -88,7 +88,7 @@ def test_sadece_bayrak_degisimi_de_yayin_tetikler() -> None:
     """Deger ayni kalsa da nokta 'gecerli'den 'REFERENCE_ERR'e gectiyse SCADA gormeli."""
     c = _DeviceCache()
     c.set(_G, 1, 5.0, flags=0x01)
-    _r, _t, _f, v = c.peek_if_dirty(_G, 1)
+    _r, _t, _f, v, _dt, _tq = c.peek_if_dirty(_G, 1)
     c.commit_published([(_G, 1, v)])
     assert c.peek_if_dirty(_G, 1) is None
 

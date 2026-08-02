@@ -95,6 +95,96 @@ def _extract_flags(measurement: Any) -> int | None:
         return None
 
 
+# --- Cihazin kendi olay zaman damgasi (B2) ---------------------------------
+#
+# NEDEN GEREKLI: gateway `source_timestamp` olarak KENDI saatini basiyor ve
+# bir cihazin tum sinyallerine ayni degeri veriyor. 4G link 10 dakika koparsa
+# outstation olaylari KENDI damgalariyla event buffer'inda biriktirir; link
+# gelince hepsi tek fragment'ta bosalir ve gateway hepsini ayni saniyeye
+# damgalar. Ariza SURESI ve olay SIRASI kalici olarak kaybolur.
+#
+# NEDEN GUVENILMIYOR: saha cihazinin RTC pili biter ve cihaz 2000-01-01'den
+# saymaya baslar. Boyle bir damgayi oldugu gibi kabul etmek, olay verisini
+# 26 yil geriye tasimak demektir. Damga DOGRULANIYOR; gecmezse degeri
+# ATMIYORUZ, yalnizca "bu damgaya guvenilmez" diyoruz.
+
+#: Damga bu kadar GELECEKTE ise cihazin saati ileri kaymis demektir.
+#: Kucuk bir tolerans: cihaz ve gateway saatleri birkac saniye ayrisabilir.
+_DAMGA_GELECEK_TOLERANS_SN = 120.0
+
+#: Damga bu kadar GERIDE ise guvenilmez. Event buffer'i pratikte saatler
+#: tutar; 7 gun fazlasiyla comert. RTC'si olmus bir cihazin bildirdigi
+#: 2000-01-01 bu pencerenin cok disinda kalir ve yakalanir.
+_DAMGA_GECMIS_TOLERANS_SN = 7 * 24 * 3600.0
+
+
+def _extract_device_time(measurement: Any) -> tuple[float | None, str | None]:
+    """Olcumden (epoch_saniye, damga_kalitesi) cikarir.
+
+    Donen kalite: "synchronized" | "unsynchronized" | "invalid" | None
+      * None  -> cihaz damga GONDERMEDI (statik/Class 0 okumasi). Eksiklik
+                 degil, o okumanin dogasi.
+      * invalid -> damga var ama GUVENILMEZ (cihaz oyle dedi ya da deger
+                   makul araligin disinda). `device_event_at` GONDERILMEZ.
+    """
+    ham = getattr(measurement, "time", None)
+    if ham is None:
+        return None, None
+
+    # Binding surumleri arasinda API farkli: `.value` (ms) ya da dogrudan int.
+    deger = getattr(ham, "value", ham)
+    try:
+        ms = int(deger)
+    except (TypeError, ValueError):
+        return None, None
+    if ms <= 0:
+        # Epoch 0 = "saat kurulmamis". Damga yokmus gibi davranmak yanlis
+        # olurdu: cihaz bir sey SOYLEDI ve soyledigi sey gecersiz.
+        return None, "invalid"
+
+    epoch = ms / 1000.0
+
+    # Cihazin KENDI beyani varsa once ona bak: opendnp3 damganin senkron
+    # olup olmadigini bildirebiliyor.
+    kalite_ham = getattr(ham, "quality", None)
+    beyan = str(getattr(kalite_ham, "name", kalite_ham) or "").strip().upper()
+    if beyan and ("INVALID" in beyan or "NOT_SYNC" in beyan or "UNSYNC" in beyan):
+        # Cihaz "bu saate guvenme" diyor — makul araliktaysa bile.
+        return epoch, "unsynchronized" if "SYNC" in beyan else "invalid"
+
+    return epoch, "synchronized"
+
+
+def dogrula_cihaz_zamani(
+    epoch: float | None, kalite: str | None, simdi: float
+) -> tuple[float | None, str | None]:
+    """Damgayi makul araliga gore suzer. Donus: (kullanilacak_epoch, kalite).
+
+    OLCUM ASLA ATILMAZ — yalnizca damga reddedilir. Reddedilen damga
+    `device_event_at` olarak GONDERILMEZ; backend o okuma icin gateway
+    saatine (`source_timestamp`) duser ve `timestamp_quality` neden
+    duruldugunu soyler.
+    """
+    if epoch is None:
+        return None, kalite
+    if epoch > simdi + _DAMGA_GELECEK_TOLERANS_SN:
+        return None, "invalid"
+    if epoch < simdi - _DAMGA_GECMIS_TOLERANS_SN:
+        # Klasik vaka: RTC pili bitmis cihaz 2000-01-01'den sayiyor.
+        return None, "invalid"
+    return epoch, kalite
+
+
+def _zaman_kwargs(measurement: Any) -> dict[str, Any]:
+    """`cache.set(**...)` icin damga alanlari. Hata HICBIR kosulda okuma
+    yolunu dusurmemeli — damga bir ek bilgidir, olcumun kendisi degil."""
+    try:
+        epoch, kalite = _extract_device_time(measurement)
+    except Exception:  # noqa: BLE001
+        return {}
+    return {"device_time": epoch, "time_quality": kalite}
+
+
 def _double_bit_to_float(value: Any) -> float:
     """DoubleBit enum -> sayisal gosterim.
 
@@ -219,6 +309,8 @@ class _DeviceCache:
         value_string: str | None = None,
         *,
         flags: int | None = None,
+        device_time: float | None = None,
+        time_quality: str | None = None,
     ) -> None:
         """SOE handler'in cache'e yazma giris noktasi.
 
@@ -242,7 +334,7 @@ class _DeviceCache:
         key = (group, index)
         with self._lock:
             prev = self._values.get(key)
-            self._values[key] = (raw, value_string, flags)
+            self._values[key] = (raw, value_string, flags, device_time, time_quality)
             now = time.time()
             self._last_update_at = now
             # Kalite bayragi degisimi de bir DEGISIKLIKTIR: deger ayni kalsa
@@ -290,8 +382,11 @@ class _DeviceCache:
 
     # ---- Atomik okuma / yayin onayi ------------------------------------------
 
-    def peek_if_dirty(self, group: int, index: int) -> tuple[float, str | None, int | None, int] | None:
-        """Degismisse (deger, metin, surum) doner; DEGISTIRMEZ.
+    def peek_if_dirty(
+        self, group: int, index: int
+    ) -> tuple[float, str | None, int | None, int, float | None, str | None] | None:
+        """Degismisse (deger, metin, bayrak, surum, cihaz_zamani, damga_kalitesi)
+        doner; DEGISTIRMEZ.
 
         TEK lock altinda calisir. Eski kod ayni is icin lock'u UC KEZ aliyordu
         (`get` -> `is_dirty` -> `clear_dirty`) ve aralarda DNP3 IO thread'i
@@ -307,7 +402,14 @@ class _DeviceCache:
             entry = self._values.get(key)
             if entry is None:
                 return None
-            return entry[0], entry[1], entry[2], self._versions.get(key, 0)
+            return (
+                entry[0],
+                entry[1],
+                entry[2],
+                self._versions.get(key, 0),
+                entry[3] if len(entry) > 3 else None,
+                entry[4] if len(entry) > 4 else None,
+            )
 
     def commit_published(self, items: list[tuple[int, int, int]]) -> int:
         """Yayini onayla: surum HALA AYNIYSA dirty bayragini temizle.
@@ -493,6 +595,7 @@ def _make_soe_handler(cache: _DeviceCache, device_code: str) -> Any:
                             it.index,
                             1.0 if it.value.value else 0.0,
                             flags=_extract_flags(it.value),
+                            **_zaman_kwargs(it.value),
                         )
                 elif isinstance(first, opendnp3.Analog):
                     for it in values:
@@ -501,6 +604,7 @@ def _make_soe_handler(cache: _DeviceCache, device_code: str) -> Any:
                             it.index,
                             float(it.value.value),
                             flags=_extract_flags(it.value),
+                            **_zaman_kwargs(it.value),
                         )
                 elif isinstance(first, opendnp3.Counter):
                     for it in values:
@@ -509,6 +613,7 @@ def _make_soe_handler(cache: _DeviceCache, device_code: str) -> Any:
                             it.index,
                             float(it.value.value),
                             flags=_extract_flags(it.value),
+                            **_zaman_kwargs(it.value),
                         )
                 elif isinstance(first, opendnp3.BinaryOutputStatus):
                     for it in values:
@@ -517,6 +622,7 @@ def _make_soe_handler(cache: _DeviceCache, device_code: str) -> Any:
                             it.index,
                             1.0 if it.value.value else 0.0,
                             flags=_extract_flags(it.value),
+                            **_zaman_kwargs(it.value),
                         )
                 elif isinstance(first, opendnp3.AnalogOutputStatus):
                     for it in values:
@@ -525,6 +631,7 @@ def _make_soe_handler(cache: _DeviceCache, device_code: str) -> Any:
                             it.index,
                             float(it.value.value),
                             flags=_extract_flags(it.value),
+                            **_zaman_kwargs(it.value),
                         )
                 elif _DOUBLE_BIT_CLS is not None and isinstance(first, _DOUBLE_BIT_CLS):
                     # G3 Double-bit Binary Input — kesici pozisyonu icin DNP3'un
@@ -539,6 +646,7 @@ def _make_soe_handler(cache: _DeviceCache, device_code: str) -> Any:
                             it.index,
                             _double_bit_to_float(it.value.value),
                             flags=_extract_flags(it.value),
+                            **_zaman_kwargs(it.value),
                         )
                 elif _FROZEN_COUNTER_CLS is not None and isinstance(first, _FROZEN_COUNTER_CLS):
                     for it in values:
@@ -547,6 +655,7 @@ def _make_soe_handler(cache: _DeviceCache, device_code: str) -> Any:
                             it.index,
                             float(it.value.value),
                             flags=_extract_flags(it.value),
+                            **_zaman_kwargs(it.value),
                         )
                 elif isinstance(first, opendnp3.OctetString):
                     for it in values:
@@ -1513,7 +1622,12 @@ class Yadnp3TelemetryReader(TelemetryReader):
                     )
                 )
                 continue
-            raw, value_string, dnp3_flags, version = taken
+            raw, value_string, dnp3_flags, version, cihaz_zamani, damga_kalitesi = taken
+            # DAMGAYI DOGRULA. Cihaz saatine guvenilmez: RTC pili biten bir
+            # gosterge 2000-01-01'den sayar ve o damgayi oldugu gibi kabul
+            # etmek olay verisini 26 yil geriye tasirdi.
+            # Reddedilen damga yalnizca DUSER; olcum yayinlanmaya devam eder.
+            cihaz_zamani, damga_kalitesi = dogrula_cihaz_zamani(cihaz_zamani, damga_kalitesi, time.time())
             scaled = raw * s.scale + s.offset
             # Kalite: cihazin bildirdigi DNP3 bayraklarindan turetilir.
             # `publish_dnp3_quality` KAPALIYKEN (varsayilan) geriye uyum icin
@@ -1549,6 +1663,8 @@ class Yadnp3TelemetryReader(TelemetryReader):
                         quality="invalid",
                         value_string=None,
                         dnp3_flags=dnp3_flags,
+                        device_event_at=cihaz_zamani,
+                        timestamp_quality=damga_kalitesi,
                         read_token=(s.dnp3_object_group, s.dnp3_index, version),
                     )
                 )
