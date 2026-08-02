@@ -280,3 +280,23 @@ def test_status_sabit_yazilmamis_gercek_saglik_govdesinden_geliyor() -> None:
     )
     # `issues` olmadan backend 'degraded'in NEDENINI hic ogrenemez.
     assert "issues" in kw and not isinstance(kw["issues"], ast.Constant), "issues gecilmiyor ya da sabit"
+
+
+def test_surum_kaynaklari_ayrismasin() -> None:
+    """`VERSION` ile `pyproject.toml` ayni surumu soylemeli.
+
+    Iki kaynak var ve ikisi de kullaniliyor: `__version__` once kurulu paket
+    metadata'sini (pyproject) okur, bulamazsa repo kokundeki VERSION'a duser.
+    0.6.0 cikarilirken yalnizca pyproject bumplandi; VERSION 0.5.0 kaldi ve
+    repo'dan dogrudan calisan gateway YANLIS surum raporladi — bu surum
+    saglik basligiyla backend'e gidiyor, yani operator guncellemenin
+    dustugunu goremezdi.
+    """
+    import pathlib
+    import re
+
+    kok = pathlib.Path(__file__).resolve().parents[1]
+    dosya = (kok / "VERSION").read_text(encoding="utf-8").strip()
+    proje = re.search(r'^version\s*=\s*"([^"]+)"', (kok / "pyproject.toml").read_text(encoding="utf-8"), re.M)
+    assert proje is not None, "pyproject.toml icinde version bulunamadi"
+    assert dosya == proje.group(1), f"surum kaynaklari ayristi: VERSION={dosya}, pyproject={proje.group(1)}"
