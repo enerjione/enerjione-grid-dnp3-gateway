@@ -6,10 +6,20 @@
 | --- | --- | --- | --- |
 | `GATEWAY_CODE` | Is mantigi kimligi; backend `gateways.code` | `.env` / secret store | Sir degil |
 | `GATEWAY_TOKEN` | Backend config endpoint'ine erisim (X-Gateway-Token) | `.env` / vault / **asla** git | **Sir** |
-| `GATEWAY_REFRESH_TOKEN` | `POST /refresh-all` operator endpoint'i Bearer auth | `.env` / vault | **Sir** |
+| `GATEWAY_REFRESH_TOKEN` | `POST /refresh-all`, `/info`, `/metrics` Bearer auth | `.env` / vault | **Sir** |
+| `GATEWAY_COMMAND_TOKEN` | `POST /operate` — **fiziksel kesici manevrasi** Bearer auth | `.env` / vault | **Sir (en kritik)** |
 | `GATEWAY_INSTANCE_ID` (opsiyonel) | Coklu kopya tespiti, log korelasyonu | Bos ise `GATEWAY_STATE_DIR/instance_{kod}.id` | Bilgi |
 | `APP_ENVIRONMENT` | `development` / `staging` / `production` validator sertligi | `.env` | Sir degil |
-| `NATS_CREDENTIALS_PATH` | NATS NKEY/JWT credentials dosya yolu | `.env` (dosya icerigi sir) | **Sir** |
+| `NATS_CREDENTIALS_PATH` (legacy) | NATS NKEY/JWT credentials dosya yolu | `.env` (dosya icerigi sir) | **Sir** |
+
+Production validator uc token'in de **birbirinden farkli** olmasini zorlar ve
+placeholder degerleri (`change-me`, `test`, ...) reddeder. Gerekce: config
+okuma yetkisi ile kesici acma yetkisi ayni sir olamaz — telemetri icin
+paylasilan bir token, sahada enerji kesme yetkisine donusurdu.
+
+Uc token da bos birakilabilir; o zaman ilgili endpoint **503** doner
+(kapali). Normal NAT-arkasi kurulumda `GATEWAY_COMMAND_TOKEN` gereksizdir —
+komutlar `GET /pending` pull kanaliyla gelir.
 
 Sahada **N gateway** = **N ayri `gateways` satiri** + cihazlar `device.gateway_code`
 ile bolusturulur. Ayni `GATEWAY_CODE` + farkli `GATEWAY_TOKEN` calismaz (backend
@@ -51,8 +61,8 @@ exponential backoff'a duser. HTTPS yokken MITM korumasi saglar.
 - **Production:** `BACKEND_API_URL=https://...` zorunlu (public host icin
   validator zorlar); private/loopback ag (RFC1918, 127.x, *.local, *.lan,
   *.internal, localhost) icin http:// kabul.
-- **NATS:** `NATS_URL=tls://...` zorunlu (public host icin); private host
-  icin `nats://` kabul.
+- **NATS (legacy):** `NATS_URL=tls://...` zorunlu (public host icin); private
+  host icin `nats://` kabul.
 - **Custom CA:** `BACKEND_API_CA_PATH` ve `NATS_TLS_CA_PATH` ile PEM bundle.
 - **Bilincli opt-out:** TLS kurulana kadar saha icin
   `GATEWAY_INSECURE_ALLOW_PLAINTEXT=true` (boot'ta loud WARN log).
@@ -67,7 +77,46 @@ exponential backoff'a duser. HTTPS yokken MITM korumasi saglar.
    `config_auth_error` etiketini izleyin.
 4. Eski token'i backend kayitlarindan silin (audit trail).
 
-## NATS auth ve TLS
+## Operator HTTP yuzeyi (health server)
+
+Gateway'in dinledigi tek port `WORKER_HEALTH_PORT`'tur. Yuzey kasitli olarak
+kucuk tutulmustur:
+
+| Endpoint | Auth | Rate limit |
+| --- | --- | --- |
+| `GET /health`, `/healthz` | Yok (probe) | 120 req/dk/IP |
+| `GET /info`, `/metrics` | `GATEWAY_REFRESH_TOKEN` Bearer | 120 req/dk/IP |
+| `POST /refresh-all` | `GATEWAY_REFRESH_TOKEN` Bearer | 10 req/dk/IP |
+| `POST /operate` | `GATEWAY_COMMAND_TOKEN` Bearer | 10 req/dk/IP |
+
+- Token karsilastirmasi `hmac.compare_digest` ile **timing-safe**.
+- Rate limit anahtari istemci IP'sidir. `X-Forwarded-For` **yalnizca**
+  `HEALTH_TRUSTED_PROXIES` (CIDR listesi) icindeki bir adresten gelen istekte
+  okunur; liste bos ise XFF tamamen yok sayilir. Aksi halde saldirgan basliga
+  rastgele IP yazip rate-limit'i bypass ederdi.
+- `/health` auth'suzdur ama **kirpilmis** ozet doner; cihaz listesi, config
+  detayi, sayaclar yalnizca auth'lu `/info` ve `/metrics` uzerindedir.
+
+`/operate` bir **fiziksel manevra** endpoint'idir. Kullanilacaksa:
+
+- `GATEWAY_COMMAND_TOKEN` ayri ve guclu olmali (validator zorlar),
+- istekte `command_id` gonderilmeli — idempotency anahtaridir; retry'da ayni
+  kesicinin iki kez surulmesini onler,
+- port saha LAN'i disina acilmamali (backend'e dogrudan erisim gerekmiyorsa
+  token'i bos birakip endpoint'i tamamen kapatin).
+
+## Hata mesajlarinda sir sizmasi
+
+Konfigurasyon hatalari `format_config_error()`'dan gecirilir. Pydantic'in
+ham hata metni `input_value={...}` kuyrugunda **tum ayar sozlugunu**
+(`GATEWAY_TOKEN` dahil) tasir; bu metin stdout'a, NSSM log dosyasina ve
+`docker logs` ciktisina duserdi. Kuyruk kirpilir, proses `EX_CONFIG` (78) ile
+cikar. `tests/test_production_blockers.py` bu davranisi kilitler.
+
+## NATS auth ve TLS (legacy — `TELEMETRY_PUBLISHER=nats`)
+
+> 0.5.x'te varsayilan telemetri yolu **backend HTTP ingest**'tir. Bu bolum
+> yalnizca rollback icin NATS'a donuldugunde gecerlidir.
 
 Production'da NATS server **deny-all default** + per-user subject ACL ile
 kurulur. Her gateway icin ayri NKEY/JWT credentials:
@@ -128,9 +177,16 @@ maskeleme yapar:
 - [ ] Cihazlar bu gateway'e `gateway_code` ile atanmis.
 - [ ] Bu makinede `.env`: `GATEWAY_CODE` + guc token + `APP_ENVIRONMENT=production`.
 - [ ] `WORKER_HEALTH_PORT` bu makine uzerinde benzersiz.
-- [ ] `NATS_URL` + `NATS_CREDENTIALS_PATH` + (public ise) `NATS_TLS_CA_PATH`.
+- [ ] `BACKEND_API_URL=https://...` (public host ise zorunlu).
 - [ ] `DNP3_DEVICE_ALLOWED_SUBNETS` saha LAN'ina gore set edildi.
 - [ ] `LOG_FILE_PATH` rotation icin set edildi (Windows NSSM kurulumda zorunlu).
-- [ ] (Opsiyonel) `GATEWAY_REFRESH_TOKEN` operator paneli kullanilacaksa.
+- [ ] (Opsiyonel) `GATEWAY_REFRESH_TOKEN` operator paneli / metrik erisimi icin.
+- [ ] (Opsiyonel) `GATEWAY_COMMAND_TOKEN` **yalnizca** dogrudan HTTP push
+      kullanilacaksa; aksi halde bos birak (endpoint kapali kalir).
+- [ ] Uc token birbirinden farkli (production validator zaten zorlar).
+- [ ] `HEALTH_TRUSTED_PROXIES` — health portu bir reverse proxy arkasindaysa
+      set edildi; degilse bos birakildi.
 - [ ] `.env` dosyasi ACL kisitlandi (Windows: `icacls`, POSIX: `chmod 600`).
 - [ ] Multi-instance lock dosyasi icin `GATEWAY_STATE_DIR` yazilabilir.
+- [ ] (Legacy/rollback) NATS'a donulecekse: `NATS_URL` +
+      `NATS_CREDENTIALS_PATH` + (public ise) `NATS_TLS_CA_PATH`.

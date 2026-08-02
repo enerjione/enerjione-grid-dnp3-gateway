@@ -148,3 +148,145 @@ def test_http_publisher_raises_publish_error_for_rejected_payload() -> None:
 
     assert publisher.counters_snapshot()["publish_failures"] == 1
     assert publisher.is_ready is True
+
+
+# --------------------------------------------------------------------------
+# devre kesici: backend erisilemezken hizli hata
+# --------------------------------------------------------------------------
+
+
+class _SayanSession(_Session):
+    """POST cagrilarini sayar — devre acikken ag'a gidilmedigini dogrular."""
+
+    def __init__(self, response: _Response | Exception) -> None:
+        super().__init__(response)
+        self.post_sayisi = 0
+
+    def post(self, url: str, **kwargs: Any) -> _Response:  # type: ignore[override]
+        self.post_sayisi += 1
+        return super().post(url, **kwargs)
+
+
+def _yayinci(session: Any) -> HttpTelemetryPublisher:
+    return HttpTelemetryPublisher(
+        base_url="http://backend/api/v1",
+        identity=_identity(),
+        session=session,
+    )
+
+
+def _payload() -> dict[str, Any]:
+    return {"message_id": "m", "device_code": "D1", "signal_key": "s", "value": 1.0}
+
+
+def test_devre_acikken_aga_gidilmez() -> None:
+    """REGRESYON: `_ready` tutuluyordu ama HIC OKUNMUYORDU.
+
+    Backend erisilemezken her cihaz icin yeni bir POST deneniyor ve TAM
+    timeout kadar bekleniyordu. Kara delik olmus bir agda (4G kopmasi,
+    firewall drop) SYN cevapsiz kalir; 300 cihazli bir cycle timeout duvarina
+    toslar, worker havuzu dolar ve kuyruktaki cihazlar HIC yoklanamaz.
+    """
+    session = _SayanSession(requests.ConnectionError("baglanti yok"))
+    publisher = _yayinci(session)
+
+    # Ilk deneme gercekten ag'a gider ve basarisiz olur -> devre acilir
+    with pytest.raises(HttpTelemetryNotReadyError):
+        publisher.publish(_payload(), message_id="m1")
+    assert session.post_sayisi == 1
+    assert publisher.is_ready is False
+
+    # Sonraki denemeler ag'a HIC gitmemeli (hizli hata)
+    for _ in range(20):
+        with pytest.raises(HttpTelemetryNotReadyError):
+            publisher.publish(_payload(), message_id="m2")
+    assert session.post_sayisi == 1, (
+        f"devre acikken {session.post_sayisi - 1} gereksiz POST denendi"
+    )
+
+    # Hata GECICI kalmali: mesaj outbox'a yazilir, retry_count artmaz,
+    # dead-letter'a dusmez. Veri kaybi yok.
+    from dnp3_gateway.messaging.errors import is_transient
+
+    try:
+        publisher.publish(_payload(), message_id="m3")
+    except HttpTelemetryNotReadyError as exc:
+        assert is_transient(exc) is True
+
+
+def test_bekleme_dolunca_tek_probe_gecer() -> None:
+    """Yarim-acik: bekleme dolunca SADECE bir istek denenir."""
+    session = _SayanSession(requests.ConnectionError("baglanti yok"))
+    publisher = _yayinci(session)
+
+    with pytest.raises(HttpTelemetryNotReadyError):
+        publisher.publish(_payload(), message_id="m1")
+    assert session.post_sayisi == 1
+
+    # Beklemeyi elle bitir
+    publisher._ready_retry_at = 0.0
+
+    with pytest.raises(HttpTelemetryNotReadyError):
+        publisher.publish(_payload(), message_id="m2")
+    assert session.post_sayisi == 2, "bekleme dolunca probe gecmeli"
+
+    # Probe da basarisiz oldu -> devre yeniden acik
+    with pytest.raises(HttpTelemetryNotReadyError):
+        publisher.publish(_payload(), message_id="m3")
+    assert session.post_sayisi == 2
+
+
+def test_backend_geri_gelince_devre_kapanir() -> None:
+    session = _SayanSession(requests.ConnectionError("baglanti yok"))
+    publisher = _yayinci(session)
+
+    with pytest.raises(HttpTelemetryNotReadyError):
+        publisher.publish(_payload(), message_id="m1")
+    assert publisher.is_ready is False
+
+    # Backend ayaga kalkti
+    session.response = _Response(202, "{}")
+    publisher._ready_retry_at = 0.0
+
+    publisher.publish(_payload(), message_id="m2")
+    assert publisher.is_ready is True
+
+    # Devre kapali: sonraki her istek normal sekilde ag'a gider
+    onceki = session.post_sayisi
+    publisher.publish(_payload(), message_id="m3")
+    assert session.post_sayisi == onceki + 1
+
+
+def test_kalici_hata_devreyi_acmaz() -> None:
+    """400/422 backend'in ERISILEBILIR oldugunu gosterir; sadece bu mesaj kotu.
+
+    Devreyi acmak, tek bir bozuk payload yuzunden TUM telemetriyi
+    geciktirirdi. Ayrica yarim-acik probe bayragi temizlenmezse devre kalici
+    olarak acik kalirdi.
+    """
+    session = _SayanSession(_Response(422, "sema hatasi"))
+    publisher = _yayinci(session)
+
+    with pytest.raises(HttpTelemetryPublishError):
+        publisher.publish(_payload(), message_id="m1")
+    assert publisher.is_ready is True
+
+    # Ag'a gitmeye devam etmeli
+    with pytest.raises(HttpTelemetryPublishError):
+        publisher.publish(_payload(), message_id="m2")
+    assert session.post_sayisi == 2
+
+
+def test_devre_kesici_batch_yolunda_da_calisir() -> None:
+    session = _SayanSession(requests.ConnectionError("baglanti yok"))
+    publisher = _yayinci(session)
+
+    ogeler = [{"payload": _payload(), "correlation_id": "c1"}]
+    with pytest.raises(HttpTelemetryNotReadyError):
+        publisher.publish_batch(ogeler)
+    assert session.post_sayisi == 1
+
+    for _ in range(10):
+        with pytest.raises(HttpTelemetryNotReadyError):
+            publisher.publish_batch(ogeler)
+    assert session.post_sayisi == 1

@@ -190,6 +190,7 @@ def open_versioned_db(
     synchronous: str = "NORMAL",
     wal_autocheckpoint: int = 1000,
     timeout: float = 5.0,
+    on_quarantine: Callable[[Path, str], None] | None = None,
 ) -> sqlite3.Connection:
     """Butunlugu dogrulanmis, semasi guncel bir SQLite baglantisi acar.
 
@@ -199,6 +200,12 @@ def open_versioned_db(
          yeniden dene (bir kez). Boylece bozuk dosya kalici boot arizasina
          donusmez.
       3. Migration'lari uygula (`PRAGMA user_version`).
+
+    `on_quarantine(karantina_yolu, sebep)`: karantina gerceklestiyse cagirilir.
+    Kaybin ANLAMI dosyaya gore degisir — outbox icin birikmis telemetri,
+    command ledger icin FIZIKSEL KOMUT gecmisi ve tekrar-onleme garantisi.
+    Cagiran taraf bunu kendi baglaminda raporlayabilsin diye ayri bir kanca
+    var; genel `quarantined_files()` listesi bu ayrimi yapmaz.
     """
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -239,8 +246,15 @@ def open_versioned_db(
             except sqlite3.Error:
                 pass
             conn = None
-        if quarantine_corrupt_db(db_path, problem) is None:
+        karantina = quarantine_corrupt_db(db_path, problem)
+        if karantina is None:
             raise SqliteIntegrityError(f"{label}: DB bozuk ({problem}) ve karantinaya alinamadi: {db_path}")
+        if on_quarantine is not None:
+            try:
+                on_quarantine(karantina, problem)
+            except Exception:  # noqa: BLE001
+                # Kanca bir raporlama detayi; acilisi dusuremez.
+                logger.exception("sqlite_quarantine_hook_failed db=%s", label)
         conn = _connect()
         residual = check_integrity(conn)
         if residual is not None:

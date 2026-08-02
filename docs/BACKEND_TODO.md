@@ -1,7 +1,8 @@
 # Backend Koordinasyonu Gereken Isler
 
-**Durum:** ACIK — henuz yapilmadi
+**Durum:** B2 ACIK; B1 tek env bayragina indi; B3 ve B4 kapandi
 **Olusturulma:** 2026-07-31 (production hardening calismasi)
+**Son guncelleme:** 2026-08-02
 **Neden ertelendi:** Bu maddeler gateway'i tek basina degistirerek cozulemez;
 backend'in `/gateways/{code}/config`, `/gateways/{code}/pending` ve
 `/telemetry/gateway/{code}` sozlesmelerini de degistirir. Gateway tarafindaki
@@ -120,44 +121,45 @@ okuyabilmek B1'e bagli.
 
 ---
 
-## B3. Per-device sinyal katalogu
+## B3. Per-device sinyal katalogu — ✅ GATEWAY TARAFI KAPANDI
 
-**Gateway durumu:** ❌ Gateway tarafinda cozulemez — kontrat degisikligi sart.
+**Durum:** (b) secenegi uygulandi. Gateway artik sinyal setini **cihaz basina**
+secer (`state.signals_for(device)`), tek global liste kullanmaz.
 
-**Sorun:** `SignalConfig` dataclass'inda `device_code` veya `signal_profile`
-bagi **YOK**. `poller.run_poll_cycle` cycle basinda TEK bir sinyal listesi
-hesaplayip AYNI listeyi her cihaza uyguluyor. `DeviceConfig.signal_profile`
-alani backend'den geliyor ve parse ediliyor ama gateway kodunda **hicbir yerde
-okunmuyor**.
+Cozumleme sirasi:
 
-Tek marka filoda zararsiz (cihazda olmayan index → `no_change` → yayin yok).
-Ama ikinci marka girdigi gun:
+```
+1. backend `signals_by_profile[device.signal_profile]` (dolu)  -> KAZANIR
+2. yerlesik profil `profiles/<model>.json`                     -> backend bos/yok ise
+3. duz `signals` listesi                                       -> profil kavrami hic yoksa
+```
 
-| | Profil A (Horstmann SN2) | Profil B (baska uretici) |
-|---|---|---|
-| `(30, 12)` | `conductor_temperature` | `battery_voltage` |
+Ozgun kayitta "gateway tarafinda cozulemez" denmisti; yanilmisiz. Iki ek
+karar bunu mumkun kildi:
 
-Backend iki profilin BIRLESIMINI donduruyor. B cihazi poll edildiginde onun
-`(30,12)` degeri **`conductor_temperature` etiketiyle** yayinlaniyor ve alarm
-esikleri bu sahte deger uzerinden tetikleniyor.
+- **Yerlesik profiller (2. adim).** Bir DNP3 modelinin adres haritasi
+  FIRMWARE'in ozelligidir — her kurulumda aynidir. Protokol surucusu zaten
+  gateway'de oldugu icin haritanin dogal yeri de orasi. Bilinen bir model,
+  backend katalogu bos olsa bile dogru yoklanir. Otorite yine **backend**:
+  kurulumcu sahada yanlis bir index'i arayuzden duzeltebilmeli, yoksa tek bir
+  adres hatasi icin yeni gateway imaji cikarmak gerekirdi.
+- **Bos liste, yanlis listeden iyidir.** Profil bulunamaz ve yerlesik harita
+  da yoksa cihaz yoklanmaz. Duz listeye dusmek komsu modelin adreslerini
+  yoklamak olurdu; okunan deger yanlis `signal_key` ile yayinlanir ve alarm
+  esigi sahte bir buyukluk uzerinden calisirdi. Sessiz yanlis veri, gorunur
+  eksik veriden daha kotudur.
 
-Ayrica performans: 300 cihaz x 265 sinyal = cycle basina 79.500 iterasyon.
+**Backend'de KALAN is (opsiyonel, oncelik dusuk):** `signals_by_profile`
+alanini donmek. Gonderilmezse gateway yerlesik profillere duser — bilinen
+modeller icin dogru calisir, ama sahadan index duzeltme yetenegi o model icin
+kaybolur. Yani bu artik bir **blocker degil**, bir **esneklik** maddesi.
 
-**Backend'de yapilacak (iki secenekten biri):**
-- **(a)** `SignalConfig`'e `device_code` alani ekle — sinyal dogrudan cihaza bagli
-- **(b)** `signals` yanitini `signals_by_profile: {profil_adi: [...]}` seklinde
-  grupla; gateway `device.signal_profile` ile eslestirsin
+**Deploy sirasi:** serbest. Gateway her iki formati de anlar (alan yoksa
+yerlesik/duz listeye duser), backend once ya da sonra deploy edilebilir.
 
-**(b) tercih edilir:** payload buyumez (ayni sinyal N cihaz icin tekrarlanmaz)
-ve mevcut `signal_profile` alani anlamli hale gelir.
-
-**Gateway'de yapilacak (backend hazir olunca):**
-- `run_poll_cycle` icinde cycle basina bir kez `signals_by_profile` on-hesapla
-- `poll_device`'a `signals_by_profile[device.signal_profile]` gecir
-- Bilinmeyen profil → WARNING + bos liste (sessizce yanlis veri yayinlama)
-
-**Deploy sirasi:** ONCE BACKEND (yeni alan/grup opsiyonel olarak eklensin,
-gateway eski formati da anlamaya devam etsin), sonra gateway.
+**Performans notu da kapandi:** filtreleme cycle basina bir kez, PROFIL
+basina onbelleklenir (`poller.run_poll_cycle._profil_onbellek`) — 300 cihaz x
+265 sinyal = 79.500 iterasyon yerine profil sayisi kadar.
 
 ---
 
@@ -250,7 +252,11 @@ Gateway tarafi 404/400'e toleransli yazilacak (eski backend'de sessizce atlar).
 |---|---|---|---|---|
 | B1 | Kalite bayraklari | ⚙️ **tek env bayragi kaldi** | — (backend v2.28.0'dan hazir) | Yuksek — olcum dogrulugu |
 | B2 | Cihaz zaman damgasi | ⚠️ zaman-senk var | Backend → Gateway (**B1'den SONRA**) | Yuksek — SOE/ariza analizi |
-| B3 | Per-device katalog | ❌ kontrat sart | Backend → Gateway | Orta — cok markali filoda kritik |
+| B3 | Per-device katalog | ✅ **GATEWAY TARAFI KAPANDI** | serbest | Dusuk — yalnizca esneklik kaldi |
 | B4 | Saglik heartbeat + filo uyarisi | ✅ **TAMAMLANDI** | — | ~~Yuksek — kor nokta~~ |
 
-**Onerilen calisma sirasi:** ~~B4~~ (tamamlandi) → ~~B1~~ (bayrak acilinca biter) → B2 → B3.
+**Onerilen calisma sirasi:** ~~B4~~ (tamamlandi) → ~~B1~~ (bayrak acilinca
+biter) → B2 → ~~B3~~ (backend tarafi opsiyonel kaldi).
+
+**Yani gercekte kalan tek koordinasyon isi B2'dir** (cihaz olay zaman
+damgasi); B1 bir env bayragi, B3 ise artik istege bagli bir iyilestirme.

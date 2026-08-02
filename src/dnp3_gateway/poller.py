@@ -506,25 +506,47 @@ def run_poll_cycle(
     pool = _get_or_create_pool(max_workers=workers)
     import time as _time
 
-    # Her future'un baslama zamanini sakla → per-device timeout kontrolu
-    submit_time = _time.monotonic()
+    # Her cihazin GERCEK baslama zamani → per-device timeout kontrolu.
+    #
+    # Eskiden burada submit zamani kullaniliyordu ve hepsi AYNI degerdi. 300
+    # cihaz / 25 worker'da kuyrugun sonundaki cihaz daha ISE BASLAMADAN
+    # "timeout" sayilip iptal ediliyor ve `mark_read` ile "okundu" isaretleniyordu.
+    # Iki sonucu vardi: (a) cihaz o cycle'da hic yoklanmiyordu, (b) log
+    # "cihaz yavas" diyordu — oysa sorun havuz kapasitesiydi. Yanlis teshis,
+    # operatoru cihaz/hat aramaya yonlendirirdi.
+    #
+    # Cozum: baslama zamanini worker'in KENDISI yazar. Sozlukte kaydi olmayan
+    # bir future henuz baslamamistir; ona timeout uygulanmaz.
     futures: dict = {}
-    future_start: dict = {}
-    for device in due:
-        fut = pool.submit(
-            poll_device,
+    baslama: dict[str, float] = {}
+    baslama_lock = threading.Lock()
+
+    def _kosucu(device: DeviceConfig, signals: list[SignalConfig]) -> int:
+        with baslama_lock:
+            baslama[device.code] = _time.monotonic()
+        return poll_device(
             gateway_code=gateway_code,
             device=device,
-            # Onbellek ana thread'de doldurulur (submit dongusu burada kosuyor),
-            # worker thread'e hazir liste gider — paylasilan dict'e worker'lar
-            # yazmaz, yaris durumu yok.
-            signals=_cihaz_sinyalleri(device),
+            signals=signals,
             reader=reader,
             publisher=publisher,
             metrics=metrics,
         )
+
+    for device in due:
+        fut = pool.submit(
+            _kosucu,
+            device,
+            # Onbellek ana thread'de doldurulur (submit dongusu burada kosuyor),
+            # worker thread'e hazir liste gider — paylasilan dict'e worker'lar
+            # yazmaz, yaris durumu yok.
+            _cihaz_sinyalleri(device),
+        )
         futures[fut] = device
-        future_start[fut] = submit_time
+
+    def _baslamis_mi(device: DeviceConfig) -> float | None:
+        with baslama_lock:
+            return baslama.get(device.code)
     # Tum cycle icin global timeout: belirlenen sure asilirsa pending
     # future'lar iptal edilir. stop_event set'lenirse erken cik.
     #
@@ -559,9 +581,14 @@ def run_poll_cycle(
         if pending and device_timeout_sec > 0:
             now = _time.monotonic()
             for fut in list(pending):
-                elapsed = now - future_start.get(fut, now)
+                device = futures[fut]
+                basladi = _baslamis_mi(device)
+                if basladi is None:
+                    # Henuz kuyrukta bekliyor — sure ISLEMIYOR. Kapasite
+                    # sikintisini cihaz arizasi gibi raporlamayiz.
+                    continue
+                elapsed = now - basladi
                 if elapsed >= device_timeout_sec:
-                    device = futures[fut]
                     fut.cancel()
                     state.mark_read(device.code, now_monotonic)
                     device_timed_out.add(fut)
@@ -607,19 +634,42 @@ def run_poll_cycle(
         state.mark_read(device.code, now_monotonic)
         total += count
 
-    # Cycle timeout sonrasi hala calisan future'lar var → cancel + log
+    # Cycle bitti ama pending future'lar var: ikiye ayrilir.
+    #
+    #   BASLAMIS  -> cihaz gercekten yanit vermedi. `mark_read` uygulanir;
+    #                aksi halde her cycle ayni yavas cihaz icin retry firtinasi
+    #                olur ve saglikli cihazlar da gecikir.
+    #   BASLAMAMIS-> cihaz KUYRUKTA bekledi, hicbir istek gitmedi. `mark_read`
+    #                UYGULANMAZ: "okundu" demek yalan olurdu ve cihaz bir
+    #                sonraki cycle'da bayatlik siralamasinin EN ONUNE gecmeli.
+    #                Bu ayrim yapilmadan, kapasitesi yetmeyen bir kurulumda
+    #                kuyrugun sonundaki cihazlar sessizce ve sonsuza kadar
+    #                okunmadan kalabiliyordu.
     if not_done:
+        baslamayanlar = [futures[f] for f in not_done if _baslamis_mi(futures[f]) is None]
         logger.warning(
-            "poll_cycle_global_timeout exceeded=%.1fs pending=%d "
-            "(donmeyen cihazlar mark_read edilip cancel edilecek)",
+            "poll_cycle_global_timeout exceeded=%.1fs pending=%d baslamayan=%d",
             cycle_timeout_sec,
             len(not_done),
+            len(baslamayanlar),
         )
+        if baslamayanlar:
+            logger.error(
+                "poll_pool_starved gateway=%s baslamayan=%d due=%d workers=%d — "
+                "bu cihazlara HIC istek gonderilemedi (havuz doldu, cihaz arizasi "
+                "DEGIL). POLL_MAX_PARALLEL degerini artirin ya da poll araligini "
+                "uzatin. Cihazlar okundu SAYILMADI; sonraki cycle'da once onlar "
+                "yoklanacak.",
+                gateway_code,
+                len(baslamayanlar),
+                len(due),
+                workers,
+            )
         for future in not_done:
             device = futures[future]
-            future.cancel()  # interrupt etmez ama mark_read kayit altina
-            # mark_read: cihazi "okundu" kabul et ki sonraki cycle'da
-            # tekrar due olsun (her cycle'da retry sürmesin)
+            future.cancel()  # interrupt etmez
+            if _baslamis_mi(device) is None:
+                continue  # mark_read YOK — bilerek
             state.mark_read(device.code, now_monotonic)
             logger.warning(
                 "poll_device_cycle_timeout gateway=%s device=%s — bu cycle'da "

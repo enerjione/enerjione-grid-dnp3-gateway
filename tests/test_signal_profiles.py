@@ -102,11 +102,14 @@ def test_bos_profil_duz_listeye_dusmez():
     )
 
 
-def test_bilinmeyen_profil_duz_listeye_duser():
+def test_bilinmeyen_profil_tek_modelli_filoda_duz_listeye_duser():
     """Anahtar hic yoksa (surum uyumsuzlugu) cihaz KARANLIGA dusmemeli.
 
     Bos liste ile bu durum FARKLIDIR: orada backend bilerek "sinyal yok"
     diyor; burada anahtari hic gormedik, yani bilgi eksik.
+
+    Bu tolerans YALNIZCA karisma ihtimali yokken gecerli: tek profil grubu +
+    tek modelli filo. O zaman duz liste zaten o modelin haritasidir.
     """
     a_sinyal = make_signal("master.current")
     state = GatewayState()
@@ -119,6 +122,97 @@ def test_bilinmeyen_profil_duz_listeye_duser():
     )
     yabanci = _cihaz("DEV-Z", "hic_bilinmeyen")
     assert [s.key for s in state.signals_for(yabanci)] == ["master.current"]
+
+
+def test_bilinmeyen_profil_cok_modelli_filoda_duz_listeye_dusmez():
+    """REGRESYON: duz liste birden fazla modelin BIRLESIMI ise kullanilamaz.
+
+    `test_bos_profil_duz_listeye_dusmez` bu riski kapatiyordu ama yalnizca
+    backend profili BOS gonderdiginde. Profil anahtari hic gelmediginde ayni
+    riskli yol arka kapidan aciktı: gateway sessizce birlesim listesine
+    dusuyordu.
+
+    Somut zarar: DEV-Z'nin (30,0) noktasi okunur ve `master.current`
+    etiketiyle yayinlanir. Deger makul gorunur, telemetri akar, esik alarmi
+    BASKA bir buyuklugun uzerinden calisir. Fark edilmesi cok zordur.
+    """
+    a_sinyal = make_signal("master.current", object_group=30, index=0)
+    b_sinyal = make_signal("acme.oil_temp", object_group=30, index=0)  # AYNI adres
+    state = GatewayState()
+    state.update(
+        _config(
+            devices=[_cihaz("DEV-A", MODEL_A), _cihaz("DEV-B", MODEL_B)],
+            # Backend'in duz listesi iki modelin BIRLESIMI
+            signals=[a_sinyal, b_sinyal],
+            by_profile={MODEL_A: [a_sinyal], MODEL_B: [b_sinyal]},
+        )
+    )
+
+    yabanci = _cihaz("DEV-Z", "hic_bilinmeyen")
+    assert state.signals_for(yabanci) == [], (
+        "cok modelli filoda bilinmeyen profil duz listeye dusmus — "
+        "okunan deger yanlis signal_key ile yayinlanir"
+    )
+
+
+def test_tek_grup_ama_karisik_filo_duz_listeye_dusmez():
+    """Tek profil grubu YETMEZ: filoda baska model varsa duz liste supheli.
+
+    Backend yalnizca MODEL_A icin sinyal gondermis; ama sahada MODEL_B
+    cihazlari da var. Duz liste MODEL_A haritasidir ve MODEL_B'ye
+    uygulanamaz — (30,0) o cihazda baska bir buyukluktur.
+    """
+    a_sinyal = make_signal("master.current", object_group=30, index=0)
+    state = GatewayState()
+    state.update(
+        _config(
+            devices=[_cihaz("DEV-A", MODEL_A), _cihaz("DEV-B", MODEL_B)],
+            signals=[a_sinyal],
+            by_profile={MODEL_A: [a_sinyal]},
+        )
+    )
+
+    assert state.signals_for(_cihaz("DEV-B", MODEL_B)) == []
+    # MODEL_A dogru sekilde calismaya devam ediyor
+    assert [s.key for s in state.signals_for(_cihaz("DEV-A", MODEL_A))] == ["master.current"]
+
+
+def test_profil_uyarisi_her_cycle_tekrarlanmaz(caplog):
+    """Kalici katalog hatasi logu doldurmamali.
+
+    `signals_for` cihaz basina her cycle'da (2sn) cagriliyor. Uyari
+    throttle edilmezse tek bir yanlis profil dakikada 30 satir uretir ve
+    gercek arizalari gorunmez kilar. Config degisince sayfa temizlenir.
+    """
+    import logging
+
+    a_sinyal = make_signal("master.current", object_group=30, index=0)
+    b_sinyal = make_signal("acme.oil_temp", object_group=30, index=0)
+    state = GatewayState()
+    cfg = _config(
+        devices=[_cihaz("DEV-A", MODEL_A), _cihaz("DEV-B", MODEL_B)],
+        signals=[a_sinyal, b_sinyal],
+        by_profile={MODEL_A: [a_sinyal], MODEL_B: [b_sinyal]},
+    )
+    state.update(cfg)
+
+    yabanci = _cihaz("DEV-Z", "hic_bilinmeyen")
+    with caplog.at_level(logging.ERROR, logger="dnp3_gateway.state"):
+        for _ in range(10):
+            state.signals_for(yabanci)
+
+    satirlar = [r for r in caplog.records if "signals_profile_unknown" in r.getMessage()]
+    assert len(satirlar) == 1, f"uyari {len(satirlar)} kez basildi, 1 bekleniyordu"
+
+    # Config surumu degisince tekrar raporlanmali (operator duzeltmis olabilir).
+    caplog.clear()
+    yeni = GatewayConfig(**{**cfg.__dict__, "config_version": "v2"})
+    state.update(yeni)
+    with caplog.at_level(logging.ERROR, logger="dnp3_gateway.state"):
+        state.signals_for(yabanci)
+    assert any("signals_profile_unknown" in r.getMessage() for r in caplog.records), (
+        "config degisince uyari sayfasi temizlenmeli"
+    )
 
 
 # --------------------------------------------------- gercek poll davranisi

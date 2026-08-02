@@ -271,3 +271,57 @@ def test_poller_metrikleri_gercekten_besler() -> None:
         metrics=m,
     )
     assert m.snapshot()["read_errors_total"] == 1, "okuma hatasi sayaca yansimali"
+
+
+# --------------------------------------------------------------------------
+# komut defteri sifirlanmasi
+# --------------------------------------------------------------------------
+
+
+def test_komut_defteri_sifirlanmasi_ayri_kod_ile_raporlanir() -> None:
+    """`state_db_quarantined` ile AYNI SEY DEGIL.
+
+    Orada kaybedilen birikmis telemetridir; burada FIZIKSEL KOMUT gecmisi ve
+    tekrar-onleme garantisi. Ayni kodu paylasmalari mudahaleyi yanlis yone
+    cevirirdi: operator "telemetri kaybi" diye gecistirirken bekleyen
+    komutlarin durumu dogrulanmadan kalirdi.
+    """
+
+    class _Ledger:
+        def status_snapshot(self):
+            return {
+                "journal_reset": True,
+                "journal_reset_at": 1.0,
+                "journal_reset_path": "/state/command_ledger.db.corrupt.123",
+                "result_pending": 0,
+                "result_dead_letter": 0,
+            }
+
+    body, code = _body(ledger_provider=lambda: _Ledger())
+    assert "command_journal_reset" in body["issues"]
+    assert body["status"] == "degraded"
+    assert code == 200
+    assert body["command_ledger"]["journal_reset"] is True
+    # /health auth'suz — karantina DOSYA YOLU burada gorunmemeli.
+    assert "journal_reset_path" not in body["command_ledger"]
+
+
+def test_saglikli_defter_sorun_uretmez() -> None:
+    class _Ledger:
+        def status_snapshot(self):
+            return {"journal_reset": False, "result_pending": 2, "result_dead_letter": 0}
+
+    body, _c = _body(ledger_provider=lambda: _Ledger())
+    assert "command_journal_reset" not in body["issues"]
+    assert body["command_ledger"]["result_pending"] == 2
+
+
+def test_defter_erisilemezse_health_patlamaz() -> None:
+    """Health probe'u bir yan bilesenin hatasi dusuremez."""
+
+    def _patlayan():
+        raise RuntimeError("ledger kapali")
+
+    body, code = _body(ledger_provider=_patlayan)
+    assert code in (200, 503)
+    assert "command_journal_reset" not in body["issues"]

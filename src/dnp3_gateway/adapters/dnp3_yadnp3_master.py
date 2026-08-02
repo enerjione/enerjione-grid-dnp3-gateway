@@ -276,10 +276,35 @@ class _DeviceCache:
         # Outstation IIN bayraklarinin son gorulen hali (edge-trigger log icin).
         self._iin_flags: dict[str, bool] = {}
         self._connected = False
+        # SURE OLCUMLERI MONOTONIC SAATLE YAPILIR.
+        #
+        # Bu alan "en son ne zaman frame geldi" sorusunu cevapliyor ve
+        # `read_device` bundan bayatlik (stale) karari uretiyor. Duvar saatiyle
+        # olculdugunde bir NTP siçramasi — ya da RTC'si bos bir sahada acilista
+        # yapilan saat duzeltmesi — `now - last_update` degerini birden
+        # devasa yapar ve gateway TUM cihazlari ayni anda comm_lost ilan eder.
+        # 300 cihazli bir sahada bu, SCADA'da toplu "haberlesme yok" dalgasi ve
+        # ardindan toplu recovery yayini demektir; hicbir cihazda gercek bir
+        # sorun yokken. Monotonic saat NTP'den etkilenmez.
         self._last_update_at: float = 0.0
+        # Duvar saati karsiligi — YALNIZCA gosterim icin (`/health`
+        # `last_frame_epoch`). Karar mekanizmasinda KULLANILMAZ.
+        self._last_update_wall: float = 0.0
         # Cihaz stale/disconnected oldugunda comm_lost yayinini SADECE bir kez
-        # yapmak icin edge-trigger flag'i. read_device set/clear eder.
+        # yapmak icin edge-trigger flag'i.
+        #
+        # DIKKAT — bu bayrak YAYIN ONAYINDAN SONRA set edilir (bkz.
+        # confirm_stale_announced). Okuma aninda set edilseydi ve o yayin
+        # kalicilastirilamasaydi (disk dolu -> OutboxFullError) cihaz SCADA'da
+        # SONSUZA KADAR son iyi degeriyle canli gorunurdu: bir sonraki cycle
+        # "zaten duyurdum" deyip `no_change` uretir, `no_change` yayinlanmaz.
+        # Kopmus bir gostergenin canli gorunmesi, degerlerin geç gelmesinden
+        # cok daha tehlikelidir.
         self._stale_announced: bool = False
+        # Duyuru "kusagi". Cihaz toparlandiginda artar; boylece onceki kopma
+        # epizoduna ait gecikmis bir yayin onayi YENI epizodu duyurulmus
+        # saymaz (peek/commit surum kontrolunun ayni mantigi).
+        self._stale_gen: int = 0
         # Recovery state machine — uc durum:
         #   "online"     : cihaz saglikli, frame'ler taze geliyor.
         #   "lost"       : link kopuk veya stale; SCADA tarafi comm_lost gorur.
@@ -335,8 +360,9 @@ class _DeviceCache:
         with self._lock:
             prev = self._values.get(key)
             self._values[key] = (raw, value_string, flags, device_time, time_quality)
-            now = time.time()
+            now = time.monotonic()
             self._last_update_at = now
+            self._last_update_wall = time.time()
             # Kalite bayragi degisimi de bir DEGISIKLIKTIR: deger ayni kalsa
             # bile nokta 'gecerli'den 'REFERENCE_ERR'e gecmisse SCADA bunu
             # gormeli.
@@ -436,6 +462,40 @@ class _DeviceCache:
         with self._lock:
             return len(self._dirty)
 
+    # ---------------------------------------------------------------
+    # comm_lost duyurusu — okuma/onay ayrimi
+    # ---------------------------------------------------------------
+
+    def begin_stale_announce(self) -> tuple[bool, tuple[str, int]]:
+        """comm_lost yayinina hazirlan.
+
+        Doner: `(zaten_duyuruldu, jeton)`. Jeton yayin kalicilastiktan sonra
+        `confirm_stale_announced`'a geri verilir. Bayrak BURADA set EDILMEZ —
+        yayin basarisiz olursa cihaz sessizce "duyuruldu" sayilmamali.
+        """
+        with self._lock:
+            return self._stale_announced, ("stale", self._stale_gen)
+
+    def confirm_stale_announced(self, token: Any) -> bool:
+        """Yayin kalicilastiktan sonra duyuruyu isaretle.
+
+        Jeton eski bir kusaga aitse (arada cihaz toparlandi) yok sayilir:
+        yeni bir kopma yasanirsa SCADA yine tek bir comm_lost gorur.
+        """
+        if not (isinstance(token, tuple) and len(token) == 2 and token[0] == "stale"):
+            return False
+        with self._lock:
+            if token[1] != self._stale_gen or self._stale_announced:
+                return False
+            self._stale_announced = True
+            return True
+
+    def reset_stale_announce(self) -> None:
+        """Cihaz toparlandi: bir sonraki kopma tekrar duyurulabilsin."""
+        with self._lock:
+            self._stale_announced = False
+            self._stale_gen += 1
+
     def note_iin(self, name: str, value: bool) -> bool:
         """IIN bayragini kaydet; DURUM DEGISTIYSE True doner (edge-trigger).
 
@@ -505,8 +565,14 @@ class _DeviceCache:
             return len(self._values)
 
     def last_update_at(self) -> float:
+        """Son frame'in MONOTONIC damgasi. Bayatlik karari icin kullanilir."""
         with self._lock:
             return self._last_update_at
+
+    def last_update_wall(self) -> float:
+        """Son frame'in duvar saati karsiligi — yalnizca gosterim icin."""
+        with self._lock:
+            return self._last_update_wall
 
     # ---- Recovery state machine ------------------------------------------------
     # Cihaz haberlesme durumu icin uc-state model:
@@ -522,7 +588,9 @@ class _DeviceCache:
         Idempotent: zaten recovering ise grace period sayaci sifirlanmaz
         (tekrar OnOpen flap'i grace'i ayrica uzatmaz).
         """
-        now = time.time()
+        # Monotonic: grace period bir SUREDIR; NTP siçramasi onu bitirmemeli
+        # (ya da sonsuza uzatmamali).
+        now = time.monotonic()
         with self._lock:
             if self._state == "recovering":
                 return
@@ -540,7 +608,7 @@ class _DeviceCache:
         with self._lock:
             if self._state != "recovering" or self._recovery_started_at == 0.0:
                 return 0.0
-            return time.time() - self._recovery_started_at
+            return time.monotonic() - self._recovery_started_at
 
     def fail_recovery(self) -> None:
         """Grace period dolmasina ragmen fresh frame gelmedi: tekrar lost."""
@@ -1479,8 +1547,12 @@ class Yadnp3TelemetryReader(TelemetryReader):
             self._scan_interval_sec * 10,
             60,
         )
+        # MONOTONIC: bayatlik bir SUREDIR, tarih degil. Duvar saatiyle
+        # olculdugunde tek bir NTP siçramasi (ya da RTC'si bos bir sahada
+        # acilis sonrasi saat duzeltmesi) TUM cihazlari ayni anda "bayat"
+        # yapip toplu sahte comm_lost dalgasi uretirdi.
         last_update = cache.last_update_at()
-        now = time.time()
+        now = time.monotonic()
         stale = last_update == 0.0 or (now - last_update) > threshold
 
         # Recovery state machine ile birlikte cihaz haberlesme durumu su sekilde
@@ -1563,11 +1635,11 @@ class Yadnp3TelemetryReader(TelemetryReader):
         # Ilk edge'de quality=comm_lost, sonrakilerde no_change (mesaj flood'unu
         # onlemek icin).
         if cache_state != "online":
-            already_announced = getattr(cache, "_stale_announced", False)
-            try:
-                cache._stale_announced = True  # type: ignore[attr-defined]
-            except Exception:  # noqa: BLE001
-                pass
+            # Bayrak BURADA set edilmez; yayin kalicilastiktan sonra
+            # `commit_published` -> `confirm_stale_announced` ile isaretlenir.
+            # Aksi halde kalicilastirilamayan (disk dolu) tek bir comm_lost
+            # yayini cihazi SCADA'da sonsuza kadar canli gosterirdi.
+            already_announced, stale_token = cache.begin_stale_announce()
             quality_to_emit = "no_change" if already_announced else "comm_lost"
             return [
                 SignalReading(
@@ -1578,6 +1650,7 @@ class Yadnp3TelemetryReader(TelemetryReader):
                     scaled_value=0.0,
                     quality=quality_to_emit,
                     value_string=None,
+                    read_token=None if already_announced else stale_token,
                 )
                 for s in signals
             ]
@@ -1587,10 +1660,7 @@ class Yadnp3TelemetryReader(TelemetryReader):
         # mark_all_dirty + log. Boylece SCADA tum sinyalleri quality=good ile
         # gorur; cihazin son bilinen degerleri yayilanir.
         if cache.consume_recovery_publish():
-            try:
-                cache._stale_announced = False  # type: ignore[attr-defined]
-            except Exception:  # noqa: BLE001
-                pass
+            cache.reset_stale_announce()
             redirty_count = cache.mark_all_dirty()
             logger.info(
                 "yadnp3_device_recovered device=%s ip=%s redirty=%d (fresh frame ile dogrulandi)",
@@ -1733,7 +1803,11 @@ class Yadnp3TelemetryReader(TelemetryReader):
         out: dict[str, dict[str, Any]] = {}
         for code, mm in masters:
             try:
-                last = mm.cache.last_update_at()
+                # Health tuketicisi bunu `time.time()` ile karsilastiriyor,
+                # dolayisiyla DUVAR saati karsiligi gonderilir. Bayatlik
+                # KARARI ise monotonic damga uzerinden verilir (bkz.
+                # `last_update_at`) — ikisi kasitli olarak ayri.
+                last = mm.cache.last_update_wall()
                 out[code] = {
                     "state": mm.cache.state(),
                     "connected": mm.cache.is_connected(),
@@ -1757,15 +1831,28 @@ class Yadnp3TelemetryReader(TelemetryReader):
         dikkate alinir. Surum uyusmuyorsa — okuma ile yayin arasinda cihazdan
         yeni bir olcum geldiyse — bayrak KORUNUR ve yeni deger bir sonraki
         cycle'da yayinlanir.
+
+        Iki jeton turu var:
+          * `(group, index, surum)` — normal olcum; dirty bayragi temizlenir.
+          * `("stale", kusak)`      — comm_lost duyurusu; duyuru bayragi
+            ancak yayin kalicilastiktan SONRA set edilir.
         """
         mm = self._masters.get(device.code)
         if mm is None:
             return 0
         items: list[tuple[int, int, int]] = []
+        stale_token: Any = None
         for r in readings:
             token = r.read_token
             if isinstance(token, tuple) and len(token) == 3:
                 items.append(token)
+            elif isinstance(token, tuple) and len(token) == 2 and token[0] == "stale":
+                stale_token = token
+        if stale_token is not None and mm.cache.confirm_stale_announced(stale_token):
+            logger.info(
+                "yadnp3_comm_lost_announced device=%s — comm_lost yayini kalicilasti",
+                device.code,
+            )
         if not items:
             return 0
         return mm.cache.commit_published(items)

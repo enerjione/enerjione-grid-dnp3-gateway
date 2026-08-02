@@ -286,6 +286,29 @@ def _quarantined_dbs() -> list[str]:
         return []
 
 
+def _ledger_snapshot(ledger_provider: Any) -> dict[str, Any]:
+    """Komut defterinin durumu; erisilemezse bos sozluk.
+
+    Ayri raporlaniyor cunku bu dosyanin kaybi outbox kaybiyla ayni sey degil:
+    burada kaybolan FIZIKSEL KOMUT gecmisi ve tekrar-onleme garantisidir.
+    """
+    if ledger_provider is None:
+        return {}
+    try:
+        ledger = ledger_provider()
+    except Exception:  # noqa: BLE001
+        return {}
+    if ledger is None:
+        return {}
+    fn = getattr(ledger, "status_snapshot", None)
+    if not callable(fn):
+        return {}
+    try:
+        return dict(fn())
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def _device_health_snapshot(reader: Any, configured_count: int) -> dict[str, Any]:
     """Adapter'dan cihaz basina haberlesme durumunu ozetler.
 
@@ -538,6 +561,7 @@ def _make_handler(
                     poll_interval_sec=poll_interval_sec,
                     disk_guard=disk_guard,
                     clock_guard=clock_guard,
+                    ledger_provider=ledger_provider,
                 )
                 self._respond_json(body, status_code=status_code)
                 return
@@ -706,36 +730,97 @@ def _make_handler(
                     )
                     return
                 try:
-                    if not ledger.start_dispatch(ledger_key):
-                        # Bu komut daha once gonderilmis. TEKRAR GONDERME;
-                        # varsa kayitli sonucu don.
-                        prior = _ledger_result_for(ledger, ledger_key)
-                        logger.info(
-                            "operate_duplicate_suppressed device=%s index=%s command_id=%s "
-                            "— komut daha once gonderildi, CROB TEKRARLANMADI",
-                            device_code,
-                            index,
-                            ledger_key,
-                        )
-                        self._respond_json(
-                            {
-                                "ok": bool(prior.get("ok")) if prior else False,
-                                "duplicate": True,
-                                "detail": "komut daha once islendi; tekrar gonderilmedi",
-                                "result": prior,
-                            },
-                            status_code=200,
-                        )
-                        return
+                    yeni_kayit = bool(ledger.start_dispatch(ledger_key))
                 except Exception:  # noqa: BLE001
-                    # Ledger erisilemezse komutu ENGELLEME (saha operasyonu
-                    # durmasin) ama idempotency garantisi olmadigini logla.
+                    # DEFTER ERISILEMIYOR — komutu CALISTIRMA.
+                    #
+                    # Eski davranis fail-open idi: `ledger_key = None` ile
+                    # devam edip CROB'u gonderiyordu. Iki sessiz sonucu vardi:
+                    #   1. Tekrar-onleme yok — backend'in HTTP timeout retry'i
+                    #      (cok olasi: timeout ~5sn, CROB 1-10sn) AYNI kesiciyi
+                    #      ikinci kez surerdi.
+                    #   2. Sonuc kaydi yok — komut calissa bile backend sonucu
+                    #      hicbir zaman ogrenemezdi.
+                    # Fiziksel manevrada "belki iki kez surdum" kabul edilemez;
+                    # "suremedim, sebebi bu" kabul edilebilir ve gorunurdur.
                     logger.exception(
-                        "operate_ledger_unavailable device=%s command_id=%s — idempotency GARANTI EDILEMIYOR",
+                        "operate_ledger_unavailable device=%s command_id=%s — komut REDDEDILDI "
+                        "(tekrar-onleme garantisi verilemiyor)",
                         device_code,
                         ledger_key,
                     )
-                    ledger_key = None
+                    self._respond_json(
+                        {
+                            "ok": False,
+                            "status": "rejected",
+                            "detail": (
+                                "komut defteri erisilemiyor; tekrar-onleme garanti "
+                                "edilemedigi icin komut gonderilmedi"
+                            ),
+                        },
+                        status_code=503,
+                    )
+                    return
+
+                if not yeni_kayit:
+                    # Bu komut daha once gonderilmis. TEKRAR GONDERME;
+                    # varsa kayitli sonucu don.
+                    prior = _ledger_result_for(ledger, ledger_key)
+                    logger.info(
+                        "operate_duplicate_suppressed device=%s index=%s command_id=%s "
+                        "kayitli_sonuc=%s — komut daha once gonderildi, CROB TEKRARLANMADI",
+                        device_code,
+                        index,
+                        ledger_key,
+                        "var" if prior else "yok",
+                    )
+                    # SONUCU BILMIYORSAK `ok:false` DEMEK YANLIS.
+                    #
+                    # Kayitli sonuc iki durumda bulunmaz: (a) ilk deneme HALA
+                    # sururken retry geldi, (b) sonuc backend'e teslim edilip
+                    # kayittan dusuruldu. Ikisinde de komut KABUL EDILMISTIR.
+                    # `ok:false` donmek cagirana "basarisiz" dedirtir; operator
+                    # YENI bir command_id ile tekrar dener ve kesici GERCEKTEN
+                    # iki kez surulur — tam da bu defterin onlemek icin var
+                    # oldugu sey.
+                    #
+                    # Bilinmeyen sonuc `status:"pending"` ile bildirilir;
+                    # cagiran taraf sonucu bekler, yeniden denemez.
+                    govde: dict[str, Any] = {
+                        "duplicate": True,
+                        "detail": "komut daha once islendi; CROB tekrarlanmadi",
+                        "result": prior,
+                    }
+                    if prior is not None:
+                        govde["ok"] = bool(prior.get("ok"))
+                        govde["status"] = str(prior.get("status", "unknown"))
+                    else:
+                        govde["ok"] = None
+                        govde["status"] = "pending"
+                        govde["detail"] = (
+                            "komut daha once kabul edildi; sonucu henuz bilinmiyor "
+                            "(YENI bir command_id ile TEKRAR DENEMEYIN)"
+                        )
+                    self._respond_json(govde, status_code=200)
+                    return
+            elif command_id is None:
+                # Idempotency anahtari YOK. Komut yine de calisir (backend eski
+                # surum olabilir) ama retry'da cift surme riski vardir; bu
+                # sessiz kalmamali.
+                logger.warning(
+                    "operate_without_command_id device=%s index=%s — idempotency "
+                    "anahtari gonderilmedi; istek tekrarlanirsa CROB DA TEKRARLANIR",
+                    device_code,
+                    index,
+                )
+            else:
+                # command_id verilmis ama defter hic yok (provider bagli degil).
+                logger.error(
+                    "operate_ledger_missing device=%s command_id=%s — komut defteri "
+                    "yapilandirilmamis; tekrar-onleme YOK",
+                    device_code,
+                    command_id,
+                )
 
             try:
                 result = reader.operate_device(
@@ -794,8 +879,19 @@ def _make_handler(
             # Endpoint her zaman 200 doner; komut sonucu result.ok'ta. Cihaz
             # reddettiyse (unsupported/inactive/timeout) ok=False + status kalir,
             # backend buna bakip operator'a gosterir.
-            _ = ok
-            self._respond_json({"result": result})
+            #
+            # `ok` / `status` / `duplicate` TEPEDE de veriliyor: duplicate
+            # cevabi bu alanlari tasiyor, basari cevabi tasimiyordu. Farkli
+            # sekiller cagiran tarafta iki ayri ayristirma yolu demek; biri
+            # gozden kacarsa "sonuc bilinmiyor" ile "basarisiz" karisir.
+            self._respond_json(
+                {
+                    "ok": ok,
+                    "status": str(result.get("status", "unknown")),
+                    "duplicate": False,
+                    "result": result,
+                }
+            )
 
         def _respond_json(self, body: dict[str, Any], *, status_code: int = 200) -> None:
             payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -827,6 +923,7 @@ def _build_health_body(
     poll_interval_sec: float = 1.0,
     disk_guard: Any = None,
     clock_guard: Any = None,
+    ledger_provider: Any = None,
 ) -> tuple[dict[str, Any], int]:
     """Health body + HTTP status code uretir.
 
@@ -923,6 +1020,16 @@ def _build_health_body(
         issues.append("state_db_quarantined")
         severity_score = max(severity_score, 1)
 
+    # --- Komut defteri sifirlandi mi? --------------------------------------
+    # `state_db_quarantined` ile AYNI SEY DEGIL: orada kaybedilen birikmis
+    # telemetridir. Burada kaybedilen fiziksel komut gecmisi ve tekrar-onleme
+    # garantisidir — operator bekleyen komutlari elle dogrulamali. Ayni
+    # severity, AYRI kod: karistirilmasi mudahaleyi yanlis yone cevirirdi.
+    ledger_snap = _ledger_snapshot(ledger_provider)
+    if ledger_snap.get("journal_reset"):
+        issues.append("command_journal_reset")
+        severity_score = max(severity_score, 1)
+
     # --- Disk alani ---------------------------------------------------------
     # "Disk-full breaker" aslinda MESAJ sayiyordu, bayt saymiyordu; disk
     # dolmasi uc ayri arizanin (retrier olumu, log rotation kirilmasi, poller
@@ -1006,6 +1113,12 @@ def _build_health_body(
     }
     if quarantined:
         body["quarantined_state_files"] = quarantined
+    if ledger_snap:
+        # Komut defteri ozeti: sifirlanma bayragi + bekleyen/olu sonuc sayisi.
+        # Karantina dosyasinin YOLU burada YOK — /health auth'suz.
+        body["command_ledger"] = {
+            k: v for k, v in ledger_snap.items() if k != "journal_reset_path"
+        }
     return body, http_code
 
 

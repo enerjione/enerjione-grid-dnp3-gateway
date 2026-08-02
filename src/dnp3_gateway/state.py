@@ -62,6 +62,10 @@ class GatewayState:
         # Profil (cihaz modeli) bazli sinyal setleri. Bos sozluk = backend bu
         # alani gondermiyor (eski surum) -> duz `_signals` kullanilir.
         self._signals_by_profile: dict[str, list[SignalConfig]] = {}
+        # Hakkinda uyari basilmis profiller. `signals_for` cihaz basina her
+        # cycle'da cagriliyor; kalici bir katalog hatasi icin ayni satiri
+        # saniyede bir basmak logu doldurur. Config degisince temizlenir.
+        self._profil_uyarildi: set[str] = set()
         self._last_read_at: dict[str, float] = {}
         self._config_version: str = ""
         self._gateway_active: bool = False
@@ -119,6 +123,11 @@ class GatewayState:
                 profil: list(satirlar)
                 for profil, satirlar in (getattr(config, "signals_by_profile", None) or {}).items()
             }
+            if changed:
+                # Katalog degisti: operator eksik profili eklemis olabilir.
+                # Uyari sayfasini temizle ki durum hala suruyorsa tekrar
+                # raporlansin (sessizce yutulmus bir hata olarak kalmasin).
+                self._profil_uyarildi.clear()
             self._gateway_active = config.is_active
             self._gateway_name = config.gateway_name
             known = {device.code for device in self._devices}
@@ -432,12 +441,16 @@ class GatewayState:
           2. Yerlesik profil (profiles/<model>.json) — backend o model icin
              sinyal gondermediyse ya da BOS gonderdiyse. Boylece bilinen bir
              model, katalog bos olsa bile dogru yoklanir.
-          3. Duz liste — profil kavrami hic yoksa (eski backend / tek model).
+          3. Duz liste — YALNIZCA karisma ihtimali yokken:
+             (a) backend profil kavramini hic kullanmiyorsa (eski surum), ya da
+             (b) tek bir profil grubu var VE filodaki tum cihazlar ayni
+                 profili tasiyorsa (tek modelli kurulum).
 
-        DIKKAT: 2. adim yoksa BOS liste doner ve cihaz yoklanmaz. Bu kasitli:
-        duz listeye dusmek KOMSU DNP3 modelinin adreslerini yoklamak olurdu ve
-        okunan deger yanlis `signal_key` ile yayinlanirdi. Sessiz yanlis veri,
-        gorunur eksik veriden daha kotudur.
+        DIKKAT: Bunlarin hicbiri tutmuyorsa BOS liste doner ve cihaz
+        yoklanmaz. Bu kasitli: cok modelli bir filoda duz liste TUM
+        profillerin BIRLESIMIdir; ona dusmek KOMSU DNP3 modelinin adreslerini
+        yoklamak olur ve okunan deger yanlis `signal_key` ile yayinlanirdi.
+        Sessiz yanlis veri, gorunur eksik veriden daha kotudur.
         """
         with self._lock:
             profil = (getattr(device, "signal_profile", None) or "").strip()
@@ -453,7 +466,7 @@ class GatewayState:
         # cycle'ini bloklardi.
         yerlesik = builtin_profile(profil)
         if yerlesik:
-            if backend_seti is not None:
+            if backend_seti is not None and self._profil_uyarisi_ver(f"builtin:{profil}"):
                 logger.info(
                     "signals_builtin_used device=%s profil=%s — backend bu model "
                     "icin sinyal gondermedi, yerlesik harita kullaniliyor",
@@ -464,24 +477,75 @@ class GatewayState:
 
         if backend_seti is not None:
             # Backend bilerek bos gonderdi ve yerlesik harita da yok.
-            logger.warning(
-                "signals_empty device=%s profil=%s — bu model icin sinyal yok; "
-                "cihaz yoklanmayacak (komsu modelin adresleri KULLANILMAZ)",
-                getattr(device, "code", "?"),
-                profil,
-            )
+            if self._profil_uyarisi_ver(f"empty:{profil}"):
+                logger.warning(
+                    "signals_empty device=%s profil=%s — bu model icin sinyal yok; "
+                    "cihaz yoklanmayacak (komsu modelin adresleri KULLANILMAZ)",
+                    getattr(device, "code", "?"),
+                    profil,
+                )
             return []
 
-        # Profil anahtari sozlukte HIC yok: surum uyumsuzlugu ya da bozuk
-        # ayristirma. Bilgi eksik oldugu icin duz liste en az kotu secenek —
-        # cihaz karanliga dusmez, tek modelli kurulumda zaten dogru sonuc verir.
-        logger.warning(
-            "signals_profile_missing device=%s profil=%r — duz listeye dusuldu",
-            getattr(device, "code", "?"),
-            profil,
-        )
+        # Profil anahtari sozlukte HIC yok: surum uyumsuzlugu, katalogda
+        # tanimsiz model ya da bozuk ayristirma.
+        #
+        # ESKI DAVRANIS kosulsuz duz listeye duserdi. Cok modelli bir filoda bu
+        # SESSIZ YANLIS VERI uretir: backend profil bazli katalog gonderiyorsa
+        # duz `signals` listesi TUM profillerin BIRLESIMIdir. Komsu modelin
+        # (30,12) adresi bu cihazda baska bir buyukluktur; okunan deger yanlis
+        # `signal_key` ile yayinlanir ve esik alarmi sahte bir buyukluk
+        # uzerinden calisir. Yukaridaki 2. adim tam da bunu engellemek icin
+        # bos liste donerken, bu satir ayni riski arka kapidan geri sokuyordu.
+        #
+        # YENI KURAL: duz listeye yalnizca KARISMA IHTIMALI YOKKEN dusulur —
+        # backend tek bir profil grubu gonderdiyse VE filodaki tum cihazlar
+        # ayni profili tasiyorsa. O durumda duz liste zaten o tek modelin
+        # haritasidir; anahtar yazim farki yuzunden tum sahayi karanliga
+        # dusurmemis oluruz. Aksi halde cihaz yoklanmaz.
         with self._lock:
-            return list(self._signals)
+            grup_sayisi = len(self._signals_by_profile)
+            filo_profilleri = {
+                (getattr(d, "signal_profile", None) or "").strip() for d in self._devices
+            }
+            duz_liste = list(self._signals)
+
+        tek_model = grup_sayisi <= 1 and len(filo_profilleri) <= 1
+        if tek_model:
+            if self._profil_uyarisi_ver(f"flat:{profil}"):
+                logger.warning(
+                    "signals_profile_missing device=%s profil=%r — katalogda yok; "
+                    "filo tek modelli oldugu icin duz listeye dusuldu (%d sinyal)",
+                    getattr(device, "code", "?"),
+                    profil,
+                    len(duz_liste),
+                )
+            return duz_liste
+
+        if self._profil_uyarisi_ver(f"unknown:{profil}"):
+            logger.error(
+                "signals_profile_unknown device=%s profil=%r — katalogda yok ve "
+                "yerlesik harita da yok. Filoda %d profil var; duz liste bunlarin "
+                "BIRLESIMI oldugu icin KULLANILMADI (yanlis signal_key riski). "
+                "Bu cihaz yoklanmayacak — backend katalogunda profili tanimlayin.",
+                getattr(device, "code", "?"),
+                profil,
+                len(filo_profilleri),
+            )
+        return []
+
+    def _profil_uyarisi_ver(self, profil: str) -> bool:
+        """Ayni profil icin uyariyi config surumu basina BIR KEZ bastir.
+
+        `signals_for` cihaz basina her cycle'da cagriliyor (2sn). Kalici bir
+        konfigurasyon hatasi icin dakikada 30 satir uretmek logu doldurur ve
+        gercek arizalari gizler. Config degisince sayfa temizlenir, boylece
+        operator duzeltmeyi denedikten sonra durum tekrar raporlanir.
+        """
+        with self._lock:
+            if profil in self._profil_uyarildi:
+                return False
+            self._profil_uyarildi.add(profil)
+            return True
 
     def has_any_signals(self) -> bool:
         """Herhangi bir sinyal tanimli mi (duz liste ya da HERHANGI bir profil)?
@@ -513,15 +577,28 @@ class GatewayState:
             self._last_read_at[device_code] = monotonic_ts
 
     def due_devices(self, now_monotonic: float) -> list[DeviceConfig]:
-        """poll_interval_sec gecmisse okunmasi gereken cihazlari listeler."""
+        """poll_interval_sec gecmisse okunmasi gereken cihazlari listeler.
+
+        SIRA = EN UZUN SUREDIR OKUNMAYAN ONCE. Eskiden config sirasi
+        korunuyordu ve bu, kapasitesi yetmeyen bir kurulumda ACLIK uretiyordu:
+        havuz doyduğunda kuyrugun sonundaki cihazlar cycle timeout'una
+        yakalanir, ertesi cycle YINE ayni sirayla en sona dizilir ve AYNI
+        cihazlar surekli okunmadan kalirdi. Panelde birkac gosterge sonsuza
+        kadar bayat veri gosterirdi.
+
+        Bayatliga gore siralamak bu dongyu kirar: bir cihaz kacirildiginda
+        bir sonraki cycle'da EN ONE gecer.
+        """
         with self._lock:
-            due: list[DeviceConfig] = []
+            due: list[tuple[float, DeviceConfig]] = []
             for device in self._devices:
                 last = self._last_read_at.get(device.code, 0.0)
                 interval = max(1, device.poll_interval_sec)
                 if now_monotonic - last >= interval:
-                    due.append(device)
-            return due
+                    due.append((last, device))
+            # Hic okunmamis cihaz (last=0.0) dogal olarak en basa gelir.
+            due.sort(key=lambda item: item[0])
+            return [device for _last, device in due]
 
     def config_loaded_at_unix(self) -> float | None:
         with self._lock:

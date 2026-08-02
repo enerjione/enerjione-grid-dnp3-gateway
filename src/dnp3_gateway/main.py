@@ -933,6 +933,7 @@ def run(current_settings: Settings | None = None) -> int:
             poll_interval_sec=cfg.default_poll_interval_sec,
             disk_guard=disk_guard,
             clock_guard=clock_guard,
+            ledger_provider=_ledger_provider,
         )
 
         # Cihaz KODLARI yalnizca bu kimlik dogrulamali baslikta gider.

@@ -264,6 +264,57 @@ def test_command_ledger_semasi_surumlenir(tmp_path: Path) -> None:
     conn.close()
 
 
+def test_bozuk_ledger_sifirlanmasi_raporlanir(tmp_path: Path) -> None:
+    """Komut defterinin sifirlanmasi outbox'in sifirlanmasiyla AYNI SEY DEGIL.
+
+    Outbox'ta kaybedilen birikmis telemetridir. Burada kaybedilen FIZIKSEL
+    KOMUT gecmisidir; iki somut sonucu var:
+      1. `recover_unknown_results` bos doner — onceki prosesin yarim biraktigi
+         bir CROB'un sonucu backend'e ASLA bildirilemez, backend o komutu
+         sonsuza kadar "bekliyor" gorur.
+      2. Tekrar-onleme garantisi kalkar — backend bekleyen bir komutu yeniden
+         gonderirse gateway onu YENI sanip CROB'u tekrarlar.
+
+    Eskiden ikisi de SESSIZDI: dosya karantinaya alinip temiz bir defterle
+    devam ediliyordu ve bunun komut kanali icin ne demek oldugu hicbir yerde
+    gorunmuyordu.
+    """
+    db = tmp_path / "ledger.db"
+    led = CommandLedger(db)
+    led.start_dispatch(101)  # yarim kalmis bir komut
+    led.close()
+
+    # Elektrik kesintisi: dosya bozuldu
+    raw = bytearray(db.read_bytes())
+    for i in range(100, min(len(raw), 4096)):
+        raw[i] = 0xFF
+    db.write_bytes(bytes(raw))
+
+    led2 = CommandLedger(db)  # patlamamali
+    try:
+        assert led2.journal_reset_at is not None, "defter sifirlanmasi tespit edilmedi"
+        assert led2.journal_reset_path is not None
+        assert ".corrupt." in led2.journal_reset_path
+
+        snap = led2.status_snapshot()
+        assert snap["journal_reset"] is True
+
+        # Yarim kalmis komut GERCEKTEN kayip — bu testin kabul ettigi zarar;
+        # onemli olan zararin GORUNUR olmasi.
+        assert led2.recover_unknown_results() == []
+    finally:
+        led2.close()
+
+
+def test_saglikli_ledger_sifirlanma_bildirmez(tmp_path: Path) -> None:
+    led = CommandLedger(tmp_path / "ledger.db")
+    try:
+        assert led.journal_reset_at is None
+        assert led.status_snapshot()["journal_reset"] is False
+    finally:
+        led.close()
+
+
 def test_bozuk_outbox_gateway_i_bloke_etmez(tmp_path: Path) -> None:
     """En kritigi: bozuk outbox artik gateway'i acilista oldurmemeli."""
     db = tmp_path / "outbox.db"
