@@ -191,8 +191,13 @@ kisitiyla) + `device_link_states` + `gateway_staleness_watchdog.apply_link_state
 `apply_link_states` v2.34.0'dan SONRA girdi — saha 2.34.0'da oldugu surece
 `gateway_health` satiri dolar ama cihaz durumuna yansimaz.
 
-**Kalan:** bu veriden alarm kurali (orn. `lost/total > 0.5` 5 dakikadan uzun
-surerse ENGINEER'a bildirim) — backend isi.
+**Alarm kurali da yazildi** (backend `gateway_fleet_alarm.py`): cihazlarin
+`lost/total` orani esigi (varsayilan 0.5) 5 dakikadan uzun sure kesintisiz
+asarsa muhendis + kurulumcuya bildirim gider. Filo duzelince isaret temizlenir,
+yeni bozulma yeniden uyarir. `GATEWAY_FLEET_LOST_RATIO` /
+`GATEWAY_FLEET_SUSTAIN_SEC` ile ayarlanir.
+
+**B4 TAMAMEN KAPANDI.**
 
 <details><summary>Ozgun kayit</summary>
 
@@ -246,6 +251,6 @@ Gateway tarafi 404/400'e toleransli yazilacak (eski backend'de sessizce atlar).
 | B1 | Kalite bayraklari | ⚙️ **tek env bayragi kaldi** | — (backend v2.28.0'dan hazir) | Yuksek — olcum dogrulugu |
 | B2 | Cihaz zaman damgasi | ⚠️ zaman-senk var | Backend → Gateway (**B1'den SONRA**) | Yuksek — SOE/ariza analizi |
 | B3 | Per-device katalog | ❌ kontrat sart | Backend → Gateway | Orta — cok markali filoda kritik |
-| B4 | Saglik heartbeat | ✅ **TAMAMLANDI** | — | ~~Yuksek — kor nokta~~ |
+| B4 | Saglik heartbeat + filo uyarisi | ✅ **TAMAMLANDI** | — | ~~Yuksek — kor nokta~~ |
 
 **Onerilen calisma sirasi:** ~~B4~~ (tamamlandi) → ~~B1~~ (bayrak acilinca biter) → B2 → B3.
