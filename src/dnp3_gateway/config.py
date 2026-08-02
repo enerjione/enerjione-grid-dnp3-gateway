@@ -903,4 +903,93 @@ class Settings(BaseSettings):
         return self.gateway_mode.strip().lower() == "dnp3"
 
 
-settings = Settings()
+class ConfigError(RuntimeError):
+    """Konfigurasyon gecersiz. Mesaj OPERATORE yoneliktir (traceback degil)."""
+
+
+def format_config_error(exc: BaseException) -> str:
+    """Pydantic dogrulama hatasini operatorun okuyabilecegi hale getirir.
+
+    Ham `ValidationError` traceback'i sahada ise yaramiyor: 20 satirlik pydantic
+    ic yigini iceriyor, hangi .env satirinin duzeltilecegi kaybolyor.
+    """
+    ham = str(exc)
+    satirlar: list[str] = []
+    for parca in ham.splitlines():
+        p = parca.strip()
+        if not p:
+            continue
+        # Belge linki operatorun isine yaramaz.
+        if p.startswith("For further information visit"):
+            continue
+        # Pydantic "N validation error(s) for Settings" basligi gereksiz.
+        if p.endswith("for Settings") and "validation error" in p:
+            continue
+        # Pydantic "Value error, <bizim mesajimiz>" formatini sadelestir.
+        if p.startswith("Value error, "):
+            p = p[len("Value error, ") :]
+        # GUVENLIK: pydantic mesajin SONUNA `[type=..., input_value={...}]`
+        # ekliyor ve `input_value` TUM AYAR SOZLUGUNU dokuyor — icinde
+        # GATEWAY_TOKEN de olabilir. Bu kuyruk stdout'a, NSSM log dosyasina ve
+        # `docker logs`a duserdi. Kesip atiyoruz.
+        kesim = p.find(" [type=")
+        if kesim >= 0:
+            p = p[:kesim]
+        satirlar.append(p.rstrip())
+    return "\n".join(satirlar) if satirlar else ham
+
+
+def load_settings(**kwargs: object) -> Settings:
+    """Settings kurar; dogrulama hatasini ConfigError'a cevirir.
+
+    Caller (bkz. __main__.main) bunu yakalayip operatore TEMIZ bir mesaj
+    basar ve tanimli bir cikis koduyla doner.
+    """
+    try:
+        return Settings(**kwargs)  # type: ignore[arg-type]
+    except ConfigError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — pydantic ValidationError dahil
+        raise ConfigError(format_config_error(exc)) from exc
+
+
+# Modul-seviye singleton ARTIK LAZY.
+#
+# NEDEN: eskiden burada `settings = Settings()` vardi ve dogrulama IMPORT
+# ANINDA calisiyordu. Sonuclari sahada agirdi:
+#   * Hata argparse'tan ONCE olustugu icin `--env-file` / `--help` hic
+#     islenemiyordu.
+#   * Logging kurulmadan patliyordu -> log dosyasi olusmuyordu.
+#   * Health server hic acilmiyordu -> operator uzaktan teshis edemiyordu.
+#   * Cikti ham bir pydantic traceback'iydi; hangi .env satirinin yanlis
+#     oldugu kayboluyordu.
+#   * Docker'da `restart: unless-stopped` ile sessiz crash-loop.
+# Artik ilk ERISIMDE kurulur; `__main__` zaten kendi Settings'ini kurup
+# `run(cfg)`'e gecirdigi icin uretim yolunda buraya hic ugranmaz.
+_settings_cache: Settings | None = None
+
+
+def get_settings() -> Settings:
+    """Surec omrunde tek kez kurulan varsayilan Settings ornegi."""
+    global _settings_cache
+    if _settings_cache is None:
+        _settings_cache = load_settings()
+    return _settings_cache
+
+
+def reset_settings_cache() -> None:
+    """Testler icin: bir sonraki get_settings() yeniden kursun."""
+    global _settings_cache
+    _settings_cache = None
+
+
+def __getattr__(name: str) -> object:
+    """`from dnp3_gateway.config import settings` geriye uyumlulugu.
+
+    PEP 562: modul sozlugunde bulunmayan ad icin cagrilir. Boylece eski
+    import bicimi calismaya devam eder ama YALNIZCA gercekten kullanildiginda
+    Settings kurulur — import etmek tek basina dogrulama tetiklemez.
+    """
+    if name == "settings":
+        return get_settings()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -118,6 +118,23 @@ class ResilientPublisher:
             self._outbox_full = True
             self._last_outbox_error = error[:500]
 
+    def notify_outbox_idle(self) -> None:
+        """Retrier kuyrugu BOS buldu — breaker'i kapatmayi dene.
+
+        NEDEN BU KANAL SART:
+        `_clear_outbox_full` yalnizca BASARILI BIR YAYINDAN sonra cagriliyordu.
+        Breaker acikken ise (a) poller `outbox_full` gordugu icin hic publish
+        denemez, (b) retrier ancak kuyrukta SATIR VARSA publish eder. Kuyruk
+        basarili yayinla degil de dead-letter'a tasinarak bosalirsa breaker'i
+        kapatacak hicbir aktor kalmiyordu.
+
+        Somut zincir: backend token'i rotate edildi -> her POST 401 (kalici)
+        -> satirlar max_retries sonrasi dead_letter'a tasinir -> pending 0'a
+        iner ama breaker HALA ACIK -> operator token'i duzeltse bile gateway
+        RESTART EDILENE KADAR hicbir telemetri yayinlamaz.
+        """
+        self._clear_outbox_full()
+
     def _clear_outbox_full(self) -> None:
         """Breaker'i kapat — ANCAK HISTEREZIS ile.
 

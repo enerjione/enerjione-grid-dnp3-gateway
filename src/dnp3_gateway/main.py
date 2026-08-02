@@ -35,7 +35,7 @@ from dnp3_gateway.backend import (
     health_header,
     parse_device_ip_allowlist,
 )
-from dnp3_gateway.config import Settings, settings
+from dnp3_gateway.config import Settings, get_settings
 from dnp3_gateway.health_server import (
     ThreadLiveness,
     _build_health_body,
@@ -43,6 +43,7 @@ from dnp3_gateway.health_server import (
 )
 from dnp3_gateway.logging_setup import configure_logging, register_secret
 from dnp3_gateway.messaging import CommandLedger, Outbox, OutboxRetrier
+from dnp3_gateway.messaging.errors import is_transient
 from dnp3_gateway.messaging.resilient_publisher import ResilientPublisher
 from dnp3_gateway.poller import run_poll_cycle
 from dnp3_gateway.resource_guard import ClockGuard, DiskGuard
@@ -239,26 +240,80 @@ def _run_command_poll(
         stop_event.wait(timeout=max(1, poll_sec))
 
 
-def _deliver_ledger_results(client: BackendConfigClient, ledger) -> None:
-    """command_ledger'da teslim bekleyen sonuclari backend'e bildir (at-least-once).
+#: Komut sonucu teslimi kac kez KALICI hata alirsa dead-letter'a tasinir.
+#: Kalici hatalarda bile birkac deneme birakiyoruz: backend deploy'u sirasinda
+#: gecici olarak 404 donebilir.
+_COMMAND_RESULT_MAX_PERMANENT_FAILURES = 3
 
-    Basarili -> mark_delivered. Bildirim hata verirse ledger'da 'pending' kalir,
-    bir sonraki turda tekrar denenir (dead_letter'a dusurmuyoruz — gecici ag
-    hatasi kalici olmasin; operator health'te pending_result_count gorur).
+#: Tek POST'ta gonderilecek azami sonuc sayisi. Kuyruk birikirse govde
+#: buyuyup `command_poll_timeout_sec`'i asiyordu — kendi kendini besleyen ariza.
+_COMMAND_RESULT_BATCH = 50
+
+
+def _deliver_ledger_results(client: BackendConfigClient, ledger) -> None:
+    """command_ledger'da teslim bekleyen sonuclari backend'e bildir.
+
+    KALICI/GECICI AYRIMI (0.5.1'de eklendi)
+    ---------------------------------------
+    Eskiden HER hata "gecici" kabul ediliyor ve sonuc ledger'da 'pending'
+    kaliyordu. Backend KALICI bir 4xx dondugu anda (token rotasyonu -> 401,
+    sema degisikligi -> 422, silinmis command_id -> 404) kuyruk BIR DAHA
+    BOSALMIYORDU:
+      * O andan sonraki TUM komut sonuclari backend'e ulasmiyor; operator
+        panelinde komutlar sonsuza kadar "bekliyor" gorunurken kesiciler
+        FIZIKSEL OLARAK surulmus oluyordu.
+      * Liste her turda buyudugu icin POST govdesi surekli sisiyor ve
+        `command_poll_timeout_sec` (4sn) asiliyordu — kendi kendini besleyen
+        ariza.
+      * Saniyede bir WARNING log'u basiliyor, disari acilan hicbir sayac yoktu.
+
+    Artik:
+      * Gecici hata (ag / 408,425,429,502,503,504) -> aynen yeniden denenir.
+      * Kalici hata -> ilgili sonuclarin basarisizlik sayaci artar; esik
+        asilinca `mark_delivery_dead_letter` ile isaretlenir ve KUYRUK ILERLER.
+      * Gonderim parcali (batch) yapilir; govde sinirsiz buyumez.
     """
     pending_results = ledger.pending_results()
     if not pending_results:
         return
+
+    parca = pending_results[:_COMMAND_RESULT_BATCH]
     try:
-        client.report_command_results(pending_results)
+        client.report_command_results(parca)
     except Exception as exc:  # noqa: BLE001
+        gecici = is_transient(exc)
+        if gecici:
+            logger.warning(
+                "command_result_delivery_failed count=%d error=%s — GECICI, sonraki turda tekrar",
+                len(parca),
+                exc,
+            )
+            return
+        # KALICI: sayaci artir, esigi asani dead-letter'a al ve ILERLE.
+        for res in parca:
+            try:
+                cid = int(res["id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            adet = ledger.bump_delivery_failure(cid)
+            if adet >= _COMMAND_RESULT_MAX_PERMANENT_FAILURES:
+                ledger.mark_delivery_dead_letter(cid, str(exc)[:500])
+                logger.error(
+                    "command_result_dead_letter id=%s failures=%d error=%s — sonuc "
+                    "backend'e teslim EDILEMEDI ve kuyruktan cikarildi. Komut "
+                    "cihaza GONDERILMIS olabilir; ledger'da kayitlidir.",
+                    cid,
+                    adet,
+                    str(exc)[:200],
+                )
         logger.warning(
-            "command_result_delivery_failed count=%d error=%s — sonraki turda tekrar",
-            len(pending_results),
+            "command_result_delivery_permanent count=%d error=%s — kalici hata, kuyruk ilerletildi",
+            len(parca),
             exc,
         )
         return
-    for res in pending_results:
+
+    for res in parca:
         try:
             ledger.mark_delivered(int(res["id"]))
         except Exception:  # noqa: BLE001
@@ -499,7 +554,9 @@ def _tls_verify_param(cfg: Settings) -> bool | str:
 
 
 def run(current_settings: Settings | None = None) -> int:
-    cfg = current_settings or settings
+    # `get_settings()` LAZY: import aninda degil, burada kurulur. Uretim
+    # yolunda __main__ zaten kendi Settings'ini gecirir.
+    cfg = current_settings or get_settings()
     # Iki asamali logging: identity'yi bilmeden once minimal (stdout-only)
     # konfigure ederiz ki bootstrap log'lari kaybolmasin. Identity'yi
     # ogrendikten sonra TEKRAR konfigure ederiz; bu sefer per-instance
@@ -781,6 +838,10 @@ def run(current_settings: Settings | None = None) -> int:
         outbox,
         publish_fn=publisher.publish_outbox_row,
         publish_batch_fn=_batch_drain,
+        # Kuyruk bosaldiginda outbox-full breaker'i kapatmayi dene.
+        # Bu kanal olmadan, kuyruk dead-letter yoluyla bosaldiginda breaker
+        # acik kalir ve gateway RESTART'a kadar hic telemetri yayinlamaz.
+        on_idle=publisher.notify_outbox_idle,
         poll_interval_sec=cfg.outbox_retrier_poll_interval_sec,
         batch_size=cfg.outbox_retrier_batch_size,
         max_retries=cfg.outbox_max_retries,

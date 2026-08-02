@@ -256,7 +256,11 @@ def test_command_ledger_semasi_surumlenir(tmp_path: Path) -> None:
     led = CommandLedger(tmp_path / "ledger.db")
     led.close()
     conn = sqlite3.connect(str(tmp_path / "ledger.db"))
-    assert _v(conn) == 1
+    # v2: kalici teslim hatasi sayaci (delivery_failures). Kalici bir 4xx
+    # kuyrugu sonsuza kadar bloke etmesin diye eklendi.
+    assert _v(conn) == 2
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(command_ledger)")}
+    assert "delivery_failures" in cols
     conn.close()
 
 

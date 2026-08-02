@@ -79,6 +79,35 @@ sinyalleri DESTEKLEMEZ ve OpenDNP3 outstation'larla tutarsiz davranabilir.
     Write-Host '[install] yadnp3 kurulumu tamam' -ForegroundColor Green
 }
 
+# Paketin KENDISI. Bu adim EKSIKTI ve dokumante edilen TUM Windows baslatma
+# yollarini kiriyordu:
+#   README.md, docs/RUNBOOK.md, scripts/README.md ve new_gateway.ps1 hepsi
+#   `py -m dnp3_gateway` diyor. Paket kurulmadigi icin bu komut
+#   `ModuleNotFoundError: No module named 'dnp3_gateway'` ile aninda oluyordu.
+#   NSSM servisi SERVICE_AUTO_START oldugu icin sonsuz restart ediyor; health
+#   server hic acilmadigi ve logging kurulmadan patladigi icin operator
+#   /health'e baglanamiyor ve log dosyasi da olusmuyordu.
+# `-e` (editable): saha kurulumunda kaynak dizini yerinde kalir, `git pull` ile
+# guncelleme yeniden kurulum gerektirmez.
+Write-Host '[install] installing package (editable)' -ForegroundColor Cyan
+& $pip -m pip install -e .
+if ($LASTEXITCODE -ne 0) { throw "paket kurulumu basarisiz (cikis kodu: $LASTEXITCODE)" }
+
+# Kurulum DOGRULAMASI — "kuruldu ama calismiyor" durumunu burada yakala.
+Write-Host '[install] verifying installation' -ForegroundColor Cyan
+$verify = & $pip -c "import dnp3_gateway; print(dnp3_gateway.__version__)" 2>&1
+if ($LASTEXITCODE -ne 0) {
+    throw "DOGRULAMA BASARISIZ: paket import edilemiyor.`n$verify"
+}
+Write-Host "[install] dnp3_gateway $verify import edilebiliyor" -ForegroundColor Green
+
+$modeCheck = & $pip -m dnp3_gateway --help 2>&1
+if ($LASTEXITCODE -ne 0) {
+    Write-Warning "python -m dnp3_gateway calistirilamadi:`n$modeCheck"
+} else {
+    Write-Host '[install] `python -m dnp3_gateway` calisiyor' -ForegroundColor Green
+}
+
 if (-not (Test-Path '.env')) {
     if (Test-Path '.env.example') {
         Write-Host '[install] creating .env from .env.example (UTF-8 no-BOM)' -ForegroundColor Green

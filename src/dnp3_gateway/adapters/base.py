@@ -33,7 +33,10 @@ class SignalReading:
     source: str
     data_type: str
     raw_value: float
-    scaled_value: float
+    # None = sayisal bir deger URETILEMEDI (cihaz NaN/Inf raporladi).
+    # Sahte bir 0.0 gondermek SCADA'da gercek olcum gibi gorunurdu; bu yuzden
+    # deger null yayinlanir ve `quality="invalid"` ile isaretlenir.
+    scaled_value: float | None
     quality: str = "good"
     value_string: str | None = None
     read_token: Any = None
