@@ -2,6 +2,59 @@
 
 Semver'a gore tutulur. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.6.0] - 2026-08-02
+
+Gateway artik backend'e CIHAZ BAZINDA link durumu bildiriyor (BACKEND_TODO
+B4 kapandi).
+
+### Added
+
+- **`X-E1-Gateway-Health` basligi — cihaz bazinda link durumu.** Backend bir
+  cihazin haberlesip haberlesmedigini yalnizca telemetri geldiginde
+  anlayabiliyordu. Ariza bekleyen bir gosterge saatlerce sessiz kalabilir
+  (deger degismezse gateway hicbir sey yayinlamaz) ve o sure boyunca cihazin
+  canli mi olu mu oldugu BILINMIYORDU. "Veri gelmiyor" ile "haberlesme koptu"
+  ayni sey degil; bu ayrimi yapabilecek tek yer gateway, cunku DNP3 link
+  durumu burada tutuluyor.
+
+  Ozet, saniyede bir zaten atilan `GET /gateways/{code}/pending` istegine
+  baslik olarak biniyor — **ek istek, ek baglanti, ek CPU yok**. Config
+  client'a degil KOMUT client'ina bindi: config-refresh 5 dakikada bir kosar,
+  cihaz kaybini 5 dakika gec ogrenmek bu mekanizmanin amacini bosa cikarirdi.
+
+  **Yalnizca `online` OLMAYAN cihazlar gonderiliyor.** 600 cihazin tamamini
+  gondermek ~9 KB eder; nginx tavanina yaklasan bir baslik ISTEGIN TAMAMINI
+  reddettirir, yani KOMUTLAR DA GITMEZ. Tavan asilirsa kademeli kuculuyor
+  (cihaz listesi -> sorun metinleri -> yalnizca sayimlar) ve kirpma
+  `states_truncated` ile bildiriliyor; sessiz kirpma backend'e "geri kalan
+  her sey iyi" dedirtirdi.
+
+  Cihaz KODLARI yalnizca bu kimlik dogrulamali baslikta gider. `/health`
+  auth'suz oldugu icin orada eskisi gibi sadece sayim var.
+
+  Saglik saglayicisinin patlamasi, sacma deger dondurmesi ya da basligin
+  uretilememesi `/pending` cagrisini DUSURMEZ — komut kanali SCADA'nin
+  kendisi, ozellik yalnizca teshis kolayligi.
+
+### Fixed
+
+- **Baslik govdesinde `status` sabit yaziliyordu.** Outbox dolarken, bir
+  thread olmusken, disk biterken ya da saat kayarken bile backend'e "iyiyim"
+  derdi. Artik `status` ve `issues` `/health` ile ayni kaynaktan
+  (`_build_health_body`, 10 sn onbellekli) geliyor.
+
+- **`sync-docs.ps1` sessizce basarisiz oluyordu** (DOCS deposu): eksik
+  kaynagi yalnizca uyariyla geciyor, "basarili" donuyordu.
+
+### Changed
+
+- Platform geneli tek-seferlik denetim raporlari (`FINAL_PREPROD_AUDIT`,
+  `FINAL_REMAINING`, `PRODUCTION_READINESS_PLAN`, `REMAINING_BLOCKERS`)
+  `DOCS/planning/reports/`'a tasindi. Icerikleri gateway'i degil tum
+  platformu anlatiyordu; yanlis depodaydilar.
+
+- **Testler 200 -> 239.**
+
 ## [0.5.0] - 2026-07-31
 
 Production-oncesi kapsamli denetim (9 boyut, karsit dogrulama) sonrasi
