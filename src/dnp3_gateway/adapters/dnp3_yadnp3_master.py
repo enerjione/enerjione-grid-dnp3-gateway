@@ -21,6 +21,7 @@ Tasarim:
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from typing import Any
@@ -581,6 +582,46 @@ _clock_guard_ref: dict[str, Any] = {"guard": None}
 def set_clock_guard(guard: Any) -> None:
     """Saat sapmasi gozlemcisini adapter'a bagla (main.py cagirir)."""
     _clock_guard_ref["guard"] = guard
+    with _saat_uyari_lock:
+        _saat_uyarilan.clear()
+
+
+# Saat sapmasi uyarisi verilmis cihazlar (log spam onlemi). `Now()` her zaman
+# senkronizasyon isteginde cagrilir; uyariyi cihaz basina bir kez basiyoruz.
+_saat_uyari_lock = threading.Lock()
+_saat_uyarilan: set[str] = set()
+
+
+def _saat_uyarisi_ver(device_code: str) -> bool:
+    with _saat_uyari_lock:
+        if device_code in _saat_uyarilan:
+            return False
+        _saat_uyarilan.add(device_code)
+        return True
+
+
+def _gecersiz_dnptime() -> Any:
+    """opendnp3'e "bu zaman gecerli degil" diyen bir DNPTime uretir.
+
+    Binding surumleri arasinda API farkli olabildigi icin sirayla deneriz:
+      1. `DNPTime(0, TimestampQuality.INVALID)` — acik ve dogru olan.
+      2. `DNPTime(0)` — epoch 0; outstation'lar bunu makul bir saat olarak
+         kabul etmez, pratikte yazim etkisiz kalir.
+    Hicbiri kurulamazsa None doneriz; opendnp3 tarafinda bu da yazimi engeller.
+    """
+    kalite_cls = getattr(opendnp3, "TimestampQuality", None)
+    if kalite_cls is not None:
+        for ad in ("INVALID", "Invalid", "NOT_SYNCHRONIZED"):
+            kalite = getattr(kalite_cls, ad, None)
+            if kalite is not None:
+                try:
+                    return opendnp3.DNPTime(0, kalite)
+                except Exception:  # noqa: BLE001
+                    break
+    try:
+        return opendnp3.DNPTime(0)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _iin_bit(iin: Any, *names: str) -> bool:
@@ -677,19 +718,39 @@ def _make_master_app(cache: _DeviceCache, device_code: str) -> Any:
             return True
 
         def Now(self):  # noqa: N802
-            # opendnp3 outstation'a saat yazarken bu degeri kullanir.
-            # Saat sapmasi buyukse (ClockGuard) yanlis zamani 300 cihaza
-            # yazmaktansa HIC yazmamak yeglenir — bu durumda cihaz kendi
-            # saatinde kalir ve IIN1.4 (NEED_TIME) bayragiyla durumu bildirir.
+            """opendnp3 outstation'a saat yazarken bu degeri kullanir.
+
+            SAAT SAPMASI KORUMASI — GERCEK, no-op DEGIL.
+            Bu metod eskiden guard'i kontrol edip yalnizca DEBUG log basiyor,
+            sonra YINE DE `time.time()` donduruyordu; yorumu ise korumanin
+            "_apply_time_sync'te" oldugunu iddia ediyordu — oyle bir mekanizma
+            YOKTU. Yani sapmis gateway saati 300 outstation'a yaziliyordu ve
+            kod bunun onlendigini soyluyordu.
+
+            Artik sapma guvensizken `DNPTime` yerine GECERSIZ bir zaman
+            (`is_valid=False` / epoch 0) donduruyoruz: opendnp3 bu durumda
+            outstation'a saat YAZMAZ, cihaz kendi saatinde kalir ve IIN1.4
+            (NEED_TIME) bayragiyla durumu bildirmeye devam eder — ki bu bayrak
+            artik loglaniyor (bkz. _report_iin).
+
+            Yanlis saati 300 cihaza yazmak, hic yazmamaktan cok daha kotudur:
+            cihazin kendi olay tamponu da bozulur ve baska bir master'in
+            okudugu damgalar da yanlis olur.
+            """
             guard = _clock_guard_ref.get("guard")
             if guard is not None:
                 try:
                     if not guard.is_safe_for_time_sync:
-                        # Gecersiz zaman dondurmek yerine mevcut saati veriyoruz;
-                        # asil koruma _apply_time_sync'in kapatilmasidir (asagida).
-                        logger.debug("yadnp3_time_write_skipped device=%s (saat sapmasi)", device_code)
+                        if _saat_uyarisi_ver(device_code):
+                            logger.error(
+                                "dnp3_time_sync_suspended device=%s — gateway saati "
+                                "guvenilmez (sapma esigi asildi); outstation'a saat "
+                                "YAZILMIYOR. Sunucuda NTP/w32time servisini kontrol edin.",
+                                device_code,
+                            )
+                        return _gecersiz_dnptime()
                 except Exception:  # noqa: BLE001
-                    pass
+                    logger.debug("clock_guard_check_failed", exc_info=True)
             return opendnp3.DNPTime(int(time.time() * 1000))
 
     return _MasterApp()
@@ -1185,6 +1246,10 @@ class Yadnp3TelemetryReader(TelemetryReader):
         # Lock granulariteyi azaltmak icin double-check pattern: lock disinda
         # hizli dict lookup; sadece master OLUSTURURKEN lock alinir.
         self._lock = threading.Lock()
+        # NaN/Inf uyarisi verilmis noktalar (log spam onlemi). Arizali bir
+        # nokta her cycle yeniden okunur; uyariyi bir kez basiyoruz.
+        self._nan_lock = threading.Lock()
+        self._nan_uyarilan: set[tuple[int, int]] = set()
 
     @staticmethod
     def _resolve_tcp_port(device: DeviceConfig, default_port: int) -> int:
@@ -1456,6 +1521,52 @@ class Yadnp3TelemetryReader(TelemetryReader):
             # `forced` degerlerini tanidiktan sonra acilacak.
             # Bkz. docs/BACKEND_TODO.md#B1
             mapped_quality = map_dnp3_quality(dnp3_flags)
+
+            # ---- NaN / Inf KORUMASI ------------------------------------------
+            # G30v5/v6 (float/double) noktalarda outstation olculemeyen bir
+            # degeri IEEE-754 NaN veya Inf olarak raporlayabilir (arizali CT
+            # kanali, akim=0 iken cos-fi, bolme hatasi...). Bu deger payload'a
+            # girerse zincir su sekilde kiriliyordu:
+            #   requests json.dumps(allow_nan=False) -> InvalidJSONError
+            #     -> requests.RequestException -> HttpTelemetryNotReadyError
+            #     -> is_transient()=True -> retrier `mark_retry` CAGIRMAZ
+            #     -> next_attempt_at ILERLEMEZ -> satir kuyrugun basinda kalir
+            # Yani 0.5.0'in tam da onlemek icin yazildigi HEAD-OF-LINE BLOCKING
+            # bu yolda geri geliyor ve TUM outbox kalici olarak tikaniyordu.
+            # Ustelik `nan != nan` oldugu icin nokta her cycle yeniden dirty
+            # isaretleniyor ve kuyruga surekli yeni NaN satiri ekleniyordu.
+            #
+            # Deger yerine None yayinliyoruz: sahte bir sayi (0.0) gondermek
+            # SCADA'da gercek bir olcum gibi gorunurdu.
+            if not math.isfinite(scaled):
+                readings.append(
+                    SignalReading(
+                        signal_key=s.key,
+                        source=s.source,
+                        data_type=s.data_type,
+                        raw_value=0.0,
+                        scaled_value=None,
+                        quality="invalid",
+                        value_string=None,
+                        dnp3_flags=dnp3_flags,
+                        read_token=(s.dnp3_object_group, s.dnp3_index, version),
+                    )
+                )
+                if self._nan_uyarisi_ver(s.dnp3_object_group, s.dnp3_index):
+                    logger.warning(
+                        "dnp3_non_finite_value device=%s signal=%s group=%s index=%s "
+                        "raw=%r scale=%s offset=%s — deger sayisal degil; "
+                        "quality=invalid ile yayinlaniyor",
+                        device.code,
+                        s.key,
+                        s.dnp3_object_group,
+                        s.dnp3_index,
+                        raw,
+                        s.scale,
+                        s.offset,
+                    )
+                continue
+
             readings.append(
                 SignalReading(
                     signal_key=s.key,
@@ -1480,6 +1591,19 @@ class Yadnp3TelemetryReader(TelemetryReader):
                 )
             )
         return readings
+
+    def _nan_uyarisi_ver(self, group: int, index: int) -> bool:
+        """Bu nokta icin NaN uyarisi DAHA ONCE verilmedi mi?
+
+        Arizali bir nokta her cycle (1-2sn) yeniden okunur; uyariyi her
+        seferinde basmak log'u doldurur ve gercek arizalari gizler.
+        """
+        anahtar = (group, index)
+        with self._nan_lock:
+            if anahtar in self._nan_uyarilan:
+                return False
+            self._nan_uyarilan.add(anahtar)
+            return True
 
     def device_health(self) -> dict[str, dict[str, Any]]:
         """Cihaz basina DNP3 haberlesme durumu (health/metrics icin).

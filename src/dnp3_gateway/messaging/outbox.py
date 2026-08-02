@@ -442,11 +442,14 @@ class OutboxRetrier:
         max_backoff_sec: float = DEFAULT_MAX_BACKOFF_SEC,
         backoff_multiplier: float = DEFAULT_BACKOFF_MULTIPLIER,
         publish_batch_fn: Callable[[list[dict[str, Any]]], None] | None = None,
+        on_idle: Callable[[], None] | None = None,
     ) -> None:
         self._outbox = outbox
         self._publish_fn = publish_fn
         # Toplu gonderim yolu (HTTP ingest icin). Yoksa mesaj basina POST.
         self._publish_batch_fn = publish_batch_fn
+        # Kuyruk bosaldiginda cagrilir (outbox-full breaker'i kapatmak icin).
+        self._on_idle = on_idle
         self._poll_interval = max(0.5, float(poll_interval_sec))
         self._batch_size = max(1, int(batch_size))
         self._max_retries = max(1, int(max_retries))
@@ -521,6 +524,15 @@ class OutboxRetrier:
 
     def _reset_backoff(self) -> None:
         self._current_backoff = self._min_backoff
+
+    def _notify_idle(self) -> None:
+        """Kuyruk bos kancasi. Hicbir hata retrier dongusunu bozmamali."""
+        if self._on_idle is None:
+            return
+        try:
+            self._on_idle()
+        except Exception:  # noqa: BLE001
+            logger.debug("outbox_idle_callback_failed", exc_info=True)
 
     def _drain_batch(self, rows: list[dict[str, Any]]) -> tuple[int, bool]:
         """Bir batch'i gondermeye calis. Doner: (gonderilen, gecici_hata_var_mi).
@@ -608,6 +620,12 @@ class OutboxRetrier:
             if not rows:
                 # Bos kuyruk = saglikli durum; backoff'i sifirla, normal interval'a don.
                 self._reset_backoff()
+                # Publisher'a haber ver: outbox-full breaker acik kalmissa
+                # kapatilabilir. Breaker acikken poller publish DENEMEZ ve
+                # retrier de satir olmadan publish edemez; kuyruk dead-letter
+                # yoluyla bosalmissa breaker'i kapatacak baska aktor YOKTUR
+                # ve gateway restart'a kadar hic telemetri yayinlamaz.
+                self._notify_idle()
                 self._stop.wait(self._poll_interval)
                 continue
 

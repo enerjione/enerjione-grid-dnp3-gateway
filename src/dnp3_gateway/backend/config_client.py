@@ -172,6 +172,19 @@ class GatewayConfigError(RuntimeError):
     """Backend API config endpoint'inden gecerli bir yanit alinamadi."""
 
 
+class CommandResultDeliveryError(GatewayConfigError):
+    """Komut sonucu backend'e teslim edilemedi.
+
+    `http_status` tasir; caller GECICI (yeniden dene) ile KALICI (dead-letter'a
+    al ve kuyrugu ilerlet) ayrimini bu bilgiyle yapar. GatewayConfigError'dan
+    turuyor ki mevcut `except GatewayConfigError` yakalayicilari bozulmasin.
+    """
+
+    def __init__(self, message: str, *, http_status: int | None = None) -> None:
+        super().__init__(message)
+        self.http_status = http_status
+
+
 def _parse_signal_list(signals_raw: Any, *, alan: str = "signals") -> list[SignalConfig]:
     """Ham sinyal listesini dogrulayarak SignalConfig listesine cevirir.
 
@@ -658,11 +671,24 @@ class BackendConfigClient:
                 timeout=self.timeout_sec,
             )
         except requests.RequestException as exc:
-            raise GatewayConfigError(
-                _scrub_token_from_text(f"command-results POST failed: {exc}", self.identity.token)
+            # Ag hatasi -> GECICI. HTTP status yok; caller yeniden dener.
+            raise CommandResultDeliveryError(
+                _scrub_token_from_text(f"command-results POST failed: {exc}", self.identity.token),
+                http_status=None,
             ) from exc
         if response.status_code >= 400:
-            raise GatewayConfigError(f"command-results POST rejected: HTTP {response.status_code}")
+            # HTTP STATUS'U TASI. Eskiden bu bilgi kayboluyordu ve caller
+            # kalici (401/422/404) ile gecici (502/503) hatayi ayirt
+            # edemiyordu: her ikisinde de sonsuza kadar yeniden deniyordu.
+            # Tek bir kalici redde takilan kuyruk BIR DAHA BOSALMIYOR ve
+            # o andan sonraki TUM komut sonuclari backend'e ulasmiyordu —
+            # operator panelinde komutlar sonsuza kadar "bekliyor" gorunurken
+            # kesiciler fiziksel olarak surulmus oluyordu.
+            preview = _scrub_token_from_text((response.text or "")[:200], self.identity.token)
+            raise CommandResultDeliveryError(
+                f"command-results POST rejected: HTTP {response.status_code}: {preview}",
+                http_status=response.status_code,
+            )
 
 
 # Schema-defansif sabitler — backend kompromize olsa bile gateway'in
@@ -830,9 +856,9 @@ def _allowed_networks_cached() -> DeviceIpAllowlist:
     if _ALLOWED_NETWORKS_CACHE is not None:
         return _ALLOWED_NETWORKS_CACHE
     try:
-        from dnp3_gateway.config import settings as _settings
+        from dnp3_gateway.config import get_settings
 
-        raw = _settings.dnp3_device_allowed_subnets or ""
+        raw = get_settings().dnp3_device_allowed_subnets or ""
     except Exception:  # noqa: BLE001
         raw = ""
     allowlist = parse_device_ip_allowlist(raw)

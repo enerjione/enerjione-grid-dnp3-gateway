@@ -32,8 +32,22 @@ def _migration_001_initial(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migration_002_delivery_failures(conn: sqlite3.Connection) -> None:
+    """v2 — sonuc teslimindeki KALICI hata sayaci.
+
+    Eskiden teslim hatasi tipsizdi: kalici bir 4xx (token rotasyonu, sema
+    degisikligi, silinmis command_id) kuyrugu SONSUZA KADAR bloke ediyordu.
+    Bu sayac sayesinde kalici hata birkac denemeden sonra dead-letter'a
+    tasinir ve kuyruk ilerler.
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(command_ledger)").fetchall()}
+    if "delivery_failures" not in cols:
+        conn.execute("ALTER TABLE command_ledger ADD COLUMN delivery_failures INTEGER NOT NULL DEFAULT 0")
+
+
 _MIGRATIONS: list[Migration] = [
     (1, "initial command_ledger schema", _migration_001_initial),
+    (2, "command_ledger.delivery_failures (kalici teslim hatasi sayaci)", _migration_002_delivery_failures),
 ]
 
 
@@ -124,6 +138,28 @@ class CommandLedger:
                 (int(command_id),),
             )
             self._conn.commit()
+
+    def bump_delivery_failure(self, command_id: int) -> int:
+        """KALICI teslim hatasi sayacini artirir ve yeni degeri doner."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE command_ledger SET delivery_failures = delivery_failures + 1 WHERE command_id = ?",
+                (int(command_id),),
+            )
+            self._conn.commit()
+            row = self._conn.execute(
+                "SELECT delivery_failures FROM command_ledger WHERE command_id = ?",
+                (int(command_id),),
+            ).fetchone()
+        return int(row[0]) if row else 0
+
+    def delivery_dead_letter_count(self) -> int:
+        """Teslim edilemeyip dead-letter'a alinan sonuc sayisi (/health icin)."""
+        with self._lock:
+            (n,) = self._conn.execute(
+                "SELECT COUNT(*) FROM command_ledger WHERE delivery_state = 'dead_letter'"
+            ).fetchone()
+        return int(n)
 
     def mark_delivery_dead_letter(self, command_id: int, error: str) -> None:
         with self._lock:

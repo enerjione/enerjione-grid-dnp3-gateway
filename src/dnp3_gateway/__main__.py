@@ -20,8 +20,12 @@ import os
 import sys
 
 from dnp3_gateway import __version__
-from dnp3_gateway.config import Settings
+from dnp3_gateway.config import ConfigError, load_settings
 from dnp3_gateway.main import run
+
+#: Konfigurasyon gecersiz. Diger hatalardan ayirt edilebilsin diye ayri kod;
+#: NSSM/Docker tarafinda "yanlis ayar" ile "cokme" ayrilabilir.
+EXIT_CONFIG_ERROR = 78  # sysexits.h EX_CONFIG
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -80,15 +84,52 @@ def _apply_cli_overrides(args: argparse.Namespace) -> None:
         os.environ["MAX_PARALLEL_DEVICES"] = str(args.max_parallel_devices)
 
 
+def _report_config_error(exc: ConfigError, env_file: str | None) -> None:
+    """Konfigurasyon hatasini OPERATORE yonelik bicimde yazdirir.
+
+    Hem stderr'e hem stdout'a yaziyoruz: NSSM `AppStdout`/`AppStderr` yalnizca
+    birini yonlendirmis olabilir ve bu mesaj sahadaki TEK teshis izidir
+    (logging henuz kurulmadi, health server acilmadi).
+    """
+    kaynak = env_file or ".env"
+    metin = "\n".join(
+        [
+            "",
+            "=" * 72,
+            "  KONFIGURASYON HATASI — gateway baslatilamadi",
+            "=" * 72,
+            "",
+            str(exc),
+            "",
+            f"  Kontrol edilecek dosya : {kaynak}",
+            "  Ayarlarin tam listesi  : .env.example",
+            "  Kurulum rehberi        : docs/RUNBOOK.md",
+            "",
+            "  Duzeltip servisi yeniden baslatin.",
+            "=" * 72,
+            "",
+        ]
+    )
+    print(metin, file=sys.stderr, flush=True)
+    print(metin, flush=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_arg_parser()
     args = parser.parse_args(argv)
     _apply_cli_overrides(args)
 
-    if args.env_file:
-        cfg = Settings(_env_file=args.env_file)  # type: ignore[call-arg]
-    else:
-        cfg = Settings()
+    # Settings ARGPARSE'TAN SONRA kurulur: `--env-file` ve `--help` bu noktaya
+    # kadar islenmis olur. Eskiden dogrulama `config` modulu import edilirken
+    # calisiyor, bu yuzden `--help` bile bozuk bir .env yuzunden patliyordu.
+    try:
+        if args.env_file:
+            cfg = load_settings(_env_file=args.env_file)
+        else:
+            cfg = load_settings()
+    except ConfigError as exc:
+        _report_config_error(exc, args.env_file)
+        return EXIT_CONFIG_ERROR
     return run(cfg)
 
 

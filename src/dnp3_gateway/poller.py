@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import atexit
 import logging
+import math
 import threading
 from concurrent.futures import (
     FIRST_COMPLETED,
@@ -126,6 +127,16 @@ def build_telemetry_payload(
     # string tipinde numeric value anlamsiz; frontend 0 yerine bos / "—"
     # gostermesi icin null yolla. Gercek metin (varsa) value_string'te.
     is_string = reading.data_type == "string"
+    # SON SAVUNMA: JSON'a sayisal olmayan bir deger (NaN/Inf) ASLA girmemeli.
+    # Adapter zaten filtreliyor (bkz. dnp3_yadnp3_master read_device), ama bu
+    # katman tum adapter'lar ve ileride eklenecek profiller icin garanti verir.
+    # NaN payload'a girerse `requests` json.dumps(allow_nan=False) ile hata
+    # verir, mesaj gecici hata olarak siniflanir, retrier `mark_retry`
+    # cagirmadigi icin satir kuyrugun basinda KALICI olarak takilir ve TUM
+    # outbox drenaji durur.
+    deger = reading.scaled_value
+    if deger is not None and not math.isfinite(deger):
+        deger = None
     return {
         "message_id": str(uuid4()),
         "correlation_id": correlation_id,
@@ -134,7 +145,7 @@ def build_telemetry_payload(
         "signal_key": reading.signal_key,
         "signal_source": reading.source,
         "signal_data_type": reading.data_type,
-        "value": None if is_string else reading.scaled_value,
+        "value": None if is_string else deger,
         "value_string": reading.value_string,
         "quality": reading.quality,
         # KALITENIN KAPSAMINI BU ALAN BELIRLER — gonderilmesi SART.
@@ -240,12 +251,18 @@ def poll_device(
         # sonra veriyoruz.
         batch_fn(items)
         _commit_published(reader=reader, device=device, readings=to_publish)
-        # Broker'a mi gitti yoksa outbox'a mi dustu? Metrik dogrulugu icin
-        # ayirt ediyoruz — eskiden ikisi de "published" sayiliyordu ve backend
-        # tum POST'lari reddederken bile "yayin akiyor" gorunuyordu.
+        # Broker'a mi gitti yoksa outbox'a mi dustu?
+        #
+        # ONEMLI: outbox'a dusen mesaj "yayinlandi" SAYILMAZ. Donus degeri
+        # `metrics.record_cycle(published=...)` uzerinden
+        # `signals_published_total`'a ekleniyor; buradan `len(items)` donmek
+        # backend TUM POST'lari reddederken bile panelde "yayin akiyor"
+        # gosteriyordu. (0.5.0'da ayri bir `signals_outboxed_total` sayaci
+        # eklenmisti ama bu cift-sayim duzeltilmemisti.)
         if getattr(publisher, "last_batch_outboxed", False):
             _bump(metrics, "inc_outboxed", len(items))
             _bump(metrics, "inc_publish_error")
+            return 0
         return len(items)
     # Fallback: batch yok -> tek tek publish (eski davranis).
     published: list[SignalReading] = []
