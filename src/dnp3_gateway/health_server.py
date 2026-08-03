@@ -988,6 +988,15 @@ def _build_health_body(
         issues.append("command_channel_failing")
         severity_score = max(severity_score, 1)
 
+    # --- Telemetri hedefi (backend ingest) ---------------------------------
+    # `broker_ready` uzun suredir govdede vardi ama HICBIR sorun kodu
+    # uretmiyordu: backend'e telemetri hic gitmezken `/health` "ok" diyebilir,
+    # ariza yalnizca outbox dolmaya basladiginda (dakikalar sonra) gorunurdu.
+    # Gateway<->backend haberlesmesi kopar kopmaz gorunmeli.
+    if outbox_snap.get("broker_ready") is False:
+        issues.append("telemetry_backend_unreachable")
+        severity_score = max(severity_score, 1)
+
     if outbox_snap.get("outbox_full"):
         issues.append("outbox_full")
         severity_score = max(severity_score, 2)

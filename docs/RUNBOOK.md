@@ -155,6 +155,9 @@ bakin.
 | `dead_letter_messages_present` | degraded | Teslim edilemeyen mesaj var. | `outbox_dead_letter` bolumune bak (asagida). Kalici bir sema/kabul hatasina isaret eder. |
 | `config_cache_stale` | degraded | Config `CONFIG_CACHE_MAX_AGE_HOURS`'tan eski. | Backend'e ulasilamiyor. Cihaz IP/sinyal listesi guncel olmayabilir. |
 | `config_refresh_failing` | degraded | Son config cekimi basarisiz. | `config_auth_error` / `config_404_error` log'una bak. |
+| `command_channel_failing` | degraded | `/pending` ~15sn'dir hata veriyor. | Backend restart penceresi olabilir; surerse asagi bak. |
+| `command_channel_down` | **unhealthy** | `/pending` ~1dk+ hata veriyor. **SCADA komutlari gateway'e ULASMIYOR** ve `config_nonce` okunamadigi icin yeni cihazlar anlik gorulmuyor. | Backend `/pending` endpoint'ini kontrol et. `health_header_disabled` log'u varsa gateway saglik basligini birakip komut kanalini kurtarmistir — o zaman backend'de `gateway_health` tablosu/migration eksiktir. |
+| `telemetry_backend_unreachable` | degraded | Telemetri hedefi (backend ingest) su an erisilemez. | Veri outbox'a yaziliyor, KAYIP YOK. `http_publisher_breaker_open` log'una ve backend ingest'e bak. Surerse outbox dolar ve unhealthy'ye cikar. |
 | `no_poll_cycles_yet` | degraded | 60sn+ gecti, hic cycle calismadi. | `config.active` false mu? Cihaz sayisi 0 mi? |
 | `disk_space_low` | degraded | State dizininde <1 GB. | Log/dead-letter temizligi. `.gateway_state` altini kontrol et. |
 | `disk_space_critical` | **unhealthy** | <256 MB. Telemetri diske yazilamayabilir. | **Acil** temizlik. Dolan disk retrier'i oldurur ve log rotation'i bozar. |

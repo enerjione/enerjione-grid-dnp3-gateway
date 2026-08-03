@@ -377,3 +377,47 @@ def test_komut_kanali_toparlaninca_sayac_sifirlanir() -> None:
     assert "command_channel_down" not in body["issues"]
     assert "command_channel_failing" not in body["issues"]
     assert code == 200
+
+
+# --------------------------------------------------------------------------
+# gateway <-> backend haberlesmesi gorunur olmali
+# --------------------------------------------------------------------------
+
+
+class _Broker:
+    def __init__(self, ready: bool) -> None:
+        self.is_ready = ready
+
+
+class _Publisher:
+    """ResilientPublisher'in /health tarafindan okunan yuzeyi."""
+
+    def __init__(self, *, ready: bool, pending: int = 0) -> None:
+        # `_broker` private ama health_server oradan okuyor (bkz. _outbox_snapshot).
+        self._broker = _Broker(ready)
+        self._pending = pending
+        self.outbox_full = False
+
+    def pending_count(self) -> int:
+        return self._pending
+
+    def dead_letter_count(self) -> int:
+        return 0
+
+
+def test_backend_erisilemezken_health_uyarir() -> None:
+    """REGRESYON: `broker_ready` govdede vardi ama HICBIR sorun kodu uretmiyordu.
+
+    Backend'e telemetri hic gitmezken `/health` "ok" diyebiliyordu; ariza
+    ancak outbox dolmaya basladiginda — dakikalar sonra — gorunurdu.
+    Gateway <-> backend haberlesmesi kopar kopmaz gorunmeli.
+    """
+    body, _c = _body(publisher=_Publisher(ready=False))
+    assert "telemetry_backend_unreachable" in body["issues"]
+    assert body["status"] == "degraded"
+
+
+def test_backend_erisilebilirken_uyari_yok() -> None:
+    body, code = _body(publisher=_Publisher(ready=True))
+    assert "telemetry_backend_unreachable" not in body["issues"]
+    assert code == 200

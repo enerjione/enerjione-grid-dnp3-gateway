@@ -62,6 +62,12 @@ services:
       # icin tune edilmis varsayilanlarini (1sn/100) GERI ALIYORDU. 300
       # cihazda 6 dalga demekti ve frontend'de olcum yasi 5-30sn araliginda
       # saliniyordu. Artik kod varsayilanlariyla ayni.
+      # Cihaz eklendiginde ANLIK tetik `config_nonce` ile gelir (komut-poll
+      # 1sn'de bir okur). Bu periyodik refresh onun YEDEGI: tetik herhangi bir
+      # sebeple calismazsa yeni cihaz en gec bu surede gorulur. Sahada tetik
+      # olunce varsayilan 300sn yuzunden 5 DAKIKA beklenmisti.
+      # Maliyet ~sifir: config istekleri ETag ile sartli (degismediyse 304).
+      CONFIG_REFRESH_SEC: "30"
       DEFAULT_POLL_INTERVAL_SEC: "1"
       MAX_PARALLEL_DEVICES: "100"
       DNP3_LOCAL_ADDRESS: "1"

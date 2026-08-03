@@ -175,7 +175,15 @@ class Settings(BaseSettings):
     # Config nadir degisir -> seyrek cek (5dk). Config degisince backend
     # config_nonce'u artirir; komut-poll bunu gorup config'i HEMEN ceker (5dk
     # beklemez). Komut artik AYRI command_poll_sec kanaliyla gelir.
-    config_refresh_sec: int = Field(default=300, ge=5, le=3600)
+    # 300 -> 60: cihaz eklendiginde ANLIK tetik `config_nonce` ile gelir
+    # (komut-poll 1sn'de bir okur), ama o tetik herhangi bir sebeple
+    # calismazsa periyodik refresh tek yedektir. Sahada tam bu oldu: backend
+    # `/pending`e 500 dondu, nonce okunamadi ve yeni eklenen cihaz 5 DAKIKA
+    # gorulmedi. 60sn ile en kotu durumda 1 dakika beklenir.
+    #
+    # Maliyet ~sifir: config istekleri ETag ile SARTLI; degismediyse backend
+    # 304 doner ve govde HIC inmez.
+    config_refresh_sec: int = Field(default=60, ge=5, le=3600)
     # Hafif komut-poll araligi: pending komutlar + nonce'lar. Komut anlik gelsin
     # diye kisa (1sn). GET /gateways/{code}/pending — agir config serialize yok.
     command_poll_sec: int = Field(default=1, ge=1, le=60)
