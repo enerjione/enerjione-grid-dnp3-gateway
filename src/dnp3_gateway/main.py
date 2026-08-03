@@ -191,6 +191,9 @@ def _run_command_poll(
         try:
             poll = client.fetch_pending_commands()
             state.apply_pending_poll(poll)
+            # SCADA komut yolunun sagligi /health'e yansisin (bkz.
+            # state.record_command_poll: bu kanal olurken panel "ok" diyordu).
+            state.record_command_poll(ok=True)
             if consecutive_errors:
                 logger.info(
                     "command_poll_recovered gateway=%s after_errors=%d",
@@ -233,10 +236,12 @@ def _run_command_poll(
                     consecutive_errors,
                     exc,
                 )
-        except Exception:  # noqa: BLE001
+            state.record_command_poll(ok=False, error=str(exc))
+        except Exception as exc:  # noqa: BLE001
             consecutive_errors += 1
             if consecutive_errors == 1:
                 logger.exception("command_poll_unexpected gateway=%s", client.gateway_code)
+            state.record_command_poll(ok=False, error=str(exc))
         stop_event.wait(timeout=max(1, poll_sec))
 
 
