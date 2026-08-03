@@ -85,39 +85,46 @@ backend bunlari tanimiyorsa olcumleri reddedebilir veya yanlis isleyebilir.
 
 ---
 
-## B2. Cihazin DNP3 olay zaman damgasi
+## B2. Cihazin DNP3 olay zaman damgasi — ⚙️ GATEWAY TARAFI BITTI, BACKEND BEKLIYOR
 
-**Gateway durumu:** ⚠️ Kismi — DNP3 zaman senkronizasyonu (`timeSyncMode`)
-eklendi, ancak olay damgasi hala yayina girmiyor.
+**Gateway durumu:** ✅ Cihaz damgasi artik yayinlaniyor. Govdede iki YENI alan
+var (bkz. `poller.build_telemetry_payload`):
 
-**Sorun:** `poller.build_telemetry_payload` icinde `source_timestamp`, cihazdan
-okuma yapilmadan ONCE uretilen gateway saatidir ve o cihazin TUM sinyallerine
-ayni deger basilir. Cihazin kendi DNP3 zaman damgasi (`it.value.time`) atiliyor.
+| Alan | Icerik |
+| --- | --- |
+| `device_event_at` | Cihazin KENDI olay damgasi (ISO-8601, UTC). Damga yoksa ya da makul araligin disindaysa `null`. |
+| `timestamp_quality` | `synchronized` / `unsynchronized` / `invalid` / `null` |
 
-Somut senaryo: 4G link 10 dakika kopuyor. Outstation event buffer'inda
-`08:00:03` (ariza gecti), `08:00:04` (ariza kalkti), `08:07:12` (yeniden kapama)
-olaylarini kendi damgalariyla biriktiriyor. Link gelince Class 1/2/3 scan
-hepsini tek fragment'ta bosaltiyor; gateway hepsini `08:10:00.123` ile ayni
-saniyeye damgaliyor. **Ariza suresi ve olay sirasi kalici olarak kayboluyor.**
+**`source_timestamp`'in anlami DEGISMEDI** — hala gateway saatidir. Bu bilincli:
+o alan backend'de historian birincil anahtarinin parcasi, TimescaleDB partition
+kolonu ve retention silme kriteri. Anlamini "cihaz zamani" yapmak gecmise
+damgali satirlarla INSERT'i patlatir, ileriye damgali satirlari ise
+retention'a gorunmez kilardi (bkz. backend migration 0025). Yani ozgun plandaki
+"`source_timestamp` anlamini degistir" maddesi **uygulanmadi ve uygulanmamali**;
+yerine ayri bir alan eklendi.
 
-**Backend'de yapilacak:**
-- Telemetri semasina `gateway_received_at` alani eklenecek
-- `source_timestamp` anlami degisecek: artik CIHAZIN olay zamani (varsa),
-  yoksa gateway zamani (fallback)
-- Historian/SOE sorgularinda hangi alanin kullanilacagi kararlastirilacak
-- Opsiyonel: `timestamp_quality` (DNP3 SYNCHRONIZED / UNSYNCHRONIZED / INVALID)
+**Cihaz saatine GUVENILMIYOR.** RTC pili biten bir gosterge 2000-01-01
+damgalar; makul araligin disindaki damga adapter'da DUSURULUR ve
+`timestamp_quality="invalid"` olur. **Olcumun kendisi her zaman yayinlanir** —
+bozuk saat veriyi degil, yalnizca damgayi kaybettirir.
 
-**⚠️ SIRA KRITIK — tek basina yapilirsa DURUM KOTULESIR:**
-```
-B1 (kalite bayraklari)  →  DNP3 zaman senkronizasyonu  →  B2  →  B4
-```
-Neden: zaman-senk olmadan outstation saatleri serbest surukleniyor (ayda
-10-60 sn drift, guc kesintisinde RTC 2000-01-01'e reset). B2'yi tek basina
-acmak "hepsi ayni yanlis saat" durumunu **"hepsi FARKLI yanlis saat"** haline
-getirir — ariza analizi icin daha kotu. Ayrica zaman kalitesi bitlerini
-okuyabilmek B1'e bagli.
+**Backend'de KALAN is:**
+- Telemetri semasina `device_event_at` + `timestamp_quality` alanlarini ekle
+  (su an gonderiliyor ama backend bunlari yok sayiyor)
+- SOE / ariza analizi sorgularinda hangi alanin kullanilacagina karar ver:
+  `device_event_at` doluysa o, degilse `source_timestamp`
+- `timestamp_quality != "synchronized"` olan damgalarin arayuzde nasil
+  isaretlenecegi (kullaniciya "bu zaman supheli" demek gerekir)
 
-**Deploy sirasi:** ONCE BACKEND (yeni alani kabul etsin), sonra gateway.
+**Deploy sirasi:** SERBEST. Gateway alanlari zaten gonderiyor; eski backend
+bunlari yok sayar (kirilma YOK). Backend hazir oldugunda veri otomatik anlam
+kazanir.
+
+**Onkosul zinciri KAPANDI:** zaman senkronizasyonu (`timeSyncMode`) eklendi,
+yani outstation saatleri artik gateway tarafindan yaziliyor. Bu olmadan B2
+"hepsi ayni yanlis saat" durumunu "hepsi FARKLI yanlis saat" haline getirirdi.
+Ayrica `ClockGuard` gateway saati supheliyken saat yazmayi askiya alir —
+yanlis saatli bir gateway 300 cihazin saatini birden bozamaz.
 
 ---
 
@@ -251,12 +258,19 @@ Gateway tarafi 404/400'e toleransli yazilacak (eski backend'de sessizce atlar).
 | # | Konu | Gateway hazir mi | Deploy sirasi | Onceligi |
 |---|---|---|---|---|
 | B1 | Kalite bayraklari | ⚙️ **tek env bayragi kaldi** | — (backend v2.28.0'dan hazir) | Yuksek — olcum dogrulugu |
-| B2 | Cihaz zaman damgasi | ⚠️ zaman-senk var | Backend → Gateway (**B1'den SONRA**) | Yuksek — SOE/ariza analizi |
+| B2 | Cihaz zaman damgasi | ⚙️ **gateway gonderiyor, backend yok sayiyor** | serbest (kirilma yok) | Yuksek — SOE/ariza analizi |
 | B3 | Per-device katalog | ✅ **GATEWAY TARAFI KAPANDI** | serbest | Dusuk — yalnizca esneklik kaldi |
 | B4 | Saglik heartbeat + filo uyarisi | ✅ **TAMAMLANDI** | — | ~~Yuksek — kor nokta~~ |
 
-**Onerilen calisma sirasi:** ~~B4~~ (tamamlandi) → ~~B1~~ (bayrak acilinca
-biter) → B2 → ~~B3~~ (backend tarafi opsiyonel kaldi).
+**Gateway tarafinda kalan is YOK.** Dordunun de gateway yarisi bitti.
 
-**Yani gercekte kalan tek koordinasyon isi B2'dir** (cihaz olay zaman
-damgasi); B1 bir env bayragi, B3 ise artik istege bagli bir iyilestirme.
+Kalan iki is BACKEND'de ve ikisi de **kirilma riski tasimiyor** — gateway
+gerekli veriyi zaten gonderiyor, backend hazir oldugunda anlam kazaniyor:
+
+1. **B2** — `device_event_at` + `timestamp_quality` alanlarini kabul et.
+   SOE/ariza analizi icin en degerli kazanim.
+2. **B1** — saha genelinde `GATEWAY_PUBLISH_DNP3_QUALITY=true`. Backend
+   v2.28.0'dan beri hazir; bu yalnizca bir `.env` degisikligi.
+
+B3'un backend yarisi (`signals_by_profile`) istege bagli bir esneklik
+maddesidir; yapilmazsa yerlesik profiller devrede kalir.

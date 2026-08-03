@@ -1,0 +1,24 @@
+# DNP3 native master kutuphanesi — TEK SURUM KAYNAGI.
+#
+# NEDEN AYRI DOSYA
+# ----------------
+# Bu pin daha once UC ayri yerde tekrarlaniyordu (Dockerfile, install.ps1 ve
+# CI). Bir yerde yukseltip digerini unutmak, CI'in test ettigi surumle
+# sahanin calistirdigi surumun AYRISMASI demekti — ve bu ayrisma yalnizca
+# saha davranisinda, yani en pahali yerde gorunurdu. Uc taraf da artik bu
+# dosyayi okuyor; `tests/test_dnp3_pin_sync.py` tekrarin geri gelmesini
+# engelliyor.
+#
+# NEDEN requirements.txt ICINDE DEGIL
+# -----------------------------------
+# yadnp3 yalnizca manylinux_x86_64 ve win_amd64 icin wheel yayinliyor
+# (macOS ve linux/arm64 YOK). Ana bagimlilik dosyasina konsaydi, desteklenmeyen
+# bir platformdaki gelistiricide `pip install -r requirements-dev.txt`
+# tamamen patlardi. Ayri dosya, kurulumu bilincli bir adim yapar.
+#
+# YUKSELTME
+# ---------
+# Surumu burada degistirmek yeterli. Ardindan `tests/test_dnp3_loopback.py`
+# GERCEK protokol trafigiyle (master <-> outstation loopback) uyumu dogrular;
+# bu testler yeni wheel'de kirilirsa yukseltme sahaya inmeden yakalanir.
+yadnp3==3.2.1.1

@@ -54,6 +54,7 @@ nssm start EnerjiOneDnp3Gateway
 | --- | --- |
 | `KONFIGURASYON HATASI` cercevesi | `.env`'de gecersiz ayar. Mesaj hangi ayar oldugunu soyler. Cikis kodu **78**. |
 | `ModuleNotFoundError: dnp3_gateway` | Paket kurulmamis. `install.ps1`'i tekrar calistirin. |
+| `Missing closing '}'` / `string is missing the terminator` (install.ps1 kosarken) | Scriptte ASCII-disi karakter var. Windows PowerShell 5.1 BOM'suz dosyalari cp1252 okur; tek bir em-dash tum scripti parse edilemez yapar. `tests/test_powershell_scripts.py` bunu kilitliyor — cikiyorsa scripti duzenleyen editor akilli tirnak/tire eklemis demektir. |
 | `Yadnp3AdapterError` | yadnp3 wheel'i kurulamamis. `GATEWAY_MODE=dnp3` icin sart. |
 | `Ayni GATEWAY_CODE icin baska bir proses` | Ayni kodla ikinci instance. |
 
@@ -426,7 +427,7 @@ O cihazlar "okundu" sayilmaz; bir sonraki cycle'da bayatlik siralamasinin
 
 | Cozum | Ne zaman |
 | --- | --- |
-| `POLL_MAX_PARALLEL` artir | CPU ve ag bant genisligi musaitse (tipik: cihaz sayisi / 10) |
+| `MAX_PARALLEL_DEVICES` artir | CPU ve ag bant genisligi musaitse. Varsayilan 100; 300 cihazda ~150 uygun (bkz. bolum 6) |
 | Poll araligini uzat (`DEFAULT_POLL_INTERVAL_SEC`) | Cihazlar zaten event-driven yayin yapiyorsa |
 | Cihaz sayisini bol | Tek gateway'e 300'den fazla cihaz dusuyorsa ikinci gateway ac |
 | `DNP3_RESPONSE_TIMEOUT_SEC` dusur | Kopuk cihazlar worker'lari uzun sure tutuyorsa |
@@ -616,7 +617,62 @@ counters, config_version, cycle metrics, **cihaz bazinda durum**) `/info` ve
 > istiyorsaniz `.env`'de `GATEWAY_REFRESH_TOKEN` set edin — aksi halde elinizde
 > yalnizca auth'suz `/health`'in kirpilmis ozeti kalir.
 
-## 6. Shutdown sırasi
+## 6. Olcek — 20 cihazdan 300'e
+
+Pilot (20 cihaz) ile hedef (gateway basina 100-300) arasindaki fark yalnizca
+sayi degil: darbogaz **worker havuzu** ve **WAN gecikmesi**dir. Asagidaki yol
+her adimda tek bir seyi degistirir, boylece bir sey bozulursa sebebi bellidir.
+
+### Kademe kademe cikis
+
+| Adim | Cihaz | Bakilacak | Sorun isareti |
+| --- | --- | --- | --- |
+| 1 | 20 | `devices.online` = cihaz sayisi | `lost` > 0 -> once o cihazi coz, ilerleme |
+| 2 | 50 | `metrics.seconds_since_last_cycle` | Poll araliginin 5 katini asiyorsa cycle yetismiyor |
+| 3 | 100 | `poll_pool_starved` log'u | Ciktiysa `MAX_PARALLEL_DEVICES` artir |
+| 4 | 200 | `outbox.outbox_pending` | Surekli artiyorsa backend ingest yetismiyor (gateway degil) |
+| 5 | 300 | `signals_outboxed_total` | Artiyorsa telemetri diske gidiyor — backend darbogazi |
+
+Her adimda **en az bir tam poll araligi + 5 dakika** bekleyin. Gateway
+delta-only yayin yaptigi icin ilk dakikada trafik yuksek (integrity poll ile
+tum degerler bir kez yayinlanir), sonra normale duser — erken karar vermeyin.
+
+### Ayar tablosu
+
+| Ayar | Varsayilan | 300 cihaz onerisi | Neden |
+| --- | --- | --- | --- |
+| `MAX_PARALLEL_DEVICES` | 100 | 150 | Kopuk cihazlar timeout suresince worker isgal eder; hedef cihaz sayisinin yarisi guvenli bir taban |
+| `DEFAULT_POLL_INTERVAL_SEC` | 1 | 2 | Cihazlar zaten event-driven yayin yapiyor; siklik CPU'ya mal olur, veriye degil |
+| `DEVICE_POLL_TIMEOUT_SEC` | 30 | 15 | Kopuk cihazin worker'i yarim surede birakmasi havuzu saglikli cihazlara acar |
+| `CYCLE_TIMEOUT_SEC` | 120 | 120 | Degistirmeyin; asilmasi zaten bir ariza isaretidir |
+
+> **Once olcun, sonra degistirin.** Bu degerler baslangic noktasi; gercek
+> sinir sahanin WAN gecikmesine ve cihazlarin yanit suresine bagli.
+> `poll_pool_starved` ciktiysa artirin, cikmadiysa dokunmayin.
+
+### Darbogaz gateway'de mi backend'de mi?
+
+Karistirilmasi kolay ve mudahaleyi tamamen yanlis yone cevirir:
+
+| Belirti | Darbogaz | Cozum yonu |
+| --- | --- | --- |
+| `poll_pool_starved` | **Gateway** — cihaza istek gidemiyor | `MAX_PARALLEL_DEVICES` / poll araligi |
+| `outbox_pending` artiyor, `signals_outboxed_total` artiyor | **Backend** — telemetri kabul edilemiyor | Backend ingest kapasitesi; gateway ayarlari FAYDA ETMEZ |
+| `http_publisher_breaker_open` | **Ag veya backend** erisilemiyor | Once `curl` ile disaridan dogrulayin |
+| `devices.lost` yuksek, digerleri temiz | **Saha agi** | Gateway degil; switch/fider/besleme |
+
+Gateway darbogazinda veri **gecikir**; backend darbogazinda veri **outbox'ta
+birikir**. Ikisinde de kayip yoktur — ama cozum yerleri tamamen farklidir.
+
+### Tek gateway'e kac cihaz?
+
+Tasarim hedefi gateway basina **100-300**, saha basina 6 gateway. 300'u
+asmayin: `devices` listesi icin backend tarafinda 1000 sert tavan var ama
+pratik sinir cok daha once, worker havuzu ve WAN gecikmesinde gelir. Daha
+fazla cihaz varsa ikinci bir gateway acin (`new_gateway.ps1`) — cihazlari
+backend'de `gateway_code` ile bolusturun.
+
+## 7. Shutdown sırasi
 
 Graceful shutdown (`SIGINT` / `SIGTERM` / Windows `SIGBREAK` NSSM stop):
 

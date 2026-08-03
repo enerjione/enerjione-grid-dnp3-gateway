@@ -131,8 +131,15 @@ def yadnp3_master(monkeypatch):
 
     monkeypatch.setattr(mod, "opendnp3", fake, raising=False)
     monkeypatch.setattr(mod, "_YADNP3_AVAILABLE", True, raising=False)
-    # class-level op_map cache'ini temizle (onceki testten kalmasin)
-    mod._ManagedMaster._OP_MAP_LAZY = None
+    # class-level op_map cache'ini temizle (onceki testten kalmasin).
+    #
+    # `monkeypatch.setattr` ILE yapilmali, duz atama ile DEGIL: bu bir SINIF
+    # niteligi ve test bittiginde geri alinmazsa icinde SAHTE enum'lar kalir.
+    # O zaman ayni oturumda daha sonra kosan ve GERCEK opendnp3 kullanan her
+    # test (bkz. test_dnp3_loopback.py) CROB kurarken
+    # "incompatible constructor arguments" ile duser — hem de yalnizca
+    # dosyalar belirli bir sirada kostugunda. Duz atama tam da bunu yapiyordu.
+    monkeypatch.setattr(mod._ManagedMaster, "_OP_MAP_LAZY", None, raising=False)
 
     mm = mod._ManagedMaster.__new__(mod._ManagedMaster)  # __init__ ATLA
     # operate_crob'un ihtiyaci: self.cache (state), self._master, self.device

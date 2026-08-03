@@ -54,7 +54,12 @@ jobs:
         run: ruff format --check .
 
   test:
-    name: pytest (py${{ matrix.python-version }})
+    # ISIMDE OS DA OLMALI: matriste iki ayri 3.12 isi var (ubuntu + windows) ve
+    # ikisi de "pytest (py3.12)" adiyla goruntuleniyordu. Windows'un matriste
+    # olma sebebi zaten YALNIZCA Windows'ta ciken bir hataydi (byte-range
+    # kilidi); o job kirmizi yandiginda hangi platform oldugunu ad'dan
+    # okuyamamak, tam da onu yakalamak icin kurulan kapiyi korlestirirdi.
+    name: pytest (${{ matrix.os }} py${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -79,6 +84,18 @@ jobs:
       - run: python -m pip install --upgrade pip
       - name: Install deps
         run: pip install -r requirements-dev.txt
+      # DNP3 native binding. Bu ADIM OLMADAN deponun EN KRITIK modulu
+      # (dnp3_yadnp3_master — tum olcumler ve tum kesici komutlari oradan
+      # geciyor) hic calistirilmadan CI yesil doner: `test_dnp3_loopback.py`
+      # opendnp3 yoksa kendini atlar. Ayri dosyadan kuruluyor cunku ana
+      # bagimlilik listesine konsa macOS/arm64 gelistiricisinde kurulum
+      # tamamen patlardi (o platformlar icin wheel yok).
+      - name: Install DNP3 native (yadnp3)
+        run: pip install -r requirements-dnp3.txt
+      # Sessiz atlamaya karsi acik kapi: wheel kurulmadiysa is BURADA dussun,
+      # loopback testleri sessizce atlanip "yesil" gorunmesin.
+      - name: yadnp3 gercekten kurulu mu
+        run: python -c "import opendnp3; print('opendnp3 hazir')"
       - name: pytest
         run: pytest -q --cov=dnp3_gateway --cov-report=term-missing:skip-covered --cov-report=xml
       - name: Upload coverage (ubuntu/3.12 only)

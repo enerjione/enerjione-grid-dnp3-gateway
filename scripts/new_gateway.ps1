@@ -8,7 +8,7 @@
 # tum gateway'ler ayni NATS JetStream broker'ina yayin yapar, backend de
 # aynidir. Cihazlar backend tarafinda gateway-koduna atanir (Smart Logger
 # frontend). RabbitMQ artik telemetri akisi icin kullanilmiyor (0.4.x
-# cutover) — alarm/notification icin backend tarafinda kalir, gateway
+# cutover)  -  alarm/notification icin backend tarafinda kalir, gateway
 # onunla ilgilenmez.
 
 [CmdletBinding()]
@@ -94,7 +94,7 @@ BACKEND_API_VERIFY_SSL=true
 CONFIG_REFRESH_SEC=30
 CONFIG_TIMEOUT_SEC=5
 
-# NATS JetStream (PRIMARY — gateway'in tek telemetri yayin yolu)
+# NATS JetStream (PRIMARY  -  gateway'in tek telemetri yayin yolu)
 # Subject: e1.telemetry.raw.<GATEWAY_CODE>. Backend stream TELEMETRY_RAW
 # bu prefix'i `e1.telemetry.raw.>` wildcard ile yakalar. NATS erisilemezse
 # gateway yine ayaga kalkar; mesajlar outbox'a yazilir, baglanti gelince
@@ -107,7 +107,7 @@ WORKER_HEALTH_HOST=127.0.0.1
 WORKER_HEALTH_PORT=$HealthPort
 
 # Polling / paralellik
-# NOT: 5sn cok yavasti — frontend'de olcum yasi 5-30sn araliginda salinuyordu.
+# NOT: 5sn cok yavasti  -  frontend'de olcum yasi 5-30sn araliginda salinuyordu.
 # config.py varsayilani 1sn; sablon artik onu eziyor DEGIL.
 DEFAULT_POLL_INTERVAL_SEC=1
 MAX_PARALLEL_DEVICES=$MaxParallelDevices

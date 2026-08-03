@@ -61,10 +61,13 @@ if ($LASTEXITCODE -ne 0) { throw 'pip install basarisiz (cikis kodu: ' + $LASTEX
 # ONEMLI: Bu adim EKSIKTI. Saha muhendisi dokumante edilen install.ps1'i
 # calistirip .env'de GATEWAY_MODE=dnp3 yaptiginda gateway boot ediyor, health
 # server aciliyor, sonra `Yadnp3AdapterError: yadnp3 (opendnp3) yuklu degil`
-# ile duruyordu — yani "hizli kurulum scripti" varsayilan konfigurasyonla
+# ile duruyordu  -  yani "hizli kurulum scripti" varsayilan konfigurasyonla
 # calisan bir kurulum uretmiyordu.
+# Surum PIN'i `requirements-dnp3.txt`ten gelir  -  Dockerfile ve CI de AYNI
+# dosyayi kurar. Pin burada tekrarlansaydi saha, imaj ve CI farkli surumler
+# calistirabilirdi ve fark yalnizca saha davranisinda gorunurdu.
 Write-Host '[install] installing yadnp3 (OpenDNP3 native DNP3 master)' -ForegroundColor Cyan
-& $pip -m pip install "yadnp3==3.2.1.1"
+& $pip -m pip install -r (Join-Path $projectRoot 'requirements-dnp3.txt')
 if ($LASTEXITCODE -ne 0) {
     Write-Warning @'
 yadnp3 kurulamadi. Gateway GATEWAY_MODE=dnp3 ile CALISMAYACAKTIR.
@@ -72,7 +75,7 @@ Olasi sebepler:
   * Python surumu icin wheel yok (desteklenen: 3.10 - 3.12)
   * Internet/proxy erisimi yok  -> wheel'i elle indirip:
       .venv\Scripts\python.exe -m pip install <indirilen>.whl
-Alternatif (SINIRLI): DNP3_LIBRARY=dnp3py — saf Python, Group 110 string
+Alternatif (SINIRLI): DNP3_LIBRARY=dnp3py  -  saf Python, Group 110 string
 sinyalleri DESTEKLEMEZ ve OpenDNP3 outstation'larla tutarsiz davranabilir.
 '@
 } else {
@@ -93,7 +96,7 @@ Write-Host '[install] installing package (editable)' -ForegroundColor Cyan
 & $pip -m pip install -e .
 if ($LASTEXITCODE -ne 0) { throw "paket kurulumu basarisiz (cikis kodu: $LASTEXITCODE)" }
 
-# Kurulum DOGRULAMASI — "kuruldu ama calismiyor" durumunu burada yakala.
+# Kurulum DOGRULAMASI  -  "kuruldu ama calismiyor" durumunu burada yakala.
 Write-Host '[install] verifying installation' -ForegroundColor Cyan
 $verify = & $pip -c "import dnp3_gateway; print(dnp3_gateway.__version__)" 2>&1
 if ($LASTEXITCODE -ne 0) {
@@ -111,9 +114,9 @@ if ($LASTEXITCODE -ne 0) {
 if (-not (Test-Path '.env')) {
     if (Test-Path '.env.example') {
         Write-Host '[install] creating .env from .env.example (UTF-8 no-BOM)' -ForegroundColor Green
-        # UTF-8 BOM olmadan yaz — bazi YAML/.env parser'lar (ozellikle Docker
+        # UTF-8 BOM olmadan yaz  -  bazi YAML/.env parser'lar (ozellikle Docker
         # Compose env_file) BOM karakterini ilk anahtarin parcasi sanir
-        # (﻿SECRET_KEY) ve hatali parse eder.
+        # (SECRET_KEY) ve hatali parse eder.
         $content = Get-Content '.env.example' -Raw -Encoding UTF8
         [System.IO.File]::WriteAllText(
             (Resolve-Path '.env.example').Path.Replace('.env.example', '.env'),
@@ -143,7 +146,7 @@ if (Test-Path '.env') {
         Set-Acl -Path '.env' -AclObject $acl
         Write-Host '[install] .env ACL kisitlandi (sadece sahibi)' -ForegroundColor Green
     } catch {
-        Write-Warning ".env ACL kisitlanamadi: $_  (devam ediliyor — production icin manuel duzeltin)"
+        Write-Warning ".env ACL kisitlanamadi: $_  (devam ediliyor  -  production icin manuel duzeltin)"
     }
 }
 
