@@ -54,7 +54,12 @@ jobs:
         run: ruff format --check .
 
   test:
-    name: pytest (py${{ matrix.python-version }})
+    # ISIMDE OS DA OLMALI: matriste iki ayri 3.12 isi var (ubuntu + windows) ve
+    # ikisi de "pytest (py3.12)" adiyla goruntuleniyordu. Windows'un matriste
+    # olma sebebi zaten YALNIZCA Windows'ta ciken bir hataydi (byte-range
+    # kilidi); o job kirmizi yandiginda hangi platform oldugunu ad'dan
+    # okuyamamak, tam da onu yakalamak icin kurulan kapiyi korlestirirdi.
+    name: pytest (${{ matrix.os }} py${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
