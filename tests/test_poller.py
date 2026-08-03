@@ -331,3 +331,108 @@ def test_dnp3_flags_yoksa_none_gider_anahtar_yine_var() -> None:
     )
     assert "dnp3_flags" in payload
     assert payload["dnp3_flags"] is None
+
+
+# --------------------------------------------------------------------------
+# havuz acligi: kuyrukta bekleyen cihaz "okundu" sayilmamali
+# --------------------------------------------------------------------------
+
+
+def test_baslamayan_cihaz_okundu_sayilmaz() -> None:
+    """REGRESYON: kuyrukta bekleyen cihazlar iptal edilip `mark_read` ediliyordu.
+
+    Eski kod per-device timeout'u SUBMIT zamanindan olcuyordu ve tum
+    future'lar icin bu deger AYNIYDI. 300 cihaz / 25 worker'da kuyrugun
+    sonundaki cihaz daha ISE BASLAMADAN "timeout" sayilip iptal ediliyor,
+    sonra "okundu" isaretleniyordu. Iki sonucu vardi:
+
+      * cihaza o cycle'da HIC istek gitmiyordu ama sistem okumus sayiyordu,
+      * `due_devices` config sirasini korudugu icin ayni cihazlar ertesi
+        cycle'da YINE en sona diziliyordu — panelde birkac gosterge sonsuza
+        kadar bayat veri gosteriyordu.
+
+    Log da yaniltiyordu: "cihaz yanit vermedi" diyordu, oysa istek hic
+    gonderilmemisti; operator sahada cihaz/hat ariyordu.
+    """
+    import threading
+
+    from dnp3_gateway import poller as _poller
+
+    # Havuz modul seviyesinde singleton'dir ve KUCULMEZ; onceki testler 4
+    # worker'lik bir havuz birakmis olabilir. Bu test kuyrukta bekleme
+    # davranisini olctugu icin temiz, tek worker'lik bir havuz sart.
+    with _poller._pool_lock:
+        _onceki, _onceki_max = _poller._pool, _poller._pool_max_workers
+        _poller._pool, _poller._pool_max_workers = None, 0
+
+    devices = [make_device(f"DEV-{i:03d}", poll_interval_sec=5) for i in range(4)]
+    signal = make_signal("master.actual_current")
+    state = GatewayState()
+    state.update(make_gateway_config(devices=devices, signals=[signal]))
+
+    kapi = threading.Event()  # ilk worker'i cycle timeout'u boyunca tutar
+
+    class _TakilanReader(TelemetryReader):
+        def __init__(self) -> None:
+            self.okunanlar: list[str] = []
+            self._lock = threading.Lock()
+
+        def read_device(self, *, device, signals):  # type: ignore[no-untyped-def]
+            with self._lock:
+                self.okunanlar.append(device.code)
+            kapi.wait(timeout=10)
+            return [SignalReading(signal.key, signal.source, signal.data_type, 1.0, 1.0, "good")]
+
+        def operate_device(self, **kwargs):  # type: ignore[no-untyped-def]
+            return {"ok": True, "status": "ok"}
+
+    reader = _TakilanReader()
+    try:
+        run_poll_cycle(
+            gateway_code="GW-001",
+            state=state,
+            reader=reader,
+            publisher=_StubPublisher(),
+            now_monotonic=100.0,
+            # 2 worker / 4 cihaz -> 2'si kuyrukta kalir.
+            # (max_parallel<=1 SERI yolu secer; paralel yolu test ediyoruz.)
+            max_parallel=2,
+            cycle_timeout_sec=0.4,
+            device_timeout_sec=0.2,
+        )
+    finally:
+        kapi.set()
+        with _poller._pool_lock:
+            _yeni = _poller._pool
+            _poller._pool, _poller._pool_max_workers = _onceki, _onceki_max
+        if _yeni is not None:
+            _yeni.shutdown(wait=False)
+
+    baslayanlar = set(reader.okunanlar)
+    assert len(baslayanlar) == 2, f"2 worker'da baslayan cihaz sayisi beklenmedik: {baslayanlar}"
+
+    # Kuyrukta kalan cihazlar okundu SAYILMAMALI: ayni tick'te hala due
+    # olmalilar (yoksa bir sonraki cycle'a kadar sessizce atlanirlardi).
+    hala_due = {d.code for d in state.due_devices(100.0)}
+    baslamayanlar = {d.code for d in devices} - baslayanlar
+    assert baslamayanlar <= hala_due, (
+        f"kuyrukta bekleyen cihazlar 'okundu' isaretlenmis: {baslamayanlar - hala_due}"
+    )
+
+
+def test_due_devices_en_bayat_cihazi_one_alir() -> None:
+    """Aclik dongusunu kiran siralama.
+
+    Config sirasi korunsaydi, kapasitesi yetmeyen bir kurulumda kuyrugun
+    sonundaki cihazlar her cycle'da yine sona dizilir ve hic okunmazdi.
+    """
+    devices = [make_device(f"DEV-{i}", poll_interval_sec=1) for i in range(3)]
+    state = GatewayState()
+    state.update(make_gateway_config(devices=devices, signals=[]))
+
+    # DEV-0 ve DEV-1 okundu; DEV-2 hic okunmadi.
+    state.mark_read("DEV-0", 50.0)
+    state.mark_read("DEV-1", 60.0)
+
+    sira = [d.code for d in state.due_devices(100.0)]
+    assert sira == ["DEV-2", "DEV-0", "DEV-1"], f"bayatlik sirasi yanlis: {sira}"

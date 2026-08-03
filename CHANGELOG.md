@@ -2,6 +2,99 @@
 
 Semver'a gore tutulur. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+Ikinci tam denetimden cikan orta oncelikli bulgular. Ortak tema: **sessiz
+yanlislik**. Her maddede sistem "calisiyor" gorunuyor ama sahaya yanlis bir
+resim veriyordu.
+
+### Fixed
+
+- **Profili katalogda olmayan cihaz duz sinyal listesine dusuyordu.** Backend
+  profil bazli katalog gonderdiginde duz `signals` listesi TUM profillerin
+  BIRLESIMIdir. Komsu modelin `(30,12)` adresi bu cihazda baska bir
+  buyukluktur; okunan deger yanlis `signal_key` ile yayinlanir ve esik alarmi
+  sahte bir buyukluk uzerinden calisirdi. Telemetri akmaya devam ettigi icin
+  fark edilmesi cok zordu.
+
+  Artik duz listeye yalnizca **karisma ihtimali yokken** dusuluyor: tek profil
+  grubu VE tek modelli filo. Aksi halde cihaz yoklanmiyor ve
+  `signals_profile_unknown` ERROR'u basiliyor. Uyarilar config surumu basina
+  bir kez cikiyor (cihaz basina her cycle degil).
+
+- **`comm_lost` duyurusu yayin onayindan ONCE isaretleniyordu.** Disk dolup
+  `OutboxFullError` verirse mesaj ne broker'a ne diske gidiyordu, ama bayrak
+  "duyuruldu" oldugu icin sonraki her cycle `no_change` uretiyordu —
+  `no_change` yayinlanmaz. Kopmus gosterge SCADA'da **sonsuza kadar** son iyi
+  degeriyle CANLI gorunurdu; operator hattin enerjili oldugunu sanabilirdi.
+
+  Bayrak artik `commit_published` ile, yayin kalicilastiktan sonra set
+  ediliyor (olcum degerleriyle ayni commit-after-publish deseni). Kusak
+  sayaci, onceki kopma epizoduna ait gecikmis bir onayin yeni epizodu
+  susturmasini engelliyor.
+
+- **Bozuk komut defterinin sifirlanmasi SESSIZDI.** Karantina, outbox kaybiyla
+  ayni genel kodla (`state_db_quarantined`) raporlaniyordu. Oysa burada
+  kaybedilen fiziksel komut gecmisidir: yarim kalmis bir CROB'un sonucu
+  backend'e asla bildirilemez ve o komutlar icin tekrar-onleme garantisi
+  kalkar. Artik ayri bir `command_journal_reset` sorunu, `command_ledger_reset`
+  ERROR'u ve `/health` `command_ledger` ozeti var.
+
+- **`/operate` duplicate cevabinda `ok:false`.** Kayitli sonuc bulunmadiginda
+  (ilk deneme hala suruyor ya da sonuc teslim edilip kayittan dusuruldu)
+  cevap "basarisiz" diyordu. Cagiran taraf bunu okuyup YENI bir `command_id`
+  ile tekrar dener ve kesici **gercekten iki kez surulurdu** — defterin
+  onlemek icin var oldugu sey. Artik `ok:null` + `status:"pending"` doner.
+  Basari cevabi da ayni alanlari (`ok`/`status`/`duplicate`) tasiyor.
+
+- **`/operate` komut defteri erisilemezken fail-open idi.** `start_dispatch`
+  hata verirse CROB yine gonderiliyordu: ne tekrar-onleme ne sonuc kaydi
+  kaliyordu. Fiziksel manevrada "belki iki kez surdum" kabul edilemez. Artik
+  503 ile reddediliyor (`operate_ledger_unavailable`).
+
+- **Kuyrukta bekleyen cihazlar "okundu" isaretleniyordu.** Per-device timeout
+  SUBMIT zamanindan olculuyordu ve tum future'lar icin bu deger AYNIYDI. 300
+  cihaz / 25 worker'da kuyrugun sonundaki cihaz daha ISE BASLAMADAN "timeout"
+  sayilip iptal ediliyor, sonra `mark_read` ile okundu isaretleniyordu. Log da
+  "cihaz yanit vermedi" diyordu — oysa istek hic gonderilmemisti.
+
+  Baslama zamanini artik worker'in kendisi yaziyor; baslamamis cihazlara
+  timeout uygulanmiyor ve `mark_read` YAPILMIYOR. `due_devices` bayatliga gore
+  siralaniyor, boylece kacirilan cihaz bir sonraki cycle'da en one geciyor —
+  eskiden config sirasi korundugu icin ayni cihazlar surekli aclikta kalirdi.
+  Yeni `poll_pool_starved` ERROR'u durumu kapasite sorunu olarak isaretliyor.
+
+- **Saat sicramasi toplu sahte `comm_lost` uretiyordu.** Bayatlik ve recovery
+  grace hesaplari duvar saatiyle yapiliyordu. Bir NTP duzeltmesi — ya da RTC
+  pili bos bir sahada acilis sonrasi saat ayari — `now - last_update`
+  degerini birden devasa yapip O ANDA HABERLESEN tum cihazlari comm_lost
+  ilan ederdi. Tum sure olcumleri `time.monotonic()`'e tasindi; duvar saati
+  yalnizca gosterim (`last_frame_epoch`) icin tutuluyor.
+
+- **Backend erisilemezken hizli-hata yoktu.** `_ready` bayragi tutuluyordu ama
+  hicbir yerde okunmuyordu: her cihaz icin yeni bir POST denenip tam timeout
+  kadar bekleniyordu. Kara delik olmus bir agda (4G kopmasi, firewall drop)
+  cycle timeout duvarina toslar, worker havuzu dolar ve kuyruktaki cihazlar
+  hic yoklanamazdi (yukaridaki aclik sorununu besliyordu). Devre kesici
+  eklendi: 1sn'den baslayip 15sn'de tavanlanan bekleme, sonunda tek bir
+  yarim-acik probe. Telemetri outbox'a yazilmaya devam ediyor — **veri kaybi
+  yok**.
+
+### Docs
+
+- `RUNBOOK.md`: `POST /operate` tam dokumantasyonu (cevap sekli, HTTP kodlari,
+  `ok:null` uyarisi), `command_journal_reset` / `poll_pool_starved` /
+  `http_publisher_breaker_open` mudahale bolumleri, yeni log etiketleri,
+  gercek shutdown sirasi + NSSM `AppStopMethodConsole` notu.
+- `ARCHITECTURE.md`: 0.5.x mimarisi — HTTP-first akis, hata siniflandirmasi,
+  commit-after-publish, thread canliligi, profil cozumleme, komut yolu,
+  saglik basligi, kaynak guard'lari, SQLite surumleme, cikis kodu 78.
+- `SECURITY.md`: `GATEWAY_COMMAND_TOKEN`, operator HTTP yuzeyi tablosu,
+  hata mesajlarinda sir sizmasi, NATS bolumu legacy olarak isaretlendi.
+- `BACKEND_TODO.md`: B3 (per-device katalog) gateway tarafinda kapandi —
+  ozgun kayittaki "gateway tarafinda cozulemez" degerlendirmesi yanlisti.
+  Geriye tek koordinasyon isi olarak B2 kaldi.
+
 ## [0.6.0] - 2026-08-02
 
 Gateway artik backend'e CIHAZ BAZINDA link durumu bildiriyor (BACKEND_TODO

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from typing import Any
 
 import requests
@@ -22,6 +23,12 @@ from dnp3_gateway.messaging.errors import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Devre kesici bekleme suresi: ilk hatadan sonra bu kadar, sonra iki kati,
+# tavana kadar. Tavan KISA tutuluyor — telemetri zaten outbox'a yaziliyor,
+# asil maliyet backend geri geldiginde onu GEC fark etmek olurdu.
+_BREAKER_BASE_SEC = 1.0
+_BREAKER_MAX_SEC = 15.0
 
 
 class HttpTelemetryPublishError(PermanentPublishError):
@@ -78,6 +85,21 @@ class HttpTelemetryPublisher:
         self._counter_lock = threading.Lock()
         self._publish_failures = 0
         self._publish_successes = 0
+        # ---- devre kesici -------------------------------------------------
+        # `_ready` bayragi tutuluyordu ama HICBIR YERDE OKUNMUYORDU: backend
+        # erisilemezken her cihaz icin yeni bir POST denenip TAM timeout
+        # kadar bekleniyordu. Kara delik olmus bir aginda (4G kopmasi,
+        # firewall drop) SYN cevapsiz kalir ve her deneme `timeout_sec`
+        # surer; 300 cihazli bir cycle timeout duvarina toslar, worker havuzu
+        # dolar ve kuyruktaki cihazlar hic yoklanamaz.
+        #
+        # Devre acikken denemeler ANINDA gecici hata verir (mesaj yine
+        # outbox'a yazilir, veri kaybi YOK) ve poll dongusu normal hizinda
+        # kosmaya devam eder. Bekleme dolunca TEK bir istek "yarim-acik" probe
+        # olarak gecirilir; basarirsa devre kapanir.
+        self._ready_retry_at: float = 0.0
+        self._breaker_wait: float = _BREAKER_BASE_SEC
+        self._probe_in_flight: bool = False
 
     def publish(
         self,
@@ -92,6 +114,8 @@ class HttpTelemetryPublisher:
             if self._closed:
                 self._mark_failure()
                 raise HttpTelemetryNotReadyError("backend ingest not ready: publisher closed")
+        if not self._breaker_izin_ver():
+            raise self._breaker_hizli_hata()
 
         request_headers = build_config_request_headers(self.identity)
         request_headers["Content-Type"] = "application/json"
@@ -134,6 +158,11 @@ class HttpTelemetryPublisher:
                 f"backend ingest not ready: HTTP {response.status_code}: {preview}",
                 http_status=response.status_code,
             )
+        # KALICI hata (400/401/422/500...): backend ERISILEBILIR, reddedilen
+        # sey bu MESAJ. Devreyi acmak yanlis olurdu — digerleri gecebilir.
+        # Ayrica yarim-acik probe bayragi burada temizlenmezse devre kalici
+        # olarak acik kalirdi.
+        self._set_ready(True)
         raise HttpTelemetryPublishError(
             f"backend ingest rejected: HTTP {response.status_code}: {preview}",
             http_status=response.status_code,
@@ -157,6 +186,8 @@ class HttpTelemetryPublisher:
             if self._closed:
                 self._mark_failure()
                 raise HttpTelemetryNotReadyError("backend ingest not ready: publisher closed")
+        if not self._breaker_izin_ver():
+            raise self._breaker_hizli_hata()
 
         payloads = [it["payload"] for it in items]
         # Correlation id: batch'in ilkini kullan (backend per-item id'yi
@@ -204,6 +235,11 @@ class HttpTelemetryPublisher:
                 f"backend ingest not ready: HTTP {response.status_code}: {preview}",
                 http_status=response.status_code,
             )
+        # KALICI hata (400/401/422/500...): backend ERISILEBILIR, reddedilen
+        # sey bu MESAJ. Devreyi acmak yanlis olurdu — digerleri gecebilir.
+        # Ayrica yarim-acik probe bayragi burada temizlenmezse devre kalici
+        # olarak acik kalirdi.
+        self._set_ready(True)
         raise HttpTelemetryPublishError(
             f"backend ingest rejected: HTTP {response.status_code}: {preview}",
             http_status=response.status_code,
@@ -241,9 +277,60 @@ class HttpTelemetryPublisher:
                 "publish_successes": self._publish_successes,
             }
 
+    # ---- devre kesici ------------------------------------------------------
+
+    def _breaker_izin_ver(self) -> bool:
+        """Istek gonderilsin mi? Devre acik ve bekleme dolmadiysa False.
+
+        Bekleme dolduysa TEK bir cagriya izin verilir (yarim-acik probe);
+        es zamanli digerleri yine hizli hata alir. Boylece backend geri
+        geldiginde 300 cihaz ayni anda timeout'a girmez.
+        """
+        with self._lock:
+            if self._ready:
+                return True
+            simdi = time.monotonic()
+            if simdi < self._ready_retry_at:
+                return False
+            if self._probe_in_flight:
+                return False
+            self._probe_in_flight = True
+            # Probe basarisiz olursa bekleme _set_ready(False) icinde uzatilir.
+            return True
+
+    def _breaker_hizli_hata(self) -> HttpTelemetryNotReadyError:
+        with self._lock:
+            kalan = max(0.0, self._ready_retry_at - time.monotonic())
+        self._mark_failure()
+        return HttpTelemetryNotReadyError(
+            f"backend ingest not ready: devre acik, {kalan:.1f}sn sonra tekrar denenecek"
+        )
+
     def _set_ready(self, ready: bool) -> None:
         with self._lock:
+            onceki = self._ready
             self._ready = ready
+            self._probe_in_flight = False
+            if ready:
+                if not onceki:
+                    logger.info(
+                        "http_publisher_breaker_closed url=%s — backend ingest tekrar erisilebilir",
+                        self.url,
+                    )
+                self._breaker_wait = _BREAKER_BASE_SEC
+                self._ready_retry_at = 0.0
+                return
+            bekleme = self._breaker_wait
+            self._ready_retry_at = time.monotonic() + bekleme
+            self._breaker_wait = min(_BREAKER_MAX_SEC, bekleme * 2.0)
+        if onceki:
+            logger.warning(
+                "http_publisher_breaker_open url=%s bekleme=%.1fsn — backend ingest "
+                "erisilemiyor; denemeler timeout beklemeden hizli hata verecek "
+                "(telemetri outbox'a yaziliyor, kayip yok)",
+                self.url,
+                bekleme,
+            )
 
     def _mark_failure(self) -> None:
         with self._counter_lock:

@@ -121,6 +121,102 @@ def test_mark_all_dirty_surumleri_ilerletir() -> None:
 
 
 # --------------------------------------------------------------------------
+# comm_lost duyurusu da yayin-onayli
+# --------------------------------------------------------------------------
+
+
+def test_comm_lost_duyurusu_onaydan_once_isaretlenmez() -> None:
+    """REGRESYON: duyuru bayragi okuma aninda set ediliyordu.
+
+    Somut zarar: disk dolu -> `OutboxFullError` -> comm_lost mesaji ne
+    broker'a ne diske gitti. Ama bayrak "duyuruldu" oldugu icin sonraki her
+    cycle `no_change` uretti; `no_change` yayinlanmaz. Kopmus gosterge
+    SCADA'da SONSUZA KADAR son iyi degeriyle CANLI gorundu — operator
+    hattin enerjili oldugunu sanip manevra yapabilirdi.
+    """
+    c = _DeviceCache()
+    duyuruldu, jeton = c.begin_stale_announce()
+    assert duyuruldu is False
+
+    # Yayin BASARISIZ oldu -> onay verilmedi
+    duyuruldu2, jeton2 = c.begin_stale_announce()
+    assert duyuruldu2 is False, "onay verilmeden 'duyuruldu' sayilmis"
+    assert jeton2 == jeton
+
+    # Yayin bu kez kalicilasti
+    assert c.confirm_stale_announced(jeton) is True
+    duyuruldu3, _ = c.begin_stale_announce()
+    assert duyuruldu3 is True, "onaydan sonra tekrar duyurulmamali (flood)"
+
+
+def test_comm_lost_onayi_idempotenttir() -> None:
+    c = _DeviceCache()
+    _d, jeton = c.begin_stale_announce()
+    assert c.confirm_stale_announced(jeton) is True
+    assert c.confirm_stale_announced(jeton) is False
+
+
+def test_toparlanma_sonrasi_yeni_kopma_yeniden_duyurulur() -> None:
+    """Kusak sayaci: eski epizodun gec onayi yeni epizodu susturmamali."""
+    c = _DeviceCache()
+    _d, eski_jeton = c.begin_stale_announce()
+
+    # Cihaz toparlandi (recovery confirmed)
+    c.reset_stale_announce()
+
+    # Onceki cycle'in gec kalan onayi simdi geliyor — YOK SAYILMALI
+    assert c.confirm_stale_announced(eski_jeton) is False
+
+    # Yeni bir kopma yasandi: SCADA yine comm_lost gormeli
+    duyuruldu, yeni_jeton = c.begin_stale_announce()
+    assert duyuruldu is False
+    assert yeni_jeton != eski_jeton
+    assert c.confirm_stale_announced(yeni_jeton) is True
+
+
+def test_gecersiz_jeton_yok_sayilir() -> None:
+    c = _DeviceCache()
+    assert c.confirm_stale_announced(None) is False
+    assert c.confirm_stale_announced((30, 1, 5)) is False
+    assert c.confirm_stale_announced("stale") is False
+
+
+def test_reader_commit_published_stale_jetonu_tasir() -> None:
+    """Kablolama testi: poller -> reader.commit_published -> cache onayi.
+
+    Birim testler cache'i doguruyor; bu test jetonun ARADAKI katmandan
+    gectigini dogrular. Yadnp3TelemetryReader.__init__ opendnp3 wheel'i
+    istedigi icin nesne `__new__` ile kuruluyor — testin ilgilendigi tek sey
+    `commit_published` govdesi.
+    """
+    from types import SimpleNamespace
+
+    from dnp3_gateway.adapters.dnp3_yadnp3_master import Yadnp3TelemetryReader
+
+    cache = _DeviceCache()
+    _duyuruldu, jeton = cache.begin_stale_announce()
+
+    reader = object.__new__(Yadnp3TelemetryReader)
+    reader._masters = {"DEV-1": SimpleNamespace(cache=cache)}
+
+    okumalar = [
+        SignalReading(
+            signal_key="master.current",
+            source="master",
+            data_type="analog",
+            raw_value=0.0,
+            scaled_value=0.0,
+            quality="comm_lost",
+            read_token=jeton,
+        )
+    ]
+    reader.commit_published(device=_device(), readings=okumalar)
+
+    duyuruldu, _ = cache.begin_stale_announce()
+    assert duyuruldu is True, "reader jetonu cache'e iletmedi"
+
+
+# --------------------------------------------------------------------------
 # poller: onay yalnizca kalicilastiktan sonra
 # --------------------------------------------------------------------------
 

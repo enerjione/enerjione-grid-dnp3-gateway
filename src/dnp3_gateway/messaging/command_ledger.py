@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 import time
@@ -10,6 +11,8 @@ from pathlib import Path
 from typing import Any
 
 from dnp3_gateway.messaging.sqlite_support import Migration, open_versioned_db
+
+logger = logging.getLogger(__name__)
 
 
 def _migration_001_initial(conn: sqlite3.Connection) -> None:
@@ -63,6 +66,24 @@ class CommandLedger:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
+        # Bozuk dosya karantinaya alindiysa: defter SIFIRLANDI.
+        #
+        # Bu, outbox'in sifirlanmasiyla AYNI SEY DEGILDIR. Outbox'ta kaybedilen
+        # birikmis telemetridir (gorunur, telafi edilebilir). Burada kaybedilen
+        # FIZIKSEL KOMUT gecmisidir; iki somut sonucu var:
+        #   1. `recover_unknown_results` bos doner — onceki proses yarim birakmis
+        #      bir CROB'un sonucunu backend'e ASLA bildiremez, backend o komutu
+        #      sonsuza kadar "bekliyor" gorur.
+        #   2. Tekrar-onleme garantisi kalkar — backend bekleyen bir komutu
+        #      yeniden gonderirse gateway onu YENI sanip CROB'u tekrarlar.
+        # Ikisi de sessiz olurdu; bu yuzden ayrica raporlaniyor.
+        self.journal_reset_at: float | None = None
+        self.journal_reset_path: str | None = None
+
+        def _karantina(yol: Path, sebep: str) -> None:
+            self.journal_reset_at = time.time()
+            self.journal_reset_path = str(yol)
+
         # synchronous=FULL: bu dosya FIZIKSEL komutlarin tek yerel kaydidir.
         # Bir CROB'un gonderilip gonderilmedigi bilgisi elektrik kesintisinde
         # bile kaybolmamali (idempotency + denetim izi).
@@ -74,7 +95,40 @@ class CommandLedger:
             label=f"command_ledger[{self.db_path.name}]",
             synchronous="FULL",
             wal_autocheckpoint=1000,
+            on_quarantine=_karantina,
         )
+        if self.journal_reset_at is not None:
+            logger.error(
+                "command_ledger_reset path=%s karantina=%s — KOMUT DEFTERI BOZUKTU ve "
+                "sifirlandi. Bu prosesten ONCE gonderilmis komutlarin sonuclari "
+                "backend'e bildirilemez ve o komutlar icin TEKRAR-ONLEME GARANTISI "
+                "YOKTUR (backend bekleyen bir komutu yeniden gonderirse CROB "
+                "tekrarlanabilir). Karantina dosyasini inceleyin ve bekleyen "
+                "komutlari operator ile dogrulayin.",
+                self.db_path,
+                self.journal_reset_path,
+            )
+
+    def status_snapshot(self) -> dict[str, Any]:
+        """Health/observability icin ozet. Hata durumunda bile govde doner."""
+        snapshot: dict[str, Any] = {
+            "journal_reset": self.journal_reset_at is not None,
+            "journal_reset_at": self.journal_reset_at,
+            "journal_reset_path": self.journal_reset_path,
+        }
+        try:
+            with self._lock:
+                (pending,) = self._conn.execute(
+                    "SELECT COUNT(*) FROM command_ledger WHERE delivery_state = 'pending'"
+                ).fetchone()
+                (dead,) = self._conn.execute(
+                    "SELECT COUNT(*) FROM command_ledger WHERE delivery_state = 'dead_letter'"
+                ).fetchone()
+            snapshot["result_pending"] = int(pending)
+            snapshot["result_dead_letter"] = int(dead)
+        except sqlite3.Error:
+            logger.debug("command_ledger_status_failed", exc_info=True)
+        return snapshot
 
     def start_dispatch(self, command_id: int) -> bool:
         """Dispatch intent'i kalıcı yazılırsa True döner."""

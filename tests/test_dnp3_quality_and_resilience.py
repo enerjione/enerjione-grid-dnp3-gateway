@@ -313,3 +313,54 @@ def test_production_dnp3_modu_kabul_eder(monkeypatch: pytest.MonkeyPatch) -> Non
     # Yeni ayarlarin varsayilanlari
     assert s.dnp3_time_sync == "lan"
     assert s.dnp3_publish_quality_flags is False  # backend hazir olunca acilacak
+
+
+# --------------------------------------------------------------------------
+# saat sicramasi: bayatlik karari monotonic saatle verilmeli
+# --------------------------------------------------------------------------
+
+
+def test_saat_sicramasi_cihazi_bayat_yapmaz(monkeypatch) -> None:
+    """REGRESYON: bayatlik duvar saatiyle olculuyordu.
+
+    Sahada iki sik senaryo var: (a) RTC pili bos bir endustriyel PC aciliyor,
+    NTP birkac dakika sonra saati AYLARCA ileri aliyor; (b) rutin bir NTP
+    duzeltmesi saati birkac dakika sicratiyor.
+
+    Duvar saatiyle olcumde `now - last_update` bir anda esigi asar ve gateway
+    O ANDA HABERLESEN 300 cihazin TAMAMINI comm_lost ilan eder. SCADA'da
+    toplu "haberlesme yok" dalgasi, ardindan toplu recovery yayini olusur;
+    hicbir cihazda gercek bir sorun yokken. Monotonic saat NTP'den etkilenmez.
+    """
+    c = _DeviceCache()
+    c.set(30, 1, 5.0)
+
+    monotonic_damga = c.last_update_at()
+    duvar_damga = c.last_update_wall()
+    assert monotonic_damga > 0.0
+    assert duvar_damga > 0.0
+
+    # Duvar saati 1 yil ileri sicradi (NTP duzeltmesi).
+    gercek_time = time.time
+    monkeypatch.setattr(time, "time", lambda: gercek_time() + 365 * 86400)
+
+    # Bayatlik karari ETKILENMEMELI: monotonic damga yerinde duruyor.
+    assert time.monotonic() - c.last_update_at() < 5.0, "bayatlik hesabi duvar saatinden etkilenmis"
+
+
+def test_recovery_grace_saat_sicramasindan_etkilenmez(monkeypatch) -> None:
+    """Grace period bir SUREDIR; saat sicramasi onu bitirmemeli.
+
+    Duvar saatiyle olculdugunde ileri bir sicrama, cihaz daha ilk frame'ini
+    gondermeden `recovery_age()`'i esigin ustune tasir ve gateway cihazi
+    hemen 'lost'a dusururdu — recovery penceresi hic isletilmemis olurdu.
+    """
+    c = _DeviceCache()
+    c.begin_recovery()
+    assert c.state() == "recovering"
+    assert c.recovery_age() < 1.0
+
+    gercek_time = time.time
+    monkeypatch.setattr(time, "time", lambda: gercek_time() + 3600)
+
+    assert c.recovery_age() < 5.0, "grace period duvar saati sicramasiyla tuketilmis"
