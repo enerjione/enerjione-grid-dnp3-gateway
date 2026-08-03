@@ -2,6 +2,41 @@
 
 Semver'a gore tutulur. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.0.1] - 2026-08-03
+
+**Saha arizasi duzeltmesi.** GW-001'de SCADA komut kanali sessizce olmustu.
+
+### Fixed
+
+- **Saglik basligi `/pending`i dusuruyordu — komut kanali oldu.** Gateway'in
+  `X-E1-Gateway-Health` basligi backend'de `gateway_health` tablosuna
+  yaziliyor; o tablo sahadaki veritabaninda yoktu (migration eksik). INSERT
+  patlayinca transaction bozuluyor ve AYNI transaction'daki komut sorgusu da
+  patliyor -> `GET /pending` 500.
+
+  Uc sonucu vardi: (1) SCADA komutlari gateway'e HIC ulasmiyordu, (2)
+  `config_nonce` okunamadigi icin yeni eklenen cihaz anlik gorulmuyor,
+  yalnizca 5 dakikalik periyodik refresh'te geliyordu, (3) saglik ozeti
+  backend'e gitmiyordu.
+
+  `health_header.py` "KOMUT KANALI KUTSAL — bu modulun hicbir hatasi
+  /pending cagrisini dusurmemeli" diyordu ama savunma yalnizca basligi
+  URETIRKEN cikan hatalari kapsiyordu; baslik uretilip gonderildiginde ve
+  BACKEND onu isleyemediginde savunma yoktu. Yani bir teshis kolayligi,
+  korumakla yukumlu oldugu seyi oldurdu.
+
+  Artik `/pending` 5xx dondu ve baslik gonderildiyse ayni istek BASLIKSIZ bir
+  kez daha denenir; basliksiz calisiyorsa baslik 10 dakika birakilir ve
+  komutlar akmaya devam eder. Backend duzeltilince kendiliginden geri gelir.
+  Baslikla ilgisi olmayan 5xx'ler yutulmaz.
+
+- **Komut kanali olurken `/health` "ok" diyordu.** Thread yasiyordu, bu
+  yuzden `thread_dead:` tetiklenmedi ve panel 660 ardisik hata boyunca
+  saglikli gorundu. Operatorun arizayi fark etmesinin hicbir yolu yoktu.
+  Yeni sorun kodlari: `command_channel_failing` (15 ardisik hata, degraded)
+  ve `command_channel_down` (60 ardisik, unhealthy). `/health` govdesine
+  `command_channel` ozeti eklendi.
+
 ## [1.0.0] - 2026-08-03
 
 **Ilk uretim surumu.** Gateway 20 gercek cihazla sahada dogrulandi; protokol

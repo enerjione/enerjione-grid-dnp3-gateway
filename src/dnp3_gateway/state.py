@@ -106,6 +106,10 @@ class GatewayState:
         self._last_refresh_error: str | None = None
         self._last_refresh_ok_unix: float | None = None
         self._last_refresh_attempt_unix: float | None = None
+        # Komut-poll (`/pending`) saglik sayaci — SCADA komut yolu.
+        self._command_poll_errors: int = 0
+        self._command_poll_last_error: str | None = None
+        self._command_poll_last_ok_unix: float | None = None
 
     def update(self, config: GatewayConfig) -> bool:
         """Yeni config gelince state'i gunceller. Degistiyse True doner.
@@ -256,6 +260,33 @@ class GatewayState:
                 self._config_refresh_pending = False
                 return True
             return False
+
+    def record_command_poll(self, *, ok: bool, error: str = "") -> None:
+        """Komut-poll (`/pending`) turunun sonucunu kaydet.
+
+        NEDEN AYRI BIR SAYAC: bu kanal SCADA'nin komut yoludur ve ayni
+        zamanda `config_nonce` tetigini tasir. Sahada backend `/pending`e 500
+        dondurdu; thread YASIYORDU (dolayisiyla `thread_dead:` tetiklenmedi)
+        ama 660 ardisik hata aliyordu. `/health` bu sure boyunca "ok" dedi —
+        yani komut kanali TAMAMEN OLUYKEN panel sagliklı gorunuyordu ve
+        operatorun bunu fark etmesinin hicbir yolu yoktu.
+        """
+        with self._lock:
+            if ok:
+                self._command_poll_errors = 0
+                self._command_poll_last_error = None
+                self._command_poll_last_ok_unix = time.time()
+            else:
+                self._command_poll_errors += 1
+                self._command_poll_last_error = error[:300]
+
+    def command_poll_snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "consecutive_errors": self._command_poll_errors,
+                "last_error": self._command_poll_last_error,
+                "last_ok_unix": self._command_poll_last_ok_unix,
+            }
 
     def record_refresh_error(self, error: str) -> None:
         """Config refresh denemesi basarisiz olursa caller cagirir.

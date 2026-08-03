@@ -286,6 +286,24 @@ def _quarantined_dbs() -> list[str]:
         return []
 
 
+#: Komut-poll ardisik hata esikleri. 1sn'lik poll'de 15 hata ~15sn kesinti
+#: demek (backend restart penceresi normaldir); 60 hata ~1dk — bu artik
+#: gecici degil, mudahale gerektiren bir ariza.
+_COMMAND_POLL_DEGRADED_ERRORS = 15
+_COMMAND_POLL_UNHEALTHY_ERRORS = 60
+
+
+def _komut_poll_snapshot(state: Any) -> dict[str, Any]:
+    """Komut kanali saglik ozeti; state desteklemiyorsa bos (geriye uyum)."""
+    fn = getattr(state, "command_poll_snapshot", None)
+    if not callable(fn):
+        return {}
+    try:
+        return dict(fn())
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def _ledger_snapshot(ledger_provider: Any) -> dict[str, Any]:
     """Komut defterinin durumu; erisilemezse bos sozluk.
 
@@ -955,6 +973,21 @@ def _build_health_body(
         if secs_since_ok is None or secs_since_ok > DEFAULT_REFRESH_DEGRADED_THRESHOLD_SEC:
             issues.append("config_refresh_failing")
             severity_score = max(severity_score, 1)
+    # --- SCADA komut kanali ------------------------------------------------
+    # Thread YASIYOR olabilir ama her turda hata aliyor olabilir; o zaman
+    # `thread_dead:` tetiklenmez ve /health "ok" der. Sahada tam bu oldu:
+    # backend `/pending`e 500 dondu, komut kanali 660 ardisik hatayla TAMAMEN
+    # oluydu ve panel saglikli gorunuyordu. Komut yolu SCADA'nin manevra
+    # kanalidir; sessiz kalmasi kabul edilemez.
+    komut_poll = _komut_poll_snapshot(state)
+    ardisik = int(komut_poll.get("consecutive_errors") or 0)
+    if ardisik >= _COMMAND_POLL_UNHEALTHY_ERRORS:
+        issues.append("command_channel_down")
+        severity_score = max(severity_score, 2)
+    elif ardisik >= _COMMAND_POLL_DEGRADED_ERRORS:
+        issues.append("command_channel_failing")
+        severity_score = max(severity_score, 1)
+
     if outbox_snap.get("outbox_full"):
         issues.append("outbox_full")
         severity_score = max(severity_score, 2)
@@ -1113,6 +1146,8 @@ def _build_health_body(
     }
     if quarantined:
         body["quarantined_state_files"] = quarantined
+    if komut_poll:
+        body["command_channel"] = komut_poll
     if ledger_snap:
         # Komut defteri ozeti: sifirlanma bayragi + bekleyen/olu sonuc sayisi.
         # Karantina dosyasinin YOLU burada YOK — /health auth'suz.

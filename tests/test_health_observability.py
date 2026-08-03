@@ -325,3 +325,55 @@ def test_defter_erisilemezse_health_patlamaz() -> None:
     body, code = _body(ledger_provider=_patlayan)
     assert code in (200, 503)
     assert "command_journal_reset" not in body["issues"]
+
+
+# --------------------------------------------------------------------------
+# SCADA komut kanali sagligi
+# --------------------------------------------------------------------------
+
+
+def _state_komut_hatali(ardisik: int):
+    st = _state()
+    for _ in range(ardisik):
+        st.record_command_poll(ok=False, error="pending request returned 500")
+    return st
+
+
+def test_komut_kanali_olurken_health_ok_dememeli() -> None:
+    """REGRESYON: sahada komut kanali 660 ardisik hatayla OLUYDU, /health "ok" diyordu.
+
+    Thread YASIYORDU (dolayisiyla `thread_dead:` tetiklenmedi) ama her turda
+    500 aliyordu. Sonuc: SCADA komutlari gateway'e HIC ulasmiyordu, ustelik
+    `config_nonce` de okunamadigi icin yeni cihazlar 5 dakikaya kadar
+    gorulmuyordu — ve panelde hicbir uyari yoktu. Operatorun bunu fark
+    etmesinin bir yolu YOKTU.
+    """
+    body, code = _body(state=_state_komut_hatali(660))
+    assert "command_channel_down" in body["issues"]
+    assert body["status"] == "unhealthy"
+    assert code == 503
+    assert body["command_channel"]["consecutive_errors"] == 660
+
+
+def test_kisa_komut_kanali_kesintisi_degraded() -> None:
+    """Backend restart penceresi normaldir; ~15sn kesinti degraded olmali."""
+    body, code = _body(state=_state_komut_hatali(20))
+    assert "command_channel_failing" in body["issues"]
+    assert body["status"] == "degraded"
+    assert code == 200
+
+
+def test_anlik_komut_hatasi_alarm_uretmez() -> None:
+    """Tek tuk hata gurultu yapmamali (1sn'lik poll'de birkac hata normal)."""
+    body, _c = _body(state=_state_komut_hatali(3))
+    assert "command_channel_failing" not in body["issues"]
+    assert "command_channel_down" not in body["issues"]
+
+
+def test_komut_kanali_toparlaninca_sayac_sifirlanir() -> None:
+    st = _state_komut_hatali(100)
+    st.record_command_poll(ok=True)
+    body, code = _body(state=st)
+    assert "command_channel_down" not in body["issues"]
+    assert "command_channel_failing" not in body["issues"]
+    assert code == 200

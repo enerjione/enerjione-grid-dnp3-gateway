@@ -13,8 +13,11 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import pytest
+
 from dnp3_gateway.auth import GatewayIdentity
 from dnp3_gateway.backend import BackendConfigClient
+from dnp3_gateway.backend.config_client import GatewayConfigError
 
 
 def _identity() -> GatewayIdentity:
@@ -138,3 +141,120 @@ def test_nonce_alanlari_bozuksa_sifira_duser() -> None:
     poll = _client({"config_nonce": "abc", "refresh_nonce": None}).fetch_pending_commands()
     assert poll.config_nonce == 0
     assert poll.refresh_nonce == 0
+
+
+# --------------------------------------------------------------------------
+# saglik basligi komut kanalini DUSURMEMELI
+# --------------------------------------------------------------------------
+
+
+class _BasligaGoreYanit:
+    """Saglik basligi varsa 500, yoksa 200 donen backend taklidi.
+
+    Sahada aynen bu oldu: backend basligi `gateway_health` tablosuna yazmaya
+    calisti, tablo yoktu (migration eksik), transaction bozuldu ve `/pending`
+    500 dondu.
+    """
+
+    def __init__(self) -> None:
+        self.baslikli_istekler = 0
+        self.basliksiz_istekler = 0
+
+    def get(self, url: str, **kwargs: Any) -> Any:  # noqa: ARG002
+        from dnp3_gateway.backend import health_header
+
+        headers = kwargs.get("headers") or {}
+        if health_header.HEADER_NAME in headers:
+            self.baslikli_istekler += 1
+            return _Resp({"detail": "Internal Server Error"}, status_code=500)
+        self.basliksiz_istekler += 1
+        return _Resp({"commands": [], "config_nonce": 7, "refresh_nonce": 2, "is_active": True})
+
+    def post(self, url: str, **kwargs: Any) -> Any:  # noqa: ARG002
+        return _Resp({"ok": True})
+
+
+def _client_saglikli_baslikla(session: Any) -> BackendConfigClient:
+    return BackendConfigClient(
+        base_url="http://backend/api/v1",
+        identity=_identity(),
+        session=session,
+        health_provider=lambda: {"status": "ok", "devices": {"total": 1}},
+    )
+
+
+def test_saglik_basligi_komut_kanalini_dusurmez() -> None:
+    """REGRESYON: baslik 500'e sebep olunca komut kanali SESSIZCE oluyordu.
+
+    Sahadaki sonuc: `/pending` her saniye 500 dondu, `config_nonce`
+    okunamadigi icin yeni eklenen cihaz 5 dakikaya kadar gorulmedi ve SCADA
+    komutlari gateway'e HIC ulasmadi. Modulun kendi sozu ("komut kanali
+    kutsal") yalnizca basligi URETIRKEN cikan hatalari kapsiyordu; baslik
+    uretilip gonderildiginde ve BACKEND patladiginda savunma yoktu.
+    """
+    session = _BasligaGoreYanit()
+    client = _client_saglikli_baslikla(session)
+
+    poll = client.fetch_pending_commands()
+
+    # Komut kanali CALISTI: nonce okundu
+    assert poll.config_nonce == 7
+    assert poll.refresh_nonce == 2
+    assert session.baslikli_istekler == 1, "baslikli istek bir kez denenmeli"
+    assert session.basliksiz_istekler == 1, "500 alinca basliksiz yeniden denenmeli"
+
+
+def test_suclu_baslik_birakilir_ve_cift_istek_surmez() -> None:
+    """Baslik suclu bulununca birakilmali; her poll'de iki istek atilmamali."""
+    session = _BasligaGoreYanit()
+    client = _client_saglikli_baslikla(session)
+
+    client.fetch_pending_commands()  # 1 baslikli + 1 basliksiz
+    for _ in range(5):
+        poll = client.fetch_pending_commands()
+        assert poll.config_nonce == 7
+
+    assert session.baslikli_istekler == 1, (
+        f"baslik birakilmamis; {session.baslikli_istekler} kez daha denendi "
+        "(her poll'de gereksiz cift istek demek)"
+    )
+    assert session.basliksiz_istekler == 6
+
+
+def test_saglikli_backendde_baslik_gonderilmeye_devam_eder() -> None:
+    """Yanlis pozitif olmamali: backend sorunsuzsa baslik birakilmaz."""
+
+    class _HerZamanOk:
+        def __init__(self) -> None:
+            self.baslikli = 0
+
+        def get(self, url: str, **kwargs: Any) -> Any:  # noqa: ARG002
+            from dnp3_gateway.backend import health_header
+
+            if health_header.HEADER_NAME in (kwargs.get("headers") or {}):
+                self.baslikli += 1
+            return _Resp({"commands": [], "config_nonce": 1, "refresh_nonce": 0, "is_active": True})
+
+        def post(self, url: str, **kwargs: Any) -> Any:  # noqa: ARG002
+            return _Resp({"ok": True})
+
+    session = _HerZamanOk()
+    client = _client_saglikli_baslikla(session)
+    for _ in range(4):
+        client.fetch_pending_commands()
+    assert session.baslikli == 4, "saglikli backendde baslik gonderilmeye devam etmeli"
+
+
+def test_baslik_disi_500_yutulmaz() -> None:
+    """Baslikla ilgisi olmayan bir 500 GIZLENMEMELI — hata yine raise edilir."""
+
+    class _HerZaman500:
+        def get(self, url: str, **kwargs: Any) -> Any:  # noqa: ARG002
+            return _Resp({"detail": "bozuk"}, status_code=500)
+
+        def post(self, url: str, **kwargs: Any) -> Any:  # noqa: ARG002
+            return _Resp({"ok": True})
+
+    client = _client_saglikli_baslikla(_HerZaman500())
+    with pytest.raises(GatewayConfigError):
+        client.fetch_pending_commands()
