@@ -82,13 +82,19 @@ RUN pip install --no-index --find-links=/tmp/wheels \
 # DNP3 kutuphanesi PyPI'den dogrudan kurulur (manylinux wheel hazir):
 #   - yadnp3 (default, OpenDNP3 native) -> Group 110 string + tum tipler
 #   - nfm-dnp3 (fallback, saf python)    -> sadece numeric (no Group 110)
+#
+# Surum PIN'i `requirements-dnp3.txt`ten gelir — CI de AYNI dosyayi kurar.
+# Pin burada tekrarlansaydi, imaj ile CI'in test ettigi surum sessizce
+# ayrisabilirdi.
+COPY requirements-dnp3.txt /tmp/requirements-dnp3.txt
 RUN if [ "${DNP3_LIBRARY}" = "yadnp3" ]; then \
-        pip install "yadnp3==3.2.1.1" \
+        pip install -r /tmp/requirements-dnp3.txt \
         && echo "[image] DNP3 library = yadnp3 (OpenDNP3 native; Group 110 supported)"; \
     else \
         pip install "nfm-dnp3>=1.0.1,<2.0" \
         && echo "[image] DNP3 library = nfm-dnp3 (pure python; no Group 110 strings)"; \
-    fi
+    fi \
+    && rm -f /tmp/requirements-dnp3.txt
 
 # Kaynak kodu son katman — sadece kod degistiginde rebuild.
 COPY --chown=e1:e1 src /app/src

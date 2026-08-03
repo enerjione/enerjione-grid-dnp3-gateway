@@ -79,6 +79,18 @@ jobs:
       - run: python -m pip install --upgrade pip
       - name: Install deps
         run: pip install -r requirements-dev.txt
+      # DNP3 native binding. Bu ADIM OLMADAN deponun EN KRITIK modulu
+      # (dnp3_yadnp3_master — tum olcumler ve tum kesici komutlari oradan
+      # geciyor) hic calistirilmadan CI yesil doner: `test_dnp3_loopback.py`
+      # opendnp3 yoksa kendini atlar. Ayri dosyadan kuruluyor cunku ana
+      # bagimlilik listesine konsa macOS/arm64 gelistiricisinde kurulum
+      # tamamen patlardi (o platformlar icin wheel yok).
+      - name: Install DNP3 native (yadnp3)
+        run: pip install -r requirements-dnp3.txt
+      # Sessiz atlamaya karsi acik kapi: wheel kurulmadiysa is BURADA dussun,
+      # loopback testleri sessizce atlanip "yesil" gorunmesin.
+      - name: yadnp3 gercekten kurulu mu
+        run: python -c "import opendnp3; print('opendnp3 hazir')"
       - name: pytest
         run: pytest -q --cov=dnp3_gateway --cov-report=term-missing:skip-covered --cov-report=xml
       - name: Upload coverage (ubuntu/3.12 only)

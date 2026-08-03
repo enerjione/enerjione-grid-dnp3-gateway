@@ -658,7 +658,7 @@ def run_poll_cycle(
             logger.error(
                 "poll_pool_starved gateway=%s baslamayan=%d due=%d workers=%d — "
                 "bu cihazlara HIC istek gonderilemedi (havuz doldu, cihaz arizasi "
-                "DEGIL). POLL_MAX_PARALLEL degerini artirin ya da poll araligini "
+                "DEGIL). MAX_PARALLEL_DEVICES degerini artirin ya da poll araligini "
                 "uzatin. Cihazlar okundu SAYILMADI; sonraki cycle'da once onlar "
                 "yoklanacak.",
                 gateway_code,
