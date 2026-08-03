@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -37,6 +38,12 @@ from dnp3_gateway.backend.http_session import build_http_session
 #   * _allowed_networks_cached allowlist dolu yolu  -> ilk config fetch duser
 # Tek bir modul-seviye logger ile bu sinif hata kalici olarak kapatildi.
 logger = logging.getLogger(__name__)
+
+# Saglik basligi `/pending`i dusuruyorsa bu kadar sure birakilir, sonra
+# yeniden denenir. Backend duzeltilince kendiliginden geri gelsin diye
+# kalici degil; ama her saniye yeniden denenip cift istek uretmesin diye de
+# kisa degil.
+_SAGLIK_BASLIK_KAPALI_SEC = 600.0
 
 
 @dataclass(frozen=True)
@@ -360,6 +367,9 @@ class BackendConfigClient:
         self._device_ip_allowlist = device_ip_allowlist
         self._clock_guard = clock_guard
         self._health_provider = health_provider
+        # Saglik basligi backend'i patlatiyorsa gecici olarak birakilir.
+        # 0.0 = acik. Bkz. `_saglik_basligini_devre_disi_birak`.
+        self._saglik_baslik_kapali_until: float = 0.0
         # Sartli istek onbellegi (ETag). Config nadiren degisir; her yoklamada
         # 193 sinyali indirmemek icin son ETag ve son AYRISTIRILMIS config
         # saklanir. 304 gelince ag uzerinden hicbir sey inmez ve JSON yeniden
@@ -551,9 +561,15 @@ class BackendConfigClient:
         return config
 
     def _build_health_header(self) -> str | None:
-        """Saglik basligini uretir; HER hata sessizce yutulur."""
+        """Saglik basligini uretir; HER hata sessizce yutulur.
+
+        Baslik gecici olarak devre disi birakilmis olabilir — bkz.
+        `_saglik_basligini_devre_disi_birak`.
+        """
         saglayici = self._health_provider
         if saglayici is None:
+            return None
+        if time.monotonic() < self._saglik_baslik_kapali_until:
             return None
         try:
             govde = saglayici()
@@ -563,6 +579,23 @@ class BackendConfigClient:
         if not isinstance(govde, dict):
             return None
         return health_header.encode_header(govde)
+
+    def _saglik_basligini_devre_disi_birak(self, sebep: str) -> None:
+        """Saglik basligini gecici olarak birak — KOMUT KANALINI KURTARMAK ICIN.
+
+        Baslik bir teshis kolayligidir; `/pending` ise SCADA komut kanalidir.
+        Backend basligi isleyemiyorsa dogru davranis basligi birakip komutlari
+        akitmaya devam etmektir.
+        """
+        self._saglik_baslik_kapali_until = time.monotonic() + _SAGLIK_BASLIK_KAPALI_SEC
+        logger.error(
+            "health_header_disabled sure=%ds sebep=%s — `/pending` yalnizca saglik "
+            "basligiyla hata veriyor. Baslik BIRAKILDI, komut kanali calismaya devam "
+            "ediyor. Backend tarafinda bu basligi isleyen yol duzeltilmeli "
+            "(gateway_health tablosu/migration).",
+            int(_SAGLIK_BASLIK_KAPALI_SEC),
+            sebep,
+        )
 
     def fetch_pending_commands(self) -> PendingPoll:
         """Hafif komut-poll — GET /gateways/{code}/pending.
@@ -592,6 +625,30 @@ class BackendConfigClient:
         except requests.RequestException as exc:
             err = _scrub_token_from_text(str(exc), self.identity.token)
             raise GatewayConfigError(f"pending request failed: {err}") from exc
+
+        # BASLIK KOMUT KANALINI DUSURUYOR MU?
+        #
+        # Yukaridaki savunma yalnizca basligi URETIRKEN cikan hatalari
+        # kapsiyordu. Baslik basariyla uretilip gonderildiginde ve BACKEND onu
+        # isleyemediginde hicbir savunma yoktu — sahada tam olarak bu oldu:
+        # backend `gateway_health` tablosuna yazmaya calisti, tablo yoktu,
+        # transaction bozuldu ve `/pending` 500 dondu. Sonuc: komut kanali
+        # SESSIZCE oldu ve `config_nonce` okunamadigi icin yeni eklenen
+        # cihazlar 5 dakikaya kadar gorulmedi.
+        #
+        # Cozum: 5xx alindiysa ve baslik GONDERILMISSE, ayni istegi BASLIKSIZ
+        # bir kez daha dene. Basliksiz calisiyorsa suclu baslige aittir;
+        # birakilir ve komutlar akmaya devam eder.
+        if saglik and 500 <= response.status_code < 600:
+            try:
+                temiz = dict(headers)
+                temiz.pop(health_header.HEADER_NAME, None)
+                ikinci = self._session.get(url, headers=temiz, timeout=self.timeout_sec)
+            except requests.RequestException:
+                ikinci = None
+            if ikinci is not None and ikinci.status_code == 200:
+                self._saglik_basligini_devre_disi_birak(f"HTTP {response.status_code}")
+                response = ikinci
 
         if response.status_code != 200:
             preview = _scrub_token_from_text((response.text or "")[:200], self.identity.token)
