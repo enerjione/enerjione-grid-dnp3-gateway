@@ -24,6 +24,13 @@ services:
     image: {{IMAGE}}
     container_name: eg-gw-{{GATEWAY_CODE_LOWER}}
     restart: unless-stopped
+    # Graceful shutdown penceresi. `docker stop` varsayilani 10sn'dir ve
+    # gateway'in tipik kapanisi (<8sn) buna ANCAK sigar — pay yok.
+    # Pencere yetmezse proses SIGKILL ile oldurulur ve in-flight bir CROB'un
+    # sonucu komut defterine yazilamaz; o komut sonraki acilista backend'e
+    # 'unknown' bildirilir (veri kaybi degil ama operator icin gereksiz
+    # belirsizlik). 30sn bol pay birakir, saglikli kapanista beklenmez.
+    stop_grace_period: 30s
     environment:
       GATEWAY_CODE: "{{GATEWAY_CODE}}"
       GATEWAY_TOKEN: "{{GATEWAY_TOKEN}}"
