@@ -2,11 +2,43 @@
 
 Semver'a gore tutulur. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [1.0.0] - 2026-08-03
 
-Ikinci tam denetimden cikan orta oncelikli bulgular. Ortak tema: **sessiz
-yanlislik**. Her maddede sistem "calisiyor" gorunuyor ama sahaya yanlis bir
-resim veriyordu.
+**Ilk uretim surumu.** Gateway 20 gercek cihazla sahada dogrulandi; protokol
+yolu artik CI'da gercek DNP3 trafigiyle test ediliyor ve dagitim imaji her
+PR'da build edilip icinde calistirilarak dogrulaniyor.
+
+1.0 su anlama gelir: **gateway tarafinda planlanmis is kalmadi.** Backend
+sozlesmesine bagli iki kalem (B1 kalite bayragi env'i, B2 cihaz zaman damgasi
+alanlarinin kabulu) backend tarafinda duruyor ve ikisi de kirilma riski
+tasimiyor — gateway gerekli veriyi zaten gonderiyor.
+
+Sinirlar: olcek dogrulamasi 20 cihaza kadar yapildi; hedef 100-300 icin
+kademeli cikis plani `docs/RUNBOOK.md` bolum 6'da.
+
+### Added
+
+- **Gercek DNP3 loopback entegrasyon testleri.** `dnp3_yadnp3_master` bu
+  deponun en kritik modulu (tum olcumler ve tum kesici komutlari oradan
+  geciyor) ama tek satiri bile gercek protokol trafigiyle test edilmemisti;
+  regresyon ancak musteri sahasinda gorulurdu. Artik localhost'ta gercek bir
+  DNP3 outstation ayaga kalkiyor ve gateway kendi master'iyla ona baglaniyor:
+  okuma, kalite bayraklari, olcekleme, delta-only yayin, link kopmasi ->
+  comm_lost -> toparlanma ve CROB'un cihaza ulasmasi dogrulaniyor.
+  Adapter kapsami CI'da %64.
+- **CI'da yadnp3** + `import opendnp3` dogrulamasi. Ikincisi sart: loopback
+  testleri kutuphane yoksa kendini atlar, wheel sessizce kurulmazsa en kritik
+  testler kosmadan CI yesil donerdi.
+- **`docker imaji` CI isi.** Imaj artik her PR'da build ediliyor ve
+  **calistirilarak** dogrulaniyor: icinde `import opendnp3`, `python -m
+  dnp3_gateway --version`, imajdaki surumun `VERSION` ile esitligi ve
+  entrypoint'in kimliksiz container'i cikis kodu 64 ile reddettigi. Dagitim
+  Docker-only oldugu icin Dockerfile yardimci dosya degil urunun kendisi;
+  eskiden yalnizca main'e push'ta build ediliyordu, yani kapinin yanlis
+  tarafinda.
+- **`requirements-dnp3.txt`** — DNP3 native surum pini icin tek kaynak.
+  Pin uc yerde tekrarlaniyordu; birini yukseltip digerini unutmak CI'in test
+  ettigi surumle sahanin calistirdigi surumun sessizce ayrismasi demekti.
 
 ### Fixed
 
@@ -80,6 +112,37 @@ resim veriyordu.
   yarim-acik probe. Telemetri outbox'a yazilmaya devam ediyor — **veri kaybi
   yok**.
 
+- **`install.ps1` stok Windows Server'da CALISMIYORDU.** Dosya BOM'suz UTF-8
+  kaydedilmisti ve icinde em-dash geciyordu. Windows PowerShell 5.1 BOM'suz
+  dosyalari cp1252 okur; U+2014'un son bayti `0x94` = U+201D'dir ve
+  PowerShell akilli tirnaklari GERCEK tirnak sayar. String erken kapanir,
+  ardindan gelen suslu parantezler yerini sasirir ve script hic calismaz —
+  yalnizca bir YORUM satirindaki tire tum kurulumu bozuyordu. PowerShell 7
+  (UTF-8 varsayilan) bunu maskeliyordu. Uc script ASCII'ye cevrildi;
+  `tests/test_powershell_scripts.py` geri gelmesini engelliyor.
+
+- **Siraya bagli test kirliligi.** `test_crob_command` sahte bir `opendnp3`
+  enjekte edip `_ManagedMaster._OP_MAP_LAZY` SINIF niteligini duz atamayla
+  sifirliyor ama geri yuklemiyordu. Icinde sahte enum'lar kalinca, ayni
+  oturumda sonra kosan ve gercek opendnp3 kullanan her test CROB kurarken
+  duser — hem de yalnizca belirli dosya siralamasinda.
+
+- **`poll_pool_starved` log'u var olmayan bir ayari soyluyordu**
+  (`POLL_MAX_PARALLEL`). Dogrusu `MAX_PARALLEL_DEVICES` — operator ariza
+  aninda bulunmayan bir ayari aramaya yonlendiriliyordu.
+
+- **CI'da iki farkli is ayni adla gorunuyordu** (`pytest (py3.12)` hem ubuntu
+  hem windows). Windows'un matriste olma sebebi YALNIZCA Windows'ta cikan bir
+  hataydi; o job kirmizi yandiginda platformu ad'dan okuyamamak, tam da onu
+  yakalamak icin kurulan kapiyi korlestiriyordu.
+
+### Changed
+
+- **Compose sablonuna `stop_grace_period: 30s`.** `docker stop` varsayilani
+  10sn ve gateway'in tipik kapanisi (<8sn) buna ANCAK sigar. Pencere yetmezse
+  proses SIGKILL ile olur ve in-flight bir CROB'un sonucu komut defterine
+  yazilamaz; o komut sonraki acilista `unknown` bildirilir.
+
 ### Docs
 
 - `RUNBOOK.md`: `POST /operate` tam dokumantasyonu (cevap sekli, HTTP kodlari,
@@ -91,9 +154,15 @@ resim veriyordu.
   saglik basligi, kaynak guard'lari, SQLite surumleme, cikis kodu 78.
 - `SECURITY.md`: `GATEWAY_COMMAND_TOKEN`, operator HTTP yuzeyi tablosu,
   hata mesajlarinda sir sizmasi, NATS bolumu legacy olarak isaretlendi.
+- `RUNBOOK.md`: **Docker-first** yeniden duzenlendi — uretim yolu ilk sirada
+  (imaj etiket politikasi, volume ve kimlik zorunlulugu, yukseltme/rollback),
+  Windows/venv "yalnizca gelistirme" olarak isaretlendi. Yeni "Olcek — 20
+  cihazdan 300'e" bolumu: kademeli cikis plani, ayar tablosu ve darbogazin
+  gateway'de mi backend'de mi oldugunu ayirt etme rehberi.
 - `BACKEND_TODO.md`: B3 (per-device katalog) gateway tarafinda kapandi —
   ozgun kayittaki "gateway tarafinda cozulemez" degerlendirmesi yanlisti.
-  Geriye tek koordinasyon isi olarak B2 kaldi.
+  B2'nin gateway yarisi da bitti (`device_event_at` + `timestamp_quality`
+  yayinlaniyor). **Gateway tarafinda kalan is yok.**
 
 ## [0.6.0] - 2026-08-02
 
