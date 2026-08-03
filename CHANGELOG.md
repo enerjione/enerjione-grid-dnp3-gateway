@@ -2,6 +2,35 @@
 
 Semver'a gore tutulur. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.0.2] - 2026-08-03
+
+Saha arizasinin ortaya cikardigi iki gorunurluk/dayaniklilik eksigi.
+
+### Fixed
+
+- **Backend'e telemetri gitmezken `/health` "ok" diyebiliyordu.**
+  `broker_ready` govdede vardi ama hicbir sorun kodu uretmiyordu; ariza
+  ancak outbox dolmaya basladiginda (dakikalar sonra) gorunurdu. Yeni kod:
+  `telemetry_backend_unreachable` (degraded). Veri outbox'a yazilmaya devam
+  ettigi icin unhealthy DEGIL — surerse `outbox_full` zaten unhealthy yapar.
+
+### Changed
+
+- **Config periyodik refresh varsayilani 300sn -> 60sn**; compose sablonu
+  acikca 30sn set ediyor. Cihaz eklendiginde anlik tetik `config_nonce` ile
+  gelir, periyodik refresh onun YEDEGIDIR — sahada tetik olunce yeni cihaz
+  5 dakika gorulmedi. Maliyet ~sifir: config istekleri ETag ile sartli
+  (degismediyse 304, govde inmez).
+
+  Not: `.env.example` zaten 30 diyordu ama compose sablonu hicbir sey set
+  etmedigi icin saha kod varsayilani 300'u aliyordu — ornek konfigurasyon
+  ile gercek davranis ayrismisti.
+
+### Docs
+
+- RUNBOOK: `command_channel_failing`, `command_channel_down` ve
+  `telemetry_backend_unreachable` sorun kodlari mudahale adimlariyla eklendi.
+
 ## [1.0.1] - 2026-08-03
 
 **Saha arizasi duzeltmesi.** GW-001'de SCADA komut kanali sessizce olmustu.
