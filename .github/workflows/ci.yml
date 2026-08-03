@@ -106,6 +106,75 @@ jobs:
           path: coverage.xml
           retention-days: 14
 
+  docker:
+    # DAGITIM YOLU BURASI. Saha Docker ile kuruluyor; yani Dockerfile bir
+    # yardimci dosya degil, URUNUN KENDISI.
+    #
+    # Bu is EKSIKTI: imaj yalnizca main'e push'ta (release-image.yml) build
+    # ediliyordu. Dockerfile'i bozan bir PR sorunsuz merge oluyor, hata ancak
+    # main'e indikten SONRA goruluyordu — yani kapinin yanlis tarafinda.
+    #
+    # `push: false` — burada yalnizca DOGRULAMA yapariz; yayinlama hala
+    # release-image.yml'in isi. Cache release-image ile paylasildigi icin ek
+    # maliyet dusuk.
+    name: docker imaji
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Imaji build et (yayinlamadan)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          build-args: |
+            DNP3_LIBRARY=yadnp3
+          platforms: linux/amd64
+          push: false
+          load: true          # sonraki adimlar imaji CALISTIRACAK
+          tags: dnp3-gateway:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      # "Build oldu" YETMEZ: imaj derlenip icindeki uygulama yine de
+      # acilmayabilir (eksik native kutuphane, yanlis PYTHONPATH, kirik
+      # entrypoint). Docker-only bir dagitimda bunu yakalayacak baska kapi YOK.
+      #
+      # NOT: `--entrypoint python` ile entrypoint ATLANIYOR — o script
+      # GATEWAY_CODE/GATEWAY_TOKEN zorunlu kilar ve burada amac imajin
+      # ICERIGINI dogrulamak. Entrypoint'in kendisi ayri bir adimda test edilir.
+      - name: Imajin icinde DNP3 native yuklu mu
+        run: |
+          docker run --rm --entrypoint python dnp3-gateway:ci \
+            -c "import opendnp3; print('opendnp3 imaj icinde hazir')"
+      - name: Uygulama imajin icinde acilabiliyor mu
+        run: |
+          docker run --rm --entrypoint python dnp3-gateway:ci -m dnp3_gateway --version
+      - name: Surum imajda da tutarli mi
+        run: |
+          set -euo pipefail
+          BEKLENEN="$(tr -d '[:space:]' < VERSION)"
+          GERCEK="$(docker run --rm --entrypoint python dnp3-gateway:ci \
+            -c 'import dnp3_gateway; print(dnp3_gateway.__version__)' | tr -d '[:space:]')"
+          echo "VERSION=$BEKLENEN imaj=$GERCEK"
+          if [ "$BEKLENEN" != "$GERCEK" ]; then
+            echo "::error::Imajdaki surum ($GERCEK) VERSION dosyasindan ($BEKLENEN) farkli."
+            exit 1
+          fi
+      # Entrypoint sozlesmesi: kimlik verilmeden container BASLAMAMALI.
+      # Baslasaydi, yanlis yapilandirilmis bir gateway sessizce ayaga kalkip
+      # backend'e kimliksiz istek yagdirirdi. Beklenen cikis kodu 64.
+      - name: Entrypoint kimlik dogrulamasi calisiyor mu
+        run: |
+          set +e
+          cikti="$(docker run --rm dnp3-gateway:ci 2>&1)"
+          kod=$?
+          set -e
+          echo "$cikti"
+          if [ "$kod" -ne 64 ]; then
+            echo "::error::GATEWAY_CODE/TOKEN yokken container cikis kodu 64 olmali, $kod dondu."
+            exit 1
+          fi
+
   build-sanity:
     name: paket derlenebiliyor mu
     runs-on: ubuntu-latest

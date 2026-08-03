@@ -4,7 +4,66 @@ Gunluk operasyon kontrol listesi + incident response.
 
 ## 1. Baslatma
 
-### Windows (gelistirme veya tek-host saha)
+> **URETIM = DOCKER.** Saha kurulumlari container ile yapilir; asagidaki
+> Docker bolumu tek gecerli uretim yoludur. Windows/venv yolu YALNIZCA
+> gelistirme icindir ve sahada kullanilmaz.
+
+### Docker (URETIM)
+
+```bash
+docker compose -f gateways/gw-001.yml up -d
+docker compose -f gateways/gw-001.yml logs -f
+```
+
+Compose sablonu: `docker/compose.template.yml`. Backend'in "Yeni gateway ekle"
+akisi bu sablonu render eder.
+
+**Imaj etiketleri** (bkz. `.github/workflows/release-image.yml`):
+
+| Etiket | Ne zaman olusur | Kullanim |
+| --- | --- | --- |
+| `:latest` | YALNIZCA `v*.*.*` tag'i atildiginda | Uretim |
+| `:<surum>` (or. `:0.6.0`) | Ayni tag ile | Uretim — **rollback icin bunu kullanin** |
+| `:main` / `:sha-<kisa>` | main'e her push'ta | Deneme/CI; **sahaya almayin** |
+
+`:latest` bilincli bir surum etiketi olmadan OLUSMAZ. Eskiden main'e giden her
+push `:latest`i eziyordu ve sahada `docker compose pull` yapan operator test
+edilmemis bir imaji uretime aliyordu.
+
+**Zorunlu iki sey:**
+
+1. `GATEWAY_CODE` + `GATEWAY_TOKEN` env — verilmezse container **cikis kodu
+   64** ile durur (entrypoint kimlik dogrulamasi). Kimliksiz bir gateway'in
+   sessizce ayaga kalkmasi istenmez.
+2. `GATEWAY_STATE_DIR` (varsayilan `/app/.gateway_state`) bir **volume**
+   olmali. Olmazsa restart'ta outbox kuyrugu, komut defteri ve instance_id
+   kaybolur; log'da `UYARI: ... bir volume degil` satirini gorursunuz.
+
+**Kurulum dogrulama:**
+
+```bash
+docker compose -f gateways/gw-001.yml ps            # healthy mi
+curl -s http://127.0.0.1:8020/health | jq .status   # "ok" bekleniyor
+```
+
+**Yukseltme:**
+
+```bash
+docker compose -f gateways/gw-001.yml pull
+docker compose -f gateways/gw-001.yml up -d
+```
+
+Compose dosyasindaki etiketi yeni surume cekmeyi unutmayin — `:latest` ile
+calisiyorsaniz `pull` zaten yeni surumu getirir, ama **hangi surumun
+kostugunu** `/health` `version` alanindan dogrulayin.
+
+**Rollback:** compose'daki etiketi onceki semver'a cevirip `up -d`. SQLite
+semasi ileri surumden geri donerse gateway acikca hata verir (sessizce yanlis
+calismaz) — bkz. bolum 4 "Surum yukseltme".
+
+### Windows / venv (YALNIZCA GELISTIRME)
+
+> Sahada kullanilmaz. Bu yol gelistirme ve hizli deneme icindir.
 
 ```powershell
 cd "C:\...\EnerjiOne Grid DNP3 Gateway"
@@ -12,72 +71,37 @@ cd "C:\...\EnerjiOne Grid DNP3 Gateway"
 ./scripts/run_gateway.ps1            # .env uzerinden
 ```
 
-`install.ps1` sunlari yapar: venv + `requirements.txt` + **yadnp3** +
-**paketin kendisi** (`pip install -e .`) ve sonunda kurulumu **dogrular**.
-Son iki adim 0.5.1'de eklendi; oncesinde `py -m dnp3_gateway`
-`ModuleNotFoundError` veriyordu.
-
-**Kurulumu elle dogrulama** (servis kurmadan once yapin):
+`install.ps1` sunlari yapar: venv + `requirements.txt` + **yadnp3**
+(`requirements-dnp3.txt` pininden) + **paketin kendisi** (`pip install -e .`)
+ve sonunda kurulumu **dogrular**.
 
 ```powershell
 .\.venv\Scripts\python.exe -c "import dnp3_gateway; print(dnp3_gateway.__version__)"
 .\.venv\Scripts\python.exe -m dnp3_gateway --version
 ```
 
-Ikisi de calismiyorsa servis de calismaz — once bunu duzeltin.
+Ikisi de calismiyorsa once bunu duzeltin.
 
-### Windows (NSSM servisi)
-
-```powershell
-nssm install EnerjiOneDnp3Gateway `
-    "C:\Projeler\EnerjiOne Grid DNP3 Gateway\.venv\Scripts\python.exe" `
-    "-m dnp3_gateway"
-nssm set EnerjiOneDnp3Gateway AppDirectory "C:\Projeler\EnerjiOne Grid DNP3 Gateway"
-nssm set EnerjiOneDnp3Gateway Start SERVICE_AUTO_START
-
-# NSSM stdout rotasyonu YOK — .env'de LOG_FILE_PATH zorunlu:
-#   LOG_FILE_PATH=C:/ProgramData/EnerjiOne/dnp3-gateway/{gateway_code}.log
-# Gateway kendi RotatingFileHandler'i acar (20MB x 10 backup default).
-
-# Konfigurasyon hatasi mesajini GORMEK icin stdout'u da yonlendirin.
-# Gateway bozuk .env'de cikis kodu 78 ile durur ve nedeni BURAYA yazar;
-# o an henuz LOG_FILE_PATH'e yazacak logging kurulmamis olur.
-nssm set EnerjiOneDnp3Gateway AppStdout "C:\ProgramData\EnerjiOne\dnp3-gateway\service-stdout.log"
-nssm set EnerjiOneDnp3Gateway AppStderr "C:\ProgramData\EnerjiOne\dnp3-gateway\service-stderr.log"
-
-nssm start EnerjiOneDnp3Gateway
-```
-
-**Servis aninda oluyorsa** once `service-stdout.log`'a bakin:
-
-| Gorulen | Anlami |
-| --- | --- |
-| `KONFIGURASYON HATASI` cercevesi | `.env`'de gecersiz ayar. Mesaj hangi ayar oldugunu soyler. Cikis kodu **78**. |
-| `ModuleNotFoundError: dnp3_gateway` | Paket kurulmamis. `install.ps1`'i tekrar calistirin. |
-| `Missing closing '}'` / `string is missing the terminator` (install.ps1 kosarken) | Scriptte ASCII-disi karakter var. Windows PowerShell 5.1 BOM'suz dosyalari cp1252 okur; tek bir em-dash tum scripti parse edilemez yapar. `tests/test_powershell_scripts.py` bunu kilitliyor — cikiyorsa scripti duzenleyen editor akilli tirnak/tire eklemis demektir. |
-| `Yadnp3AdapterError` | yadnp3 wheel'i kurulamamis. `GATEWAY_MODE=dnp3` icin sart. |
-| `Ayni GATEWAY_CODE icin baska bir proses` | Ayni kodla ikinci instance. |
-
-### Ayni makinede coklu gateway
+**Ayni makinede coklu gateway (gelistirme):**
 
 ```powershell
 ./scripts/new_gateway.ps1 -Code GW-002 -HealthPort 8021
-# -> .env.GW-002 uretir, GATEWAY_TOKEN dosyaya guvenli yazar
-
 py -m dnp3_gateway --env-file .env.GW-002
 ```
 
 Her instance kendi `instance_GW-002.lock` dosyasi alir; ayni kod ile ikinci
 proses SystemExit eder.
 
-### Linux / Docker
+**Servis acilmiyorsa** (`service-stdout.log` / container log'u):
 
-```bash
-docker compose -f gateways/gw-001.yml up -d
-```
-
-Compose template: `docker/compose.template.yml`. Backend "Yeni gateway ekle"
-akisi bu sablonu render eder.
+| Gorulen | Anlami |
+| --- | --- |
+| `KONFIGURASYON HATASI` cercevesi | `.env`'de gecersiz ayar. Mesaj hangi ayar oldugunu soyler. Cikis kodu **78**. |
+| `[entrypoint] HATA: GATEWAY_CODE ve GATEWAY_TOKEN` | Container'a kimlik verilmemis. Cikis kodu **64**. |
+| `ModuleNotFoundError: dnp3_gateway` | Paket kurulmamis (venv yolu). `install.ps1`'i tekrar calistirin. |
+| `Yadnp3AdapterError` | yadnp3 wheel'i yok. `GATEWAY_MODE=dnp3` icin sart. Docker imajinda hazir gelir. |
+| `Ayni GATEWAY_CODE icin baska bir proses` | Ayni kodla ikinci instance. |
+| `Missing closing '}'` (install.ps1) | Scriptte ASCII-disi karakter var; Windows PowerShell 5.1 BOM'suz dosyalari cp1252 okur. `tests/test_powershell_scripts.py` bunu kilitliyor. |
 
 ## 2. Saglik dogrulama
 
@@ -165,13 +189,20 @@ Log'da `signals_empty device=... profil=...` satirini arayin.
 
 ## 3. Log izleme
 
-```powershell
-# Rotating dosya (LOG_FILE_PATH set ise)
-Get-Content "$env:ProgramData\EnerjiOne\dnp3-gateway\GW-001.log" -Tail 200 -Wait
-
-# Servis stdout (NSSM AppStdout yonlendirmesi)
-Get-Content "$env:ProgramData\EnerjiOne\dnp3-gateway\current.log" -Tail 200 -Wait
+```bash
+# URETIM (Docker)
+docker compose -f gateways/gw-001.yml logs -f --tail 200
+docker compose -f gateways/gw-001.yml logs --since 1h | grep -E "ERROR|WARNING"
 ```
+
+```powershell
+# Gelistirme (venv) — LOG_FILE_PATH set ise rotating dosya
+Get-Content "$env:ProgramData\EnerjiOne\dnp3-gateway\GW-001.log" -Tail 200 -Wait
+```
+
+> Docker'da `LOG_FILE_PATH` **set etmeyin**: loglar stdout'a aksin ve
+> `docker logs` / log driver toplasin. Dosyaya yazmak container icinde
+> rotasyon ve disk yonetimi sorunu yaratir, ayrica `docker logs` bos kalir.
 
 ### Anahtar log etiketleri
 
@@ -510,16 +541,24 @@ Saha cikisinda yaygin hatalar:
 
 ### Surum yukseltme
 
-> **Yalnizca `git pull` YETMEZ — `install.ps1`'i tekrar calistirin.**
+**Docker (uretim):** yukseltme `pull` + `up -d` (bkz. bolum 1). Surum imajin
+icine build aninda yazilir, dolayisiyla asagidaki bayat-surum tuzagi Docker'da
+YOKTUR. Yine de her yukseltmeden sonra dogrulayin:
+
+```bash
+curl -s http://127.0.0.1:8020/health | jq -r .version
+```
+
+> **Gelistirme (venv) yolunda dikkat: yalnizca `git pull` YETMEZ —
+> `install.ps1`'i tekrar calistirin.**
 >
 > Surum bilgisi once **kurulu paket metadata**'sindan okunur (`pip install -e .`
 > ile yazilir), yalnizca o yoksa `VERSION` dosyasina duser. Kodu guncelleyip
-> kurulumu yenilemezseniz kod yeni, `/health` `version` alani ESKI olur:
-> `User-Agent`, loglar ve backend'in gordugu surum yanlis kalir ve bir olay
-> incelemesinde "hangi surum kosuyordu" sorusu yanlis cevaplanir.
+> kurulumu yenilemezseniz kod yeni, `/health` `version` alani ESKI olur ve bir
+> olay incelemesinde "hangi surum kosuyordu" sorusu yanlis cevaplanir.
 >
-> Dogrulama: `(Invoke-RestMethod http://127.0.0.1:8020/health).version`
-> ile repo kokundeki `VERSION` dosyasi **ayni olmali**.
+> Docker'da bu olamaz: imaj her build'de temiz kurulur ve CI
+> (`docker imaji` isi) imajdaki surumun `VERSION` ile ayni oldugunu dogrular.
 
 #### SQLite semasi
 
@@ -674,7 +713,8 @@ backend'de `gateway_code` ile bolusturun.
 
 ## 7. Shutdown sırasi
 
-Graceful shutdown (`SIGINT` / `SIGTERM` / Windows `SIGBREAK` NSSM stop):
+Graceful shutdown (`SIGTERM` — `docker stop` / compose `down`; gelistirmede
+`SIGINT` / Windows `SIGBREAK`):
 
 1. `stop_event.set()` — tum thread'lerin bekleme araliklarini kirar
 2. Komut-poll thread'i join (5sn) + `command_ledger` kapanir
@@ -688,7 +728,11 @@ Graceful shutdown (`SIGINT` / `SIGTERM` / Windows `SIGBREAK` NSSM stop):
 
 Toplam tipik shutdown: <8 saniye.
 
-> **NSSM notu:** varsayilan `AppStopMethodConsole` penceresi bu sureden kisa
-> olabilir. `nssm set <svc> AppStopMethodConsole 10000` ile 10sn verin; aksi
-> halde in-flight bir CROB sonucu ledger'a yazilamadan proses oldurulebilir
-> (sonraki acilista `unknown` olarak bildirilir — kayip degil ama gurultudur).
+> **Docker notu:** `docker stop` varsayilan olarak 10sn sonra SIGKILL gonderir
+> — tipik shutdown (<8sn) buna sigar ama pay dardir. Compose'da
+> `stop_grace_period: 30s` verin; aksi halde in-flight bir CROB sonucu
+> ledger'a yazilamadan proses oldurulebilir (sonraki acilista `unknown` olarak
+> bildirilir — kayip degil ama gurultudur).
+>
+> Gelistirmede NSSM kullaniyorsaniz karsiligi:
+> `nssm set <svc> AppStopMethodConsole 10000`.
