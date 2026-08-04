@@ -1801,6 +1801,16 @@ class Yadnp3TelemetryReader(TelemetryReader):
             self._nan_uyarilan.add(anahtar)
             return True
 
+    @property
+    def io_thread_count(self) -> int:
+        """Secilen opendnp3 IO thread sayisi.
+
+        Log'a YAZILMASI icin acildi: eskiden yalnizca "auto" yaziliyordu ve
+        heuristigin gercekte ne sectigi hicbir yerde gorunmuyordu — operator
+        olcegi buyuturken ayarin tuttugunu dogrulayamiyordu.
+        """
+        return self._manager_threads
+
     def device_health(self) -> dict[str, dict[str, Any]]:
         """Cihaz basina DNP3 haberlesme durumu (health/metrics icin).
 

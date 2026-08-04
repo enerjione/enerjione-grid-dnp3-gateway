@@ -68,22 +68,17 @@ def build_adapter(settings: Settings) -> TelemetryReader:
     if library in ("yadnp3", "opendnp3"):
         from dnp3_gateway.adapters.dnp3_yadnp3_master import Yadnp3TelemetryReader
 
-        logger.info(
-            "adapter_selected mode=dnp3 library=yadnp3 (OpenDNP3) local_addr=%s default_tcp=%s "
-            "scan=%ss baseline=%ss manager_threads=%s time_sync=%s quality_flags_published=%s",
-            settings.dnp3_local_address,
-            settings.dnp3_tcp_port,
-            settings.default_poll_interval_sec,
-            settings.dnp3_event_baseline_interval_sec,
-            settings.dnp3_manager_threads if settings.dnp3_manager_threads > 0 else "auto",
-            settings.dnp3_time_sync,
-            settings.dnp3_publish_quality_flags,
-        )
         _warn_ignored_dnp3_settings(settings)
-        return Yadnp3TelemetryReader(
+        # Class 1/2/3 EVENT SCAN araligi. Eskiden dogrudan
+        # `default_poll_interval_sec`e baglanmisti, ama bunlar farkli isler:
+        # poll interval YAYIN turudur, scan interval cihaza SORMA sikligidir.
+        # 401 cihazda scan=1s saniyede 401 DNP3 istegi uretiyordu.
+        # 0 = eski davranis (poll interval ile ayni).
+        event_scan_sec = settings.dnp3_event_scan_interval_sec or settings.default_poll_interval_sec
+        okuyucu = Yadnp3TelemetryReader(
             local_address=settings.dnp3_local_address,
             default_dnp3_tcp_port=settings.dnp3_tcp_port,
-            scan_interval_sec=settings.default_poll_interval_sec,
+            scan_interval_sec=event_scan_sec,
             baseline_interval_sec=settings.dnp3_event_baseline_interval_sec,
             manager_threads=settings.dnp3_manager_threads,
             time_sync=settings.dnp3_time_sync,
@@ -95,6 +90,23 @@ def build_adapter(settings: Settings) -> TelemetryReader:
             # demekti (bkz. dnp3_yadnp3_master.__init__).
             device_count_hint=settings.max_parallel_devices,
         )
+        # Log ADAPTER KURULDUKTAN SONRA: `manager_threads` eskiden "auto"
+        # yaziyordu ve heuristigin GERCEKTE kac thread sectigi hicbir yerde
+        # gorunmuyordu — operator 500 cihaza cikarken bunu dogrulayamiyordu.
+        # `scan` de eskiden poll interval'i yaziyordu; artik ayri ayar var.
+        logger.info(
+            "adapter_selected mode=dnp3 library=yadnp3 (OpenDNP3) local_addr=%s default_tcp=%s "
+            "scan=%ss%s baseline=%ss io_threads=%s time_sync=%s quality_flags_published=%s",
+            settings.dnp3_local_address,
+            settings.dnp3_tcp_port,
+            event_scan_sec,
+            "" if settings.dnp3_event_scan_interval_sec else " (poll ile ayni)",
+            settings.dnp3_event_baseline_interval_sec,
+            okuyucu.io_thread_count,
+            settings.dnp3_time_sync,
+            settings.dnp3_publish_quality_flags,
+        )
+        return okuyucu
 
     if library == "dnp3py":
         # Legacy: nfm-dnp3 (saf python). Group 110 yok, OpenDNP3 outstation
