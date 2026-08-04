@@ -2,6 +2,37 @@
 
 Semver'a gore tutulur. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.3.0] - 2026-08-04
+
+300 cihazli sahada olculen yayin darbogazi kaldirildi. Hedef 500 cihaz.
+
+### Added
+
+- **`JetStreamPublisher.publish_batch` — toplu (paralel) yayin.** Bu metot
+  YOKTU; `ResilientPublisher.publish_batch` "broker batch desteklemiyor"
+  deyip mesajlari TEK TEK `publish()`e dusuruyor, her cagri da cagiran
+  thread'i BLOKE eden bir JetStream ACK round-trip'i oluyordu. HTTP
+  publisher'da batch vardi; NATS'a geciste bu kazanim sessizce kayboldu.
+
+  Sahada olculdu (300 cihaz): bir cycle'da 30.696 mesaj, NATS round-trip
+  0.064 ms -> yalnizca ack beklemesi ~2.0 sn; cycle ortalamasi 4.02 sn
+  (hedef 1 sn, medyan 3.57, max 16.35), gateway CPU %94.8 (100 cihazda %5).
+  Kapasite uyarilari SIFIRDI (poll_pool_starved/timeout yok) — yani darbogaz
+  worker havuzu degil, yayin yoluydu.
+
+  Artik tum publish'ler ayni loop turunda baslatilip ack'ler TOPLU bekleniyor
+  (N sirali round-trip -> ~1 round-trip). Govdeler cagiran thread'de
+  serilestiriliyor (JSON'u loop icine tasimak tek loop'u tum gateway icin
+  darbogaz yapardi); paralellik `_BATCH_CHUNK`=256 ile sinirli (kontrolsuz
+  gather istemci yazma tamponunu ve bekleyen-ack sayisini sisirirdi).
+
+  Hata semantigi KORUNDU: en az bir mesaj basarisizsa istisna firlatilir,
+  ResilientPublisher TUM batch'i outbox'a yazar. Duplicate uretebilir ama
+  `Nats-Msg-Id` dedup'i (2dk) eler — at-least-once bozulmaz.
+
+  8 yeni test (348 toplam). `test_yayinlar_paralel_yapilir` regresyonu
+  olcerek yakalar: sirali davranista test duser.
+
 ## [1.2.0] - 2026-08-04
 
 Kapasite: tek gateway hedefi 500 cihaz (ekstra gateway kurmadan).
