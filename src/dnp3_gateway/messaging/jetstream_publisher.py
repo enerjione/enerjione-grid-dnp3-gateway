@@ -32,6 +32,14 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# `publish_batch` icinde ayni anda kac publish baslatilir.
+#
+# Tek `gather` ile on binlerce publish'i ayni anda baslatmak NATS istemcisinin
+# yazma tamponunu ve sunucudaki bekleyen-ack sayisini kontrolsuz sisirir.
+# 256 paralellik, olculen 0.064 ms round-trip'te bir parcayi ~tek round-trip
+# suresine indirir; daha buyugu kazanc getirmeden risk ekler.
+_BATCH_CHUNK = 256
+
 try:
     import nats  # type: ignore[import-not-found]
 
@@ -422,6 +430,92 @@ class JetStreamPublisher:
             with self._counter_lock:
                 self._publish_failures += 1
             raise JetStreamPublishError(str(exc)) from exc
+
+    def publish_batch(self, items: list[dict[str, Any]]) -> None:
+        """Bir cihazin tum degisen sinyallerini TEK loop turunda PARALEL yayinla.
+
+        NEDEN GEREKLI — OLCULDU
+        -----------------------
+        Bu metot YOKKEN `ResilientPublisher.publish_batch` "broker batch
+        desteklemiyor" deyip mesajlari TEK TEK `publish()`e dusuruyordu. Her
+        cagri ayri bir `run_coroutine_threadsafe` + `future.result()` yani
+        thread'i BLOKE eden bir JetStream ACK round-trip'i demekti.
+
+        300 cihazli sahada olculdu (2026-08-04): bir cycle'da 30.696 mesaj,
+        NATS round-trip 0.064 ms -> yalnizca ACK beklemesi ~2.0 sn; gozlenen
+        cycle ortalamasi 4.02 sn (hedef 1 sn) ve gateway CPU %95. Yani cycle
+        suresinin yaklasik YARISI sirali ack beklemesiydi. 500 cihaz hedefinde
+        tek cekirdek bunu kaldirmaz.
+
+        Burada tum publish'ler ayni loop turunda baslatilip ack'ler TOPLU
+        beklenir: N sirali round-trip -> ~1 round-trip.
+
+        HATA SEMANTIGI korunur: en az bir mesaj basarisizsa istisna firlatilir
+        ve `ResilientPublisher` TUM batch'i outbox'a yazar. Bu duplicate
+        uretebilir ama JetStream `Nats-Msg-Id` dedup'i (2dk pencere) bunu
+        eler — at-least-once garantisi bozulmaz.
+        """
+        if not items:
+            return
+        if not self._ready.is_set() or self._loop is None or self._js is None:
+            with self._counter_lock:
+                self._publish_failures += len(items)
+            raise JetStreamNotReadyError("publisher not ready (NATS connection unavailable)")
+
+        # Govdeleri ONCEDEN, cagiran thread'de hazirla. JSON serilestirmeyi
+        # event loop'un icine tasimak tek loop'u tum gateway icin darbogaz
+        # yapardi (loop ayni zamanda NATS I/O'sunu da suruyor).
+        hazir: list[tuple[bytes, dict[str, str]]] = []
+        for it in items:
+            body = json.dumps(it["payload"], ensure_ascii=False).encode("utf-8")
+            js_headers: dict[str, str] = {"Nats-Msg-Id": str(it["message_id"])}
+            corr = it.get("correlation_id")
+            if corr:
+                js_headers["X-Correlation-Id"] = str(corr)
+            for k, v in (it.get("headers") or {}).items():
+                if v is None:
+                    continue
+                js_headers[str(k)] = str(v)
+            hazir.append((body, js_headers))
+
+        async def _do_batch() -> int:
+            """Parcalar halinde paralel yayinla; basarisiz sayisini doner.
+
+            PARCA (chunk) NEDEN: tek `gather` ile on binlerce publish'i ayni
+            anda baslatmak NATS istemcisinin yazma tamponunu ve sunucudaki
+            bekleyen-ack sayisini kontrolsuz sisirir. Parca boyu paralelligi
+            korur ama kaynak tuketimini sinirli tutar.
+            """
+            hatali = 0
+            for i in range(0, len(hazir), _BATCH_CHUNK):
+                parca = hazir[i : i + _BATCH_CHUNK]
+                sonuclar = await asyncio.gather(
+                    *(self._js.publish(self.subject, b, headers=h) for b, h in parca),
+                    return_exceptions=True,
+                )
+                for s in sonuclar:
+                    if isinstance(s, BaseException):
+                        hatali += 1
+                        if hatali == 1:
+                            logger.debug("jetstream_batch_item_failed", exc_info=s)
+            return hatali
+
+        try:
+            future = asyncio.run_coroutine_threadsafe(_do_batch(), self._loop)
+            # Paralel oldugu icin toplam sure ~en yavas mesaj kadardir; yine de
+            # parca sayisina gore pay birakiyoruz (parcalar SIRAYLA kosuyor).
+            parca_sayisi = max(1, (len(hazir) + _BATCH_CHUNK - 1) // _BATCH_CHUNK)
+            hatali = future.result(timeout=self._publish_timeout * parca_sayisi + 5.0)
+        except Exception as exc:
+            with self._counter_lock:
+                self._publish_failures += len(items)
+            raise JetStreamPublishError(str(exc)) from exc
+
+        with self._counter_lock:
+            self._publish_successes += len(items) - hatali
+            self._publish_failures += hatali
+        if hatali:
+            raise JetStreamPublishError(f"batch: {hatali}/{len(items)} mesaj yayinlanamadi")
 
     # ---- Telemetry / health ---------------------------------------------
     @property
