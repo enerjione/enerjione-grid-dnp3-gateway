@@ -506,6 +506,30 @@ class Settings(BaseSettings):
             "arada Class 1/2/3 event poll yapilir. Drift toleransi olarak 30-300 sn idealdir."
         ),
     )
+    dnp3_event_scan_interval_sec: int = Field(
+        default=0,
+        ge=0,
+        le=3600,
+        description=(
+            "event_driven mod: Class 1/2/3 EVENT SCAN araligi (sn). 0 = "
+            "DEFAULT_POLL_INTERVAL_SEC ile ayni (eski davranis).\n"
+            "\n"
+            "NEDEN AYRI AYAR: bu iki sure FARKLI isler ama tek ayara baglilardi.\n"
+            "  * poll interval -> gateway'in cache'ten okuyup YAYINLAMA turu\n"
+            "  * scan interval -> cihaza 'yeni olayin var mi' diye SORMA sikligi\n"
+            "\n"
+            "401 cihazli sahada olculdu (2026-08-04): scan=1s ile saniyede 401 DNP3\n"
+            "istegi uretiliyordu ve gateway CPU'su cihaz sayisiyla dogru orantili\n"
+            "artiyordu (mesaj sayisiyla DEGIL) — cunku her istek bir TCP round-trip +\n"
+            "cerceve cozumleme + C++->Python callback zinciri demek.\n"
+            "\n"
+            "Cihazlar unsolicited modda calisir (disableUnsolOnStartup=False), yani\n"
+            "degisiklikleri KENDILIGINDEN gonderir; scan yalnizca yedek mekanizmadir.\n"
+            "Bu yuzden scan'i seyreltmek veri tazeligini orantili bozmaz.\n"
+            "\n"
+            "Yukseltmeden once/sonra `/health` 'oldest_frame_age_sec' izlenmelidir."
+        ),
+    )
     dnp3_direct_max_points_per_read: int = Field(
         default=24,
         ge=1,
