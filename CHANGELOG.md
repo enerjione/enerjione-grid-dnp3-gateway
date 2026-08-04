@@ -2,6 +2,41 @@
 
 Semver'a gore tutulur. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.4.0] - 2026-08-04
+
+400 cihazli olcumde bulunan iki SESSIZ sinir kapatildi. Hedef: 500 cihaz.
+
+### Fixed
+
+- **Dosya tanitici (fd) tavani — cihaz sayisinin gercek sinirlayicisi.**
+  Her DNP3 cihazi bir TCP soketi tutuyor; 400 cihazda 420 fd acikti. Docker
+  varsayilani 1024 -> ~950 cihazda mutlak duvar, ama pratik sinir cok daha
+  erken: baglanti flap'inde eski soket kapanmadan yenisi acilir ve fd gecici
+  olarak IKIYE katlanir. Limit dolunca hata "cihaz kopuk" gibi gorunur ve
+  gercek sebep hicbir sayacta yazmaz.
+
+  Compose sablonuna `ulimits.nofile = 65536` eklendi. MEVCUT kurulumlarin
+  compose dosyasina ELLE eklenmeli — sablon yalnizca yeni kurulumlari etkiler.
+
+- **DNP3 IO thread sayisi sabit 4 idi.** Kod icindeki yorum
+  `max(4, ceil(device_count_hint / 25))` heuristigini TARIF EDIYOR ama
+  UYGULAMIYORDU ("device_count_hint constructor'da bilinmiyor"). 400 cihazda
+  sonuc 100 CIHAZ/THREAD. Sikisma cihazi offline yapmaz; yalnizca DNP3
+  yanitini geciktirir ve veriyi bayatlatir — yani sessizce.
+
+  Ipucu artik `MAX_PARALLEL_DEVICES`ten geliyor (reader boot'ta, config
+  gelmeden kuruldugu icin gercek cihaz sayisi bilinemez). Hedef ~25
+  cihaz/thread, taban 4, tavan 32: 100->4, 300->12, 500->20, 1000->32.
+  `DNP3_MANAGER_THREADS` acikca set edilmisse operator karari korunur.
+
+### Docs
+
+- RUNBOOK "Tek gateway'e kac cihaz?" olculen rakamlarla yeniden yazildi
+  (400 cihaz: CPU %108, RAM 375 MiB, 6.349 sinyal/sn, sifir hata) +
+  sinirlayici tablosu. Simulator yukunun gercekciden 10-100 kat agir oldugu
+  notu eklendi: sahadaki SN2 bir ariza gostergesidir, 193 sinyalin cogu
+  sabittir ve delta-only yayin devrededir.
+
 ## [1.3.0] - 2026-08-04
 
 300 cihazli sahada olculen yayin darbogazi kaldirildi. Hedef 500 cihaz.
