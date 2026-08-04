@@ -88,6 +88,12 @@ def build_adapter(settings: Settings) -> TelemetryReader:
             manager_threads=settings.dnp3_manager_threads,
             time_sync=settings.dnp3_time_sync,
             publish_quality_flags=settings.dnp3_publish_quality_flags,
+            # DNP3 IO thread sayisi icin olcek ipucu. Reader boot'ta, config
+            # gelmeden once kuruldugu icin GERCEK cihaz sayisi burada bilinmez;
+            # `MAX_PARALLEL_DEVICES` operatorun bekledigi olcegi tasiyan en
+            # yakin degerdir. Sabit 4 thread 400 cihazda 100 cihaz/thread
+            # demekti (bkz. dnp3_yadnp3_master.__init__).
+            device_count_hint=settings.max_parallel_devices,
         )
 
     if library == "dnp3py":

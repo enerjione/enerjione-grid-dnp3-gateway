@@ -1395,6 +1395,7 @@ class Yadnp3TelemetryReader(TelemetryReader):
         manager_threads: int = 0,
         time_sync: str = "lan",
         publish_quality_flags: bool = False,
+        device_count_hint: int = 0,
     ) -> None:
         if not _YADNP3_AVAILABLE:
             raise Yadnp3AdapterError(
@@ -1408,15 +1409,24 @@ class Yadnp3TelemetryReader(TelemetryReader):
         # Kalite bayraklarinin YAYINA girmesi backend hazir olunca acilir
         # (bkz. docs/BACKEND_TODO.md#B1); bayraklar her durumda okunur.
         self._publish_dnp3_quality = bool(publish_quality_flags)
-        # DNP3Manager IO thread sayisi. Eski sabit 2 thread, 100 cihazli
-        # instance'ta thread doyumu yapiyordu (her cihazin TCP I/O +
-        # scheduler isi tek 2 thread'e diziliyordu). manager_threads=0
-        # verilirse heuristic: max(4, ceil(device_count_hint / 25))
-        # ama device_count_hint constructor'da bilinmiyor; minimum 4 alacagiz.
-        if manager_threads <= 0:
-            resolved_threads = 4
-        else:
+        # DNP3Manager IO thread sayisi.
+        #
+        # Bu heuristik yorumda TARIF EDILIYOR ama UYGULANMIYORDU: "device_count_hint
+        # constructor'da bilinmiyor" denip sabit 4 aliniyordu. Sonuc: 400 cihazli
+        # sahada 100 CIHAZ/THREAD (2026-08-04 olcumu). Her cihazin TCP I/O'su ve
+        # scheduler isi bu dort thread'e diziliyor; cihaz sayisi arttikca DNP3
+        # yaniti gecikir ve bu gecikme hicbir sayacta gorunmez (cihaz "online"
+        # kalir, yalnizca veri bayatlar).
+        #
+        # `device_count_hint` artik veriliyor: operatorun olcek beklentisini
+        # tasiyan `MAX_PARALLEL_DEVICES` ayarindan geliyor (bkz. adapters/factory).
+        # Hedef ~25 cihaz/thread; taban 4 (kucuk kurulum), tavan 32 (bu noktadan
+        # sonra thread eklemek context-switch maliyetinden baska sey getirmiyor).
+        if manager_threads > 0:
             resolved_threads = max(1, min(64, int(manager_threads)))
+        else:
+            ipucu = max(0, int(device_count_hint or 0))
+            resolved_threads = max(4, min(32, -(-ipucu // 25))) if ipucu else 4
         self._manager = opendnp3.DNP3Manager(resolved_threads)
         self._manager_threads = resolved_threads
         self._masters: dict[str, _ManagedMaster] = {}
