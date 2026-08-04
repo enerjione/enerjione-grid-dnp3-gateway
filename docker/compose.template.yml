@@ -24,6 +24,20 @@ services:
     image: {{IMAGE}}
     container_name: eg-gw-{{GATEWAY_CODE_LOWER}}
     restart: unless-stopped
+    # DOSYA TANITICI (fd) TAVANI — cihaz sayisinin GERCEK sinirlayicisi.
+    #
+    # Her DNP3 cihazi bir TCP soketi tutar; 400 cihazli olcumde 420 fd acikti
+    # (2026-08-04). Docker'in varsayilan soft limiti 1024 -> yaklasik 950-1000
+    # cihazda mutlak duvar, ama PRATIK sinir cok daha erken: baglanti flap'inde
+    # eski soket kapanmadan yenisi acilir ve fd gecici olarak ikiye katlanabilir.
+    #
+    # Limit dolunca hata "cihaz kopuk" gibi gorunur (soket acilamaz) ve gercek
+    # sebep hicbir sayacta yazmaz — teshisi en zor ariza tiplerinden biri.
+    # 65536 ile 500 cihaz hedefinde bol pay kalir.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     # Graceful shutdown penceresi. `docker stop` varsayilani 10sn'dir ve
     # gateway'in tipik kapanisi (<8sn) buna ANCAK sigar — pay yok.
     # Pencere yetmezse proses SIGKILL ile oldurulur ve in-flight bir CROB'un

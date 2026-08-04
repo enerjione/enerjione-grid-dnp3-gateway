@@ -710,13 +710,39 @@ Karistirilmasi kolay ve mudahaleyi tamamen yanlis yone cevirir:
 Gateway darbogazinda veri **gecikir**; backend darbogazinda veri **outbox'ta
 birikir**. Ikisinde de kayip yoktur — ama cozum yerleri tamamen farklidir.
 
-### Tek gateway'e kac cihaz?
+### Tek gateway'e kac cihaz? — OLCULDU
 
-Tasarim hedefi gateway basina **100-300**, saha basina 6 gateway. 300'u
-asmayin: `devices` listesi icin backend tarafinda 1000 sert tavan var ama
-pratik sinir cok daha once, worker havuzu ve WAN gecikmesinde gelir. Daha
-fazla cihaz varsa ikinci bir gateway acin (`new_gateway.ps1`) — cihazlari
-backend'de `gateway_code` ile bolusturun.
+400 cihazla olculdu (2026-08-04, v1.3.0, simulator yuku):
+
+| Olcum | Deger |
+| --- | --- |
+| Gateway CPU | %108 |
+| RAM | 375 MiB (~0.94 MiB/cihaz) |
+| Thread | 413 (~1/cihaz) |
+| Acik fd | 420 (~1/cihaz) |
+| Yayin | 6.349 sinyal/sn |
+| Outbox / hata | 0 / 0 |
+
+Olcekleme dogrusal: 300 -> 400 cihazda CPU %77 -> %108.
+
+**Desteklenen: 500 cihaz** (v1.3.0 hedefi). Sinirlayicilar sirayla:
+
+| Sinir | Deger | Not |
+| --- | --- | --- |
+| **fd (dosya tanitici)** | compose'da **65536** | Docker varsayilani 1024 idi -> ~950 cihazda duvar. Baglanti flap'inde fd gecici olarak IKIYE katlanir, o yuzden pratik sinir cok daha erkendi. Hata "cihaz kopuk" gibi gorunur, gercek sebep hicbir sayacta yazmaz. |
+| **DNP3 IO thread** | otomatik, ~25 cihaz/thread | 1.3.0 oncesi SABIT 4 idi (400 cihazda 100 cihaz/thread). `DNP3_MANAGER_THREADS` ile ezilebilir. |
+| CPU | ~%136 @500 (projeksiyon) | Host 14 cekirdekte sorun degil |
+| `devices` sert tavani | 1000 | Backend ayristiricisinda; asilirsa liste kirpilir |
+
+> **Simulator yuku GERCEKCIDEN AGIR.** Olcumde cihaz basina 15.9 sinyal/sn
+> yayinlandi. Sahadaki Horstmann SN2 bir ariza gostergesidir; 193 sinyalin
+> cogu sabittir ve delta-only yayin sayesinde gercek yuk 10-100 kat dusuktur.
+> Yani bu rakamlar guvenli taraftan.
+
+**500'un otesi olculmedi.** Daha fazla cihaz varsa ikinci bir gateway acin
+(`new_gateway.ps1`) — cihazlari backend'de `gateway_code` ile bolusturun.
+Her instance kendi outbox'i, kendi kilidi ve kendi prosesiyle calisir; bu
+ayni zamanda tek prosesin GIL tavanini da asmanin dogal yoludur.
 
 ## 7. Shutdown sırasi
 
