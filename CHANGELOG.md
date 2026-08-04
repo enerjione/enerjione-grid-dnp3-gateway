@@ -2,6 +2,22 @@
 
 Semver'a gore tutulur. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.2.0] - 2026-08-04
+
+Kapasite: tek gateway hedefi 500 cihaz (ekstra gateway kurmadan).
+
+### Changed
+
+- **`MAX_PARALLEL_DEVICES` varsayilani 100 -> 500, ust sinir 500 -> 1000.**
+  Havuz tembel buyudugu icin kucuk sahada ek maliyet yok; 500 cihazda cihaz
+  basina worker, kopuk cihaz dalgasinda tek timeout dalgasi demek. Compose
+  sablonu ve `.env.example` 500 set eder.
+- **`DEVICE_POLL_TIMEOUT_SEC` varsayilani 30 -> 15.** Kopuk cihaz worker'i
+  bu sure boyunca isgal ediyor; RUNBOOK ayar tablosundaki 300+ cihaz onerisi
+  varsayilan yapildi. Integrity poll'u 15sn'i asan yavas WAN sahasi env ile
+  yukseltebilir.
+- RUNBOOK "Olcek" bolumu 500 cihaz kademesiyle guncellendi.
+
 ## [1.1.0] - 2026-08-04
 
 Mimari karar: telemetrinin STANDART yolu dogrudan NATS JetStream.

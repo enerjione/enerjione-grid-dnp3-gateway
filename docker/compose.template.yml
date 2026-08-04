@@ -66,7 +66,7 @@ services:
       # Maliyet ~sifir: config istekleri ETag ile sartli (degismediyse 304).
       CONFIG_REFRESH_SEC: "30"
       DEFAULT_POLL_INTERVAL_SEC: "1"
-      MAX_PARALLEL_DEVICES: "100"
+      MAX_PARALLEL_DEVICES: "500"
       DNP3_LOCAL_ADDRESS: "1"
       DNP3_TCP_PORT: "20000"
       DNP3_EVENT_BASELINE_INTERVAL_SEC: "60"

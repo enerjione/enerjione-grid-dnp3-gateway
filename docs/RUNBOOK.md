@@ -661,9 +661,10 @@ counters, config_version, cycle metrics, **cihaz bazinda durum**) `/info` ve
 > istiyorsaniz `.env`'de `GATEWAY_REFRESH_TOKEN` set edin — aksi halde elinizde
 > yalnizca auth'suz `/health`'in kirpilmis ozeti kalir.
 
-## 6. Olcek — 20 cihazdan 300'e
+## 6. Olcek — 20 cihazdan 500'e
 
-Pilot (20 cihaz) ile hedef (gateway basina 100-300) arasindaki fark yalnizca
+Pilot (20 cihaz) ile hedef (gateway basina 500, 1.2.0+ varsayilan kapasite)
+arasindaki fark yalnizca
 sayi degil: darbogaz **worker havuzu** ve **WAN gecikmesi**dir. Asagidaki yol
 her adimda tek bir seyi degistirir, boylece bir sey bozulursa sebebi bellidir.
 
@@ -675,7 +676,8 @@ her adimda tek bir seyi degistirir, boylece bir sey bozulursa sebebi bellidir.
 | 2 | 50 | `metrics.seconds_since_last_cycle` | Poll araliginin 5 katini asiyorsa cycle yetismiyor |
 | 3 | 100 | `poll_pool_starved` log'u | Ciktiysa `MAX_PARALLEL_DEVICES` artir |
 | 4 | 200 | `outbox.outbox_pending` | Surekli artiyorsa backend ingest yetismiyor (gateway degil) |
-| 5 | 300 | `signals_outboxed_total` | Artiyorsa telemetri diske gidiyor — backend darbogazi |
+| 5 | 300 | `signals_outboxed_total` | Artiyorsa telemetri diske gidiyor — NATS/broker darbogazi |
+| 6 | 500 | `poll_pool_starved` + `metrics.seconds_since_last_cycle` | Cikiyorsa MAX_PARALLEL_DEVICES < cihaz sayisi veya kopuk cihaz dalgasi; DEVICE_POLL_TIMEOUT_SEC'i dusurun |
 
 Her adimda **en az bir tam poll araligi + 5 dakika** bekleyin. Gateway
 delta-only yayin yaptigi icin ilk dakikada trafik yuksek (integrity poll ile
@@ -683,11 +685,11 @@ tum degerler bir kez yayinlanir), sonra normale duser — erken karar vermeyin.
 
 ### Ayar tablosu
 
-| Ayar | Varsayilan | 300 cihaz onerisi | Neden |
+| Ayar | Varsayilan (1.2.0+) | 500 cihaz | Neden |
 | --- | --- | --- | --- |
-| `MAX_PARALLEL_DEVICES` | 100 | 150 | Kopuk cihazlar timeout suresince worker isgal eder; hedef cihaz sayisinin yarisi guvenli bir taban |
-| `DEFAULT_POLL_INTERVAL_SEC` | 1 | 2 | Cihazlar zaten event-driven yayin yapiyor; siklik CPU'ya mal olur, veriye degil |
-| `DEVICE_POLL_TIMEOUT_SEC` | 30 | 15 | Kopuk cihazin worker'i yarim surede birakmasi havuzu saglikli cihazlara acar |
+| `MAX_PARALLEL_DEVICES` | 500 | 500 | Havuz tembel buyur; cihaz basina worker = kopuk cihaz dalgasinda tek timeout dalgasi. `poll_pool_starved` cikarsa cihaz sayisinin altinda kalmis demektir |
+| `DEFAULT_POLL_INTERVAL_SEC` | 1 | 1-2 | Cihazlar zaten event-driven yayin yapiyor; siklik CPU'ya mal olur, veriye degil |
+| `DEVICE_POLL_TIMEOUT_SEC` | 15 | 15 | Kopuk cihazin worker'i yarim surede birakmasi havuzu saglikli cihazlara acar (1.2.0'da varsayilan oldu; yavas WAN sahasi env ile yukseltir) |
 | `CYCLE_TIMEOUT_SEC` | 120 | 120 | Degistirmeyin; asilmasi zaten bir ariza isaretidir |
 
 > **Once olcun, sonra degistirin.** Bu degerler baslangic noktasi; gercek

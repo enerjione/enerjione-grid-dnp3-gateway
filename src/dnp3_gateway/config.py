@@ -350,15 +350,23 @@ class Settings(BaseSettings):
     # mod cihazda yeni veri yoksa adapter'dan "no_change" dönuyor (publish
     # olmuyor).
     default_poll_interval_sec: int = Field(default=1, ge=1, le=3600)
-    # Paralelizm: bir cycle'da kac cihaz aynı anda okunur. 100 cihaz/gateway
-    # senaryosunda 25 yetersiz; tek cycle'da 100 cihaz paralel okuma yapilirsa
-    # her cihazin yanit suresi <100ms oldugu icin cycle 1sn altinda biter.
-    max_parallel_devices: int = Field(default=100, ge=1, le=500)
+    # Paralelizm: bir cycle'da kac cihaz aynı anda okunur. Hedef kapasite tek
+    # gateway'de 500 cihaz (1.2.0+): 500 paralel worker ile her cihazin yanit
+    # suresi <100ms oldugu icin cycle 1sn altinda biter ve kopuk cihaz
+    # dalgasinda bile tek timeout dalgasi yasanir (worst case ~15sn, bkz.
+    # device_poll_timeout_sec). Havuz tembel buyur (ThreadPoolExecutor
+    # max_workers tavandir, thread ihtiyac olunca acilir) — kucuk sahada 500
+    # varsayilanin maliyeti yok. RUNBOOK "Olcek" bolumundeki kademeli cikis
+    # ve `poll_pool_starved` sinyali gecerliligini korur.
+    max_parallel_devices: int = Field(default=500, ge=1, le=1000)
     # Tek bir cihaz okuma + publish icin maksimum sure (sn). Bu sureyi asarsa
     # cihaz "timeout" kabul edilir, mark_read cagirilir, diger cihazlar
-    # etkilenmez. 100+ cihazda 1-2 hangat olan cihaz tum cycle'i bloke etmesin.
+    # etkilenmez. Kopuk cihaz worker'i bu sure boyunca isgal eder; 300+
+    # cihazda 30sn havuzu ac birakiyordu (RUNBOOK ayar tablosundaki 15sn
+    # onerisi 1.2.0'da varsayilan yapildi). WAN'da integrity poll'u 15sn'i
+    # asan saha varsa env ile yukseltilebilir.
     device_poll_timeout_sec: float = Field(
-        default=30.0,
+        default=15.0,
         ge=1.0,
         le=600.0,
         description="Tek cihaz icin poll+publish maksimum sure (sn)",
