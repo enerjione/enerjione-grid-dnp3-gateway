@@ -6,7 +6,8 @@ Calisma akisi:
        konfigurasyon ceker ve `GatewayState`'i gunceller.
     3. Ana thread `default_poll_interval_sec` araliginda uyanip okunma vakti
        gelen cihazlari `poller.run_poll_cycle` ile okur/yayinlar.
-       Telemetri backend HTTP ingest'e yollanir (varsayilan publisher).
+       Telemetri dogrudan NATS JetStream'e basilir (standart publisher);
+       HTTP ingest yalnizca TELEMETRY_PUBLISHER=http ile rollback yoludur.
     4. SIGINT/SIGTERM/SIGBREAK alindiginda graceful shutdown:
          - config refresh thread durdurulur
          - poller kapanir
@@ -764,7 +765,7 @@ def run(current_settings: Settings | None = None) -> int:
     _print_console_banner(cfg=cfg, identity=identity, actual_health_port=actual_health_port)
 
     if cfg.telemetry_publisher == "nats":
-        # Legacy/rollback publisher: NATS JetStream.
+        # STANDART publisher: NATS JetStream — telemetri backend'e ugramaz.
         from dnp3_gateway.messaging.jetstream_publisher import JetStreamPublisher
 
         broker = JetStreamPublisher.create(
@@ -783,7 +784,8 @@ def run(current_settings: Settings | None = None) -> int:
             )
             raise SystemExit(1)
     else:
-        # Varsayilan publisher: backend HTTP ingest. NAT arkasinda outbound HTTPS yeterli.
+        # Rollback publisher: backend HTTP ingest (TELEMETRY_PUBLISHER=http ile
+        # bilincli secim). Her olcum backend + Postgres outbox'tan gecer.
         from dnp3_gateway.messaging.http_publisher import HttpTelemetryPublisher
 
         broker = HttpTelemetryPublisher(

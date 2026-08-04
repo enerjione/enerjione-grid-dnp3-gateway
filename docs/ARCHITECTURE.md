@@ -50,8 +50,9 @@ NAT/GSM arkasindadir; iceri dogru acilmis tek bir port yoktur.
                                +--------------+
 ```
 
-`TELEMETRY_PUBLISHER=nats` ile eski JetStream yolu hala secilebilir
-(rollback); varsayilan ve desteklenen yol HTTP'dir.
+Varsayilan ve STANDART yol NATS JetStream'dir (1.1.0+); telemetri
+backend'e ugramaz. `TELEMETRY_PUBLISHER=http` ile backend HTTP ingest'e
+rollback mumkundur (yuk backend'e biner, yalnizca bilincli geri donus).
 
 ## Veri akisi (basarili publish)
 

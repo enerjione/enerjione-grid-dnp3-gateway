@@ -25,8 +25,9 @@ def test_settings_defaults_are_sensible() -> None:
     # Default FALSE — public host'a clear-text HTTP/nats:// validator
     # tarafindan reddedilir; bilincli opt-out gerekir.
     assert s.gateway_insecure_allow_plaintext is False
-    # Varsayilan telemetri yolu: backend HTTP ingest. NATS legacy rollback.
-    assert s.telemetry_publisher == "http"
+    # Varsayilan telemetri yolu: NATS JetStream (STANDART) — telemetri
+    # backend'e ugramaz. HTTP ingest yalnizca bilincli rollback.
+    assert s.telemetry_publisher == "nats"
     assert s.nats_publish_timeout_sec == pytest.approx(2.0)
 
 
@@ -111,13 +112,28 @@ def test_prod_allows_public_http_when_insecure_opt_in(
     assert s.gateway_insecure_allow_plaintext is True
 
 
-def test_prod_http_publisher_ignores_nats_url(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Default HTTP publisher icin NATS_URL rollback ayari validate edilmez."""
+def test_prod_default_nats_publisher(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Production'da hicbir sey set edilmezse STANDART yol NATS'tir.
+
+    Private/compose-ici host'a nats:// kabul (tls zorunlulugu yalnizca
+    public host icin)."""
     monkeypatch.setenv("APP_ENVIRONMENT", "production")
+    monkeypatch.setenv("GATEWAY_MODE", "dnp3")  # prod'da mock yasak
+    monkeypatch.setenv("GATEWAY_TOKEN", _strong_token())
+    monkeypatch.setenv("BACKEND_API_URL", "https://api.example.com/api/v1")
+    monkeypatch.setenv("NATS_URL", "nats://192.168.1.10:4222")
+    s = Settings(_env_file=None)  # type: ignore[call-arg]
+    assert s.telemetry_publisher == "nats"
+
+
+def test_prod_http_rollback_ignores_nats_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bilincli HTTP rollback'te NATS_URL validate edilmez."""
+    monkeypatch.setenv("APP_ENVIRONMENT", "production")
+    monkeypatch.setenv("TELEMETRY_PUBLISHER", "http")
     monkeypatch.setenv("GATEWAY_MODE", "dnp3")  # prod\'da mock yasak
     monkeypatch.setenv("GATEWAY_TOKEN", _strong_token())
     monkeypatch.setenv("BACKEND_API_URL", "https://api.example.com/api/v1")
-    monkeypatch.setenv("NATS_URL", "nats://nats.example.com:4222")
+    monkeypatch.setenv("NATS_URL", "bozuk-url")
     s = Settings(_env_file=None)  # type: ignore[call-arg]
     assert s.telemetry_publisher == "http"
 

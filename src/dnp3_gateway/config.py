@@ -205,18 +205,22 @@ class Settings(BaseSettings):
     )
 
     # ----- Telemetri yayinlama -----------------------------------------------
-    # Varsayilan yol: backend HTTP ingest (`/telemetry/gateway/{code}`). Gateway
-    # NAT arkasinda kalsa bile outbound HTTPS yeterli olur. JetStream yolu legacy
-    # rollback icin tutulur; `TELEMETRY_PUBLISHER=nats` set edilirse kullanilir.
+    # STANDART yol: NATS JetStream (`<prefix>.<gateway_code>` subject'i).
+    # Telemetri backend'e HIC ugramaz — HTTP ingest yolunda her olcum backend
+    # HTTP + Postgres outbox + NATS zincirinden geciyordu ve yuk backend'e
+    # biniyordu (2026-08-04 yuk testi: outbox drain 3.250 msj/sn'e karsi
+    # persist 1.100 msj/sn — backlog kendiliginden erimiyordu). HTTP ingest
+    # yalnizca bilincli rollback icin tutulur: `TELEMETRY_PUBLISHER=http`.
+    # Komut/config kanali bundan bagimsizdir, HTTP uzerinden calismaya devam
+    # eder.
     telemetry_publisher: str = Field(
-        default="http",
-        description="Telemetri yayin yolu: http (backend ingest) | nats (JetStream legacy)",
+        default="nats",
+        description="Telemetri yayin yolu: nats (JetStream, STANDART) | http (backend ingest, rollback)",
     )
 
-    # ----- NATS JetStream (LEGACY/ROLLBACK) -----------------------------------
-    # HTTP publish down olunca: publish hatasi -> outbox'a yazilir -> retrier
-    # backend gelince bosaltir. NATS yolu sadece TELEMETRY_PUBLISHER=nats ise
-    # kullanilir.
+    # ----- NATS JetStream (STANDART TELEMETRI YOLU) ---------------------------
+    # Publish down olunca: publish hatasi -> outbox'a yazilir -> retrier broker
+    # gelince bosaltir (at-least-once, kayip yok).
     nats_url: str = Field(
         default="nats://localhost:4222",
         description=(

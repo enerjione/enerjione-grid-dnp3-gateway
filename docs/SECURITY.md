@@ -113,10 +113,10 @@ ham hata metni `input_value={...}` kuyrugunda **tum ayar sozlugunu**
 `docker logs` ciktisina duserdi. Kuyruk kirpilir, proses `EX_CONFIG` (78) ile
 cikar. `tests/test_production_blockers.py` bu davranisi kilitler.
 
-## NATS auth ve TLS (legacy — `TELEMETRY_PUBLISHER=nats`)
+## NATS auth ve TLS (STANDART yol — `TELEMETRY_PUBLISHER=nats`)
 
-> 0.5.x'te varsayilan telemetri yolu **backend HTTP ingest**'tir. Bu bolum
-> yalnizca rollback icin NATS'a donuldugunde gecerlidir.
+> 1.1.0+ itibariyla varsayilan telemetri yolu NATS JetStream'dir; bu bolum
+> her kurulum icin gecerlidir. HTTP ingest yalnizca bilincli rollback'tir.
 
 Production'da NATS server **deny-all default** + per-user subject ACL ile
 kurulur. Her gateway icin ayri NKEY/JWT credentials:

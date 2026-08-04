@@ -39,16 +39,13 @@ services:
       GATEWAY_MODE: "dnp3"
       BACKEND_API_URL: "{{BACKEND_API_URL}}"
       BACKEND_API_VERIFY_SSL: "true"
-      # TELEMETRI YOLU: varsayilan `http` — telemetri BACKEND_API_URL'e
-      # POST /telemetry/gateway/{code} ile gider. NAT arkasindaki saha
-      # gateway'i icin outbound HTTPS yeterlidir.
-      #
-      # Bu satir EKSIKTI ve yanilticiydi: sablon NATS_URL'i set edip yorumda
-      # "gateway'in tek telemetri yayinlama yolu" diyordu, ama kod varsayilani
-      # HTTP oldugu icin render edilen container NATS'i TAMAMEN yok sayiyordu.
-      # Telemetri gelmediginde ekip saatlerce NATS'ta ariza ariyordu.
-      TELEMETRY_PUBLISHER: "http"
-      # NATS yalnizca TELEMETRY_PUBLISHER=nats ile (legacy/rollback) kullanilir.
+      # TELEMETRI YOLU: STANDART `nats` — telemetri dogrudan JetStream'e
+      # basilir (subject: e1.telemetry.raw.<code>), backend'e HIC ugramaz.
+      # HTTP ingest yalnizca bilincli rollback icindir (`http`): o yolda her
+      # olcum backend HTTP + Postgres outbox zincirinden gecer ve yuk
+      # backend'e biner (2026-08-04 yuk testinde olculdu). Komut/config
+      # kanali bundan bagimsiz, HTTP uzerinden calisir.
+      TELEMETRY_PUBLISHER: "nats"
       NATS_URL: "{{NATS_URL}}"
       NATS_SUBJECT_PREFIX: "e1.telemetry.raw"
       # WORKER_HEALTH_HOST=0.0.0.0: Container icinde butun interface'lere bind.

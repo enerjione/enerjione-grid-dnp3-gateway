@@ -6,13 +6,13 @@
 
 EnerjiOne Grid platformunun **saha gateway** servisidir. DNP3 protokolu uzerinden
 saha outstation cihazlarini master rolunde poll eder, okudugu sinyalleri
-normalize eder ve **backend HTTP ingest** ile cati backend'inin tag-engine
-servisine iletir. NAT arkasindaki saha gateway'i icin outbound HTTPS yeterlidir.
+normalize eder ve **dogrudan NATS JetStream'e** yayinlar
+(`e1.telemetry.raw.<code>`); telemetri backend'e ugramaz.
 
-> NATS JetStream legacy/rollback yolu olarak durur; `TELEMETRY_PUBLISHER=nats`
-> ile acilir. **Varsayilan `http`'dir** — dokuman ve compose sablonu eskiden
-> NATS'i tek yol gibi anlatiyordu ve telemetri gelmediginde ekip yanlis yerde
-> ariza ariyordu.
+> **Varsayilan `nats`'tir (1.1.0+).** Backend HTTP ingest yolu yalnizca
+> bilincli rollback icin durur (`TELEMETRY_PUBLISHER=http`): o yolda her
+> olcum backend HTTP + Postgres outbox zincirinden gecer ve yuk backend'e
+> biner (2026-08-04 yuk testinde olculdu). Komut/config kanali HTTP'de kalir.
 
 ```
 +-------------------+         +----------------------+  HTTPS  +------------------+

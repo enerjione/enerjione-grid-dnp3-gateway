@@ -308,10 +308,12 @@ kayit ac.
 
 ### Telemetri gitmiyor / outbox dolmaya basladi
 
-> **ONCE SUNU KONTROL EDIN:** telemetri varsayilan olarak **backend HTTP
-> ingest**'e gider (`TELEMETRY_PUBLISHER=http`), NATS'a DEGIL. NATS yalnizca
-> `TELEMETRY_PUBLISHER=nats` ile devreye girer. Eski dokumanlar NATS'i tek yol
-> gibi anlatiyordu ve ekipler saatlerce yanlis yerde ariza ariyordu.
+> **ONCE SUNU KONTROL EDIN:** 1.1.0+ itibariyla telemetri varsayilan olarak
+> **dogrudan NATS JetStream'e** gider (`TELEMETRY_PUBLISHER=nats`).
+> `TELEMETRY_PUBLISHER=http` set edilmisse rollback yolundasiniz: telemetri
+> backend HTTP ingest'e gider ve yuk backend'e biner. Once hangi yolda
+> oldugunuzu `dnp3_gateway_starting ... publisher=...` log satirindan teyit
+> edin.
 
 ```
 publish_batch_failed_outboxed count=175 error=... consecutive=1

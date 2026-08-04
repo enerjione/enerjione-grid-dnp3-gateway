@@ -2,6 +2,30 @@
 
 Semver'a gore tutulur. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.0] - 2026-08-04
+
+Mimari karar: telemetrinin STANDART yolu dogrudan NATS JetStream.
+
+### Changed
+
+- **`TELEMETRY_PUBLISHER` varsayilani `http` -> `nats`.** Telemetri artik
+  backend'e ugramadan `e1.telemetry.raw.<code>` subject'ine basilir. HTTP
+  ingest yolu kaldirilmadi; yalnizca bilincli rollback icin durur
+  (`TELEMETRY_PUBLISHER=http`). Komut/config kanali HTTP'de kalir.
+
+  Gerekce (2026-08-04, 100 cihazlik yuk testi): HTTP yolunda her olcum
+  backend HTTP ingest -> Postgres outbox -> NATS zincirinden geciyordu.
+  Backend outbox drain'i 3.250 msj/sn basarken persist 1.100 msj/sn
+  isleyebildi; 5M+ mesajlik backlog olustu, cihaz durum gecisleri (comm_lost)
+  telemetri kuyrugunun arkasinda saatlerce gorunmez kaldi ve gateway outbox'i
+  500K tavaninda olcum dusurdu. NATS-direkt yolda backend yalnizca tuketici.
+
+  Grid tarafi v2.40.0 bununla uyumlu: panel "Guncelle" akisi gateway
+  compose'unu guncel NATS URL'i ile tazeler; HTTP yedek yolundan telemetri
+  basan gateway icin backend rate-limit'li uyari loglar.
+- Compose sablonu ve `.env.example` `TELEMETRY_PUBLISHER: "nats"` set eder;
+  README/ARCHITECTURE/RUNBOOK/SECURITY "legacy NATS" etiketleri kaldirildi.
+
 ## [1.0.2] - 2026-08-03
 
 Saha arizasinin ortaya cikardigi iki gorunurluk/dayaniklilik eksigi.
