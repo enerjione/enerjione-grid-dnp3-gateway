@@ -2,6 +2,43 @@
 
 Semver'a gore tutulur. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.5.0] - 2026-08-04
+
+401 cihazli sahada olculen CPU yukunun kaynagi bulundu ve ayarlanabilir hale
+getirildi. **Varsayilan davranis DEGISMEDI.**
+
+### Added
+
+- **`DNP3_EVENT_SCAN_INTERVAL_SEC`** — Class 1/2/3 event scan araligi artik
+  poll araligindan AYRI ayarlanabiliyor. Varsayilan 0 = poll interval ile
+  ayni (eski davranis; mevcut kurulumlar etkilenmez).
+
+  NEDEN: `scan_interval_sec` dogrudan `default_poll_interval_sec`e
+  baglanmisti, ama bunlar farkli isler — poll interval YAYIN turu, scan
+  interval cihaza SORMA sikligidir. 401 cihazda `scan=1s` saniyede 401 DNP3
+  istegi uretiyordu; her istek TCP round-trip + cerceve cozumleme +
+  C++->Python callback zinciri demek.
+
+  Bu, CPU'nun cihaz sayisiyla (mesaj sayisiyla DEGIL) artmasini acikliyor:
+  300 cihaz %77.2 / 400 cihaz %108.6 CPU iken yayin yalnizca +%17 artmisti.
+
+  Once yayin yolundan supheledim, OLCUM CURUTTU: json.dumps 3.5 us/mesaj
+  (6500 msj/sn icin %2.3), payload kurma 4.6 us (%3.0) — serilestirme toplam
+  ~%5. `orjson` eklemek ise yaramazdi.
+
+  Cihazlar unsolicited modda calistigi icin (disableUnsolOnStartup=False)
+  scan yalnizca yedek mekanizmadir; 3-5 sn tipik olarak veri tazeligini
+  bozmadan yuku belirgin dusurur. Kazanc SAHADA OLCULMELI — bu yuzden
+  varsayilan degistirilmedi.
+
+### Fixed
+
+- **Log iki yerde yaniltiyordu.** `manager_threads=auto` yaziyordu;
+  heuristigin GERCEKTE kac thread sectigi hicbir yerde gorunmuyordu ve
+  operator olcegi buyuturken ayarin tuttugunu dogrulayamiyordu. Artik
+  `io_threads=20` gibi gercek deger yaziliyor (yeni `io_thread_count`).
+  `scan=` alani da poll interval yerine etkin degeri ve kaynagini gosteriyor.
+
 ## [1.4.0] - 2026-08-04
 
 400 cihazli olcumde bulunan iki SESSIZ sinir kapatildi. Hedef: 500 cihaz.
