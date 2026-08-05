@@ -76,6 +76,15 @@ def _print_console_banner(
     # Kurulumda "gateway backend'e ulasiyor mu" sorusunun ilk adresi budur;
     # operator bunu dogrudan curl'leyebilsin diye banner'da gosteriyoruz.
     print(f"  config   {config_url}", flush=True)
+    # Telemetri hangi yoldan gidiyor — kurulumun ilk dogrulama noktasi.
+    # "Yerel kurulum yaptim ama neden yavas?" sorusunun cevabi cogu zaman
+    # burada gizliydi; artik banner'da acikca yaziyor.
+    if cfg.telemetry_publisher != "nats":
+        print("  telemetri  HTTP ingest (TELEMETRY_PUBLISHER=http, rollback yolu)", flush=True)
+    elif cfg.install_mode == "local":
+        print("  telemetri  NATS (yerel kurulum — HTTP yedegi YOK)", flush=True)
+    else:
+        print("  telemetri  NATS (uzak kurulum — erisilemezse HTTP yedegi devreye girer)", flush=True)
     if cfg.is_mock_mode:
         print("  UYARI: GATEWAY_MODE=mock — sahadan okuma YOK, degerler ureticidir.", flush=True)
     print("", flush=True)
@@ -559,6 +568,83 @@ def _tls_verify_param(cfg: Settings) -> bool | str:
     return cfg.backend_api_verify_ssl
 
 
+def _build_http_broker(cfg: Settings, identity: GatewayIdentity) -> Any:
+    from dnp3_gateway.messaging.http_publisher import HttpTelemetryPublisher
+
+    return HttpTelemetryPublisher(
+        base_url=cfg.backend_api_url,
+        identity=identity,
+        timeout_sec=cfg.config_timeout_sec,
+        verify=_tls_verify_param(cfg),
+    )
+
+
+def _build_telemetry_broker(cfg: Settings, identity: GatewayIdentity) -> Any:
+    """Kurulum moduna gore telemetri tasima yolunu kurar.
+
+    Uc olasi sonuc:
+      * TELEMETRY_PUBLISHER=http  -> yalnizca HTTP (bilincli rollback).
+      * INSTALL_MODE=local        -> yalnizca NATS. Yedek yol YOK; NATS
+        erisilemezse mesajlar outbox'ta birikir ve /health acikca sikayet
+        eder. Sessiz HTTP'ye dusus, ayni makinedeki bir yapilandirma
+        hatasini gizleyip performans hedefini kaybettirir.
+      * INSTALL_MODE=remote       -> NATS birincil + HTTP yedek. Yedege
+        dusus ve geri donus `TelemetryTransportRouter` tarafindan yonetilir.
+    """
+    if cfg.telemetry_publisher != "nats":
+        # Rollback yolu: backend HTTP ingest. Her olcum backend + Postgres
+        # outbox zincirinden gecer; yalnizca bilincli secimle kullanilir.
+        logger.warning(
+            "telemetry_transport_selected mode=%s active=http fallback=yok — "
+            "TELEMETRY_PUBLISHER=http ile ROLLBACK yolu secildi; telemetri "
+            "backend HTTP ingest uzerinden gidecek (NATS kullanilmiyor).",
+            cfg.install_mode,
+        )
+        return _build_http_broker(cfg, identity)
+
+    from dnp3_gateway.messaging.jetstream_publisher import JetStreamPublisher
+
+    nats_broker = JetStreamPublisher.create(
+        url=cfg.nats_url,
+        subject_prefix=cfg.nats_subject_prefix,
+        gateway_code=identity.gateway_code,
+        connect_timeout_sec=cfg.nats_connect_timeout_sec,
+        publish_timeout_sec=cfg.nats_publish_timeout_sec,
+        tls_ca_path=cfg.nats_tls_ca_path,
+        credentials_path=cfg.nats_credentials_path,
+    )
+    if nats_broker is None:
+        logger.error(
+            "jetstream_publisher_create_failed — nats-py paketi yuklu degil. "
+            "Gateway baslamiyor. requirements.txt + pip install -r"
+        )
+        raise SystemExit(1)
+
+    from dnp3_gateway.messaging.transport_router import TelemetryTransportRouter
+
+    yerel = cfg.install_mode == "local"
+    http_broker = None if yerel else _build_http_broker(cfg, identity)
+    router = TelemetryTransportRouter(
+        nats_broker=nats_broker,
+        http_broker=http_broker,
+        install_mode=cfg.install_mode,
+        fail_threshold=cfg.telemetry_fallback_fail_threshold,
+        probe_interval_sec=cfg.telemetry_fallback_probe_interval_sec,
+    )
+    # Boot'ta aktif yol ve yedek politikasi TEK satirda gorunur olmali —
+    # "su an veri hangi yoldan gidiyor?" sorusunun log'daki ilk cevabi budur.
+    logger.info(
+        "telemetry_transport_selected install_mode=%s active=%s fallback=%s "
+        "nats_subject=%s backend_ingest=%s",
+        cfg.install_mode,
+        router.active_transport,
+        "http" if router.fallback_enabled else "yok (yerel kurulumda NATS zorunlu)",
+        getattr(nats_broker, "subject", "?"),
+        cfg.backend_api_url if router.fallback_enabled else "-",
+    )
+    return router
+
+
 def run(current_settings: Settings | None = None) -> int:
     # `get_settings()` LAZY: import aninda degil, burada kurulur. Uretim
     # yolunda __main__ zaten kendi Settings'ini gecirir.
@@ -615,13 +701,15 @@ def run(current_settings: Settings | None = None) -> int:
             flush=True,
         )
     logger.info(
-        "dnp3_gateway_starting version=%s gateway=%s instance=%s env=%s mode=%s publisher=%s backend=%s",
+        "dnp3_gateway_starting version=%s gateway=%s instance=%s env=%s mode=%s "
+        "publisher=%s install_mode=%s backend=%s",
         __version__,
         identity.gateway_code,
         identity.instance_id,
         identity.app_environment,
         cfg.gateway_mode,
         cfg.telemetry_publisher,
+        cfg.install_mode,
         cfg.backend_api_url,
     )
     # Deprecation uyarisi: nats_dual_publish_enabled artik anlamsiz (JetStream
@@ -764,36 +852,7 @@ def run(current_settings: Settings | None = None) -> int:
     # health_server start sonrasi yazdirilir.
     _print_console_banner(cfg=cfg, identity=identity, actual_health_port=actual_health_port)
 
-    if cfg.telemetry_publisher == "nats":
-        # STANDART publisher: NATS JetStream — telemetri backend'e ugramaz.
-        from dnp3_gateway.messaging.jetstream_publisher import JetStreamPublisher
-
-        broker = JetStreamPublisher.create(
-            url=cfg.nats_url,
-            subject_prefix=cfg.nats_subject_prefix,
-            gateway_code=identity.gateway_code,
-            connect_timeout_sec=cfg.nats_connect_timeout_sec,
-            publish_timeout_sec=cfg.nats_publish_timeout_sec,
-            tls_ca_path=cfg.nats_tls_ca_path,
-            credentials_path=cfg.nats_credentials_path,
-        )
-        if broker is None:
-            logger.error(
-                "jetstream_publisher_create_failed — nats-py paketi yuklu degil. "
-                "Gateway baslamiyor. requirements.txt + pip install -r"
-            )
-            raise SystemExit(1)
-    else:
-        # Rollback publisher: backend HTTP ingest (TELEMETRY_PUBLISHER=http ile
-        # bilincli secim). Her olcum backend + Postgres outbox'tan gecer.
-        from dnp3_gateway.messaging.http_publisher import HttpTelemetryPublisher
-
-        broker = HttpTelemetryPublisher(
-            base_url=cfg.backend_api_url,
-            identity=identity,
-            timeout_sec=cfg.config_timeout_sec,
-            verify=_tls_verify_param(cfg),
-        )
+    broker = _build_telemetry_broker(cfg, identity)
 
     # Outbox: broker'a yayinlanmamis mesajlari diske yazar,
     # retrier sonra gonderir. Process restart'a dayanikli (kalici SQLite);

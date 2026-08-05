@@ -392,6 +392,11 @@ def _outbox_snapshot(publisher: Any) -> dict[str, Any]:
         "broker_ready": None,
         "broker_publish_failures": None,
         "broker_publish_successes": None,
+        # Aktif tasima yolu. Sahada en pahali sorulardan biri "su an veri
+        # hangi yoldan gidiyor?" idi ve log'a bakmadan cevaplanamiyordu;
+        # yanlis yoldan (HTTP yedegi) akan bir sistem "calisiyor" gorunup
+        # performans hedefini sessizce kaybediyordu.
+        "telemetry_transport": None,
     }
     if publisher is None:
         return snap
@@ -432,6 +437,15 @@ def _outbox_snapshot(publisher: Any) -> dict[str, Any]:
                     counters = counters_fn()
                     snap["broker_publish_failures"] = int(counters.get("publish_failures", 0))
                     snap["broker_publish_successes"] = int(counters.get("publish_successes", 0))
+                except Exception:  # noqa: BLE001
+                    pass
+            # TelemetryTransportRouter varsa aktif yolu da rapor et. Router
+            # yoksa (dogrudan tek publisher) alan None kalir — eski
+            # kurulumlarla uyumlu.
+            transport_fn = getattr(broker, "transport_status", None)
+            if callable(transport_fn):
+                try:
+                    snap["telemetry_transport"] = dict(transport_fn())
                 except Exception:  # noqa: BLE001
                     pass
     except Exception:  # noqa: BLE001
@@ -995,6 +1009,16 @@ def _build_health_body(
     # Gateway<->backend haberlesmesi kopar kopmaz gorunmeli.
     if outbox_snap.get("broker_ready") is False:
         issues.append("telemetry_backend_unreachable")
+        severity_score = max(severity_score, 1)
+
+    # --- Yedek tasima yoluna dusus ----------------------------------------
+    # Uzak kurulumda HTTP yedegi BEKLENEN davranistir; veri akmaya devam
+    # ettigi icin "unhealthy" degil. Ama sessiz de kalmamali: NATS yolu
+    # kapaliyken sistem calisir gorunur, olculen throughput ise kat kat
+    # dusuktur. Operator bunu panelde gormeli ki NATS erisimini duzeltsin.
+    transport = outbox_snap.get("telemetry_transport") or {}
+    if transport.get("active_transport") == "http" and transport.get("fallback_enabled"):
+        issues.append("telemetry_transport_fallback_http")
         severity_score = max(severity_score, 1)
 
     if outbox_snap.get("outbox_full"):

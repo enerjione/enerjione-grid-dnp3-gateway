@@ -2,6 +2,83 @@
 
 Semver'a gore tutulur. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.0] - 2026-08-05
+
+Telemetri tasima yolu artik KURULUM SENARYOSUNA gore davraniyor ve aktif yol
+her zaman gorunur. **Varsayilan davranis mevcut kurulumlarda DEGISMEDI**
+(`INSTALL_MODE` varsayilani `remote`; NATS calisirken hicbir sey degismez).
+
+### Added
+
+- **`INSTALL_MODE` (`local` | `remote`, varsayilan `remote`)** — NATS
+  erisilemedigi zaman ne olacagini belirler.
+
+  - `local` ("bu cihaza kur", backend ile ayni makine): **NATS ZORUNLU,
+    HTTP yedegi YOK.** Ayni makinede NATS'a erisilememesi bir yapilandirma
+    hatasidir; sessizce HTTP'ye dusmek bu hatayi GIZLER. Sistem "calisiyor"
+    gorunur, panelde veri akar, ama her olcum backend HTTP + Postgres
+    zincirinden gecer ve 500 cihaz hedefi tutmaz — ariza ancak yuk testinde,
+    haftalar sonra fark edilir. Bu modda NATS dustugunde mesajlar outbox'ta
+    birikir (kayip yok) ve `/health` acikca `telemetry_backend_unreachable`
+    der.
+  - `remote` ("baska cihaza kur", saha sunucusu): once NATS denenir,
+    erisilemezse **HTTP ingest ile veri akmaya DEVAM eder**. Sahada 4222
+    kapali/NAT arkasinda olabilir. NATS geri gelince birincil yola
+    **kendiliginden donulur** — HTTP'de kalici takilma yok.
+
+- **`TelemetryTransportRouter`** (`messaging/transport_router.py`) —
+  `ResilientPublisher` ile gercek publisher'lar arasina giren broker
+  cephesi. Bu konumlandirma iki seyi ayni anda saglar:
+  - **fallback'te kayip yok**: NATS'a yazilamayan mesaj AYNI CAGRIDA HTTP'ye
+    verilir; iki yol da coktugunde istisna yayilir ve mesaj outbox'a yazilir,
+  - **outbox drenaji da yedek yolu kullanir**: retrier ayni router'dan gectigi
+    icin NATS uzun sure kapali kalsa bile birikmis tampon HTTP'den bosalir.
+
+- **Aktif tasima yolu `/health` govdesinde**: `outbox.telemetry_transport`
+  altinda `active_transport`, `install_mode`, `fallback_enabled`,
+  `transport_switches`, `fallback_delivered_total`, `nats_ready`,
+  `http_ready`. Sahada en pahali sorulardan biri "su an veri hangi yoldan
+  gidiyor?" idi ve log'a bakmadan cevaplanamiyordu.
+
+- **`telemetry_transport_fallback_http` health sorunu** (degraded) — uzak
+  kurulumda HTTP yedegine dusulunce panelde gorunur. Veri aktigi icin
+  "unhealthy" degil, ama sessiz de kalmamali.
+
+- **`TELEMETRY_FALLBACK_FAIL_THRESHOLD`** (varsayilan 3) ve
+  **`TELEMETRY_FALLBACK_PROBE_INTERVAL_SEC`** (varsayilan 30) ayarlari.
+
+- **Boot log + konsol banner'inda aktif yol**:
+  `telemetry_transport_selected install_mode=... active=... fallback=...`
+  ve `dnp3_gateway_starting ... install_mode=...`.
+
+### Changed
+
+- **Yol degisimi OLAY uretir, denemeler sessizdir.** Her basarisiz NATS
+  denemesini loglamak 500 cihazli sahada saniyede binlerce satir uretir ve
+  gercek olayi bogardi. Artik yalnizca `nats->http` (WARNING) ve `http->nats`
+  (INFO) gecislerinde TEK satir atilir; deneme sayilari `/health`'te.
+
+- **Yerel modda `NATS_URL` acikca verilmelidir** — varsayilana
+  (`nats://localhost:4222`) sessizce dusmek yasak. Ajan `NATS_URL`'i compose'a
+  yazmayi atlarsa gateway kendi container'ina baglanmaya calisir, hicbir zaman
+  baglanamaz ve yerel modda yedegi de olmadigi icin telemetri tamamen durur.
+  Kurulumun ilk saniyesinde acik hata vermek, sahada saatler suren teshisten
+  iyidir. Kural HER ortamda gecerli (dev dahil).
+
+### Notes
+
+- **Tekrar (duplicate) riski:** NATS batch'i KISMEN basarisiz olursa tum
+  batch HTTP'ye aktarilir ve giden mesajlar iki kez islenebilir. Bilincli
+  tercih — at-least-once garantisini korumak, kayip vermemek. Baskin
+  senaryoda (NATS tamamen erisilemez) `JetStreamNotReadyError` hicbir mesaj
+  gonderilmeden firlatilir, dolayisiyla tekrar olusmaz.
+
+- **Canli dogrulama** (192.168.2.99, izole NATS 2.10 container): gercek
+  `docker stop` ile NATS durduruldu, 50 mesajin tamami HTTP'den teslim edildi
+  (outbox 0, kayip 0); gercek `docker start` sonrasi otomatik NATS'a donuldu;
+  yerel modda ayni kesintide HTTP'ye HIC dusulmedi ve 30 mesaj outbox'ta
+  korundu. 16/16 kontrol gecti. Production NATS'a dokunulmadi.
+
 ## [1.5.0] - 2026-08-04
 
 401 cihazli sahada olculen CPU yukunun kaynagi bulundu ve ayarlanabilir hale
