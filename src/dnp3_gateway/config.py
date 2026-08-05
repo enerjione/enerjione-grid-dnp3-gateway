@@ -218,6 +218,56 @@ class Settings(BaseSettings):
         description="Telemetri yayin yolu: nats (JetStream, STANDART) | http (backend ingest, rollback)",
     )
 
+    # ----- Kurulum modu: tasima yolu davranisini BELIRLER ---------------------
+    # Bu ayar `telemetry_publisher=nats` iken NATS erisilemedigi zaman ne
+    # olacagini belirler ve iki kurulum senaryosunun DOGRU davranisi farklidir:
+    #
+    #   local  ("bu cihaza kur" — backend ile ayni makine)
+    #          NATS ZORUNLU, yedek yol YOK. Ayni makinede NATS'a erisilememesi
+    #          bir yapilandirma hatasidir; sessizce HTTP'ye dusmek bu hatayi
+    #          GIZLER. Sistem "calisiyor" gorunur ama her olcum backend HTTP +
+    #          Postgres zincirinden gecer ve 500 cihaz hedefi tutmaz — ariza
+    #          ancak yuk testinde, haftalar sonra fark edilir. Bu modda NATS
+    #          dustugunde mesajlar outbox'ta birikir (kayip yok) ve /health
+    #          `telemetry_backend_unreachable` der.
+    #
+    #   remote ("baska cihaza kur" — sahadaki ayri sunucu)
+    #          Once NATS denenir; erisilemezse HTTP ile veri akmaya DEVAM eder.
+    #          Sahada 4222 kapali/NAT arkasinda olabilir ve operatorun elinde
+    #          yalnizca backend'in HTTPS ucu olabilir. NATS geri gelince
+    #          gateway birincil yola KENDILIGINDEN doner.
+    #
+    # Varsayilan `remote`: mevcut kurulumlar (INSTALL_MODE gondermeyenler)
+    # davranis degistirmesin, yalnizca yedek yol kazansin.
+    install_mode: str = Field(
+        default="remote",
+        description=(
+            "Kurulum senaryosu: local (backend ile ayni makine — NATS zorunlu, "
+            "HTTP yedegi YOK) | remote (uzak saha kurulumu — NATS birincil, "
+            "erisilemezse HTTP yedegine duser ve geri doner)"
+        ),
+    )
+    telemetry_fallback_fail_threshold: int = Field(
+        default=3,
+        ge=1,
+        le=100,
+        description=(
+            "Uzak kurulumda kac ARDISIK NATS hatasindan sonra aktif yol HTTP'ye "
+            "cevrilir. 1 tek bir timeout'ta yol degistirir (gereksiz salinim); "
+            "cok buyuk deger her mesajda NATS timeout'u odemek demektir."
+        ),
+    )
+    telemetry_fallback_probe_interval_sec: float = Field(
+        default=30.0,
+        ge=5.0,
+        le=3600.0,
+        description=(
+            "HTTP yedegine dustukten sonra NATS'a donmek icin yoklama araligi "
+            "(sn). Yoklama gercek bir publish degil, NATS istemcisinin baglanti "
+            "durumudur; maliyeti sifira yakindir."
+        ),
+    )
+
     # ----- NATS JetStream (STANDART TELEMETRI YOLU) ---------------------------
     # Publish down olunca: publish hatasi -> outbox'a yazilir -> retrier broker
     # gelince bosaltir (at-least-once, kayip yok).
@@ -661,6 +711,15 @@ class Settings(BaseSettings):
             raise ValueError(f"TELEMETRY_PUBLISHER gecersiz: '{v}'. Gecerli: {sorted(valid)}")
         return s
 
+    @field_validator("install_mode")
+    @classmethod
+    def _validate_install_mode(cls, v: str) -> str:
+        valid = {"local", "remote"}
+        s = (v or "remote").strip().lower()
+        if s not in valid:
+            raise ValueError(f"INSTALL_MODE gecersiz: '{v}'. Gecerli: {sorted(valid)}")
+        return s
+
     @field_validator("dnp3_read_strategy")
     @classmethod
     def _validate_read_strategy(cls, v: str) -> str:
@@ -751,6 +810,39 @@ class Settings(BaseSettings):
                 ".env'den silmeniz onerilir."
             )
         return s
+
+    @model_validator(mode="after")
+    def _validate_transport_contract(self) -> Settings:
+        """Tasima yolu sozlesmesi — HER ortamda gecerli (dev dahil).
+
+        YEREL KURULUMDA NATS_URL ACIKCA VERILMELIDIR.
+        `nats_url` alaninin bir varsayilani var (`nats://localhost:4222`).
+        Bu varsayilan uzak kurulumda zararsizdir (nasil olsa yedek yol var)
+        ama YEREL kurulumda sessiz bir tuzaktir: ajan NATS_URL'i compose'a
+        yazmayi atlarsa gateway varsayilana duser, `localhost:4222`'ye —
+        yani KENDI CONTAINER'INA — baglanmayi dener, hicbir zaman
+        baglanamaz ve bu yerel modda yedegi de olmadigi icin telemetri
+        tamamen durur. Kurulumun ilk saniyesinde acik bir hata vermek,
+        sahada saatler suren bir teshisten iyidir.
+
+        Bu yuzden yerel modda alan yalnizca BOS olmamakla kalmaz, ACIKCA
+        SET EDILMIS olmalidir (`model_fields_set`) — varsayilana dusmek
+        kabul edilmez.
+        """
+        if self.install_mode != "local" or self.telemetry_publisher != "nats":
+            return self
+        acikca_verildi = "nats_url" in self.model_fields_set
+        if not acikca_verildi or not (self.nats_url or "").strip():
+            raise ValueError(
+                "YAPILANDIRMA: INSTALL_MODE=local (bu cihaza kurulum) icin "
+                "NATS_URL ACIKCA verilmelidir; varsayilana dusulemez. Yerel "
+                "kurulumda NATS ZORUNLUDUR ve HTTP yedegi YOKTUR — backend ile "
+                "ayni makinede NATS'a erisilememesi bir yapilandirma hatasidir "
+                "ve gizlenmemelidir. Compose/.env icine NATS_URL=nats://<host>:4222 "
+                "ekleyin. Uzak saha kurulumu yapiyorsaniz INSTALL_MODE=remote "
+                "kullanin; o modda NATS erisilemezse HTTP yedegine dusulur."
+            )
+        return self
 
     @model_validator(mode="after")
     def _validate_production_safeguards(self) -> Settings:

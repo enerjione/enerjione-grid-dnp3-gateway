@@ -306,14 +306,65 @@ config_404_error gateway=GW-001 — Backendde 'GW-001' kodlu gateway yok.
 **Cozum:** Backend panelinden ayni `GATEWAY_CODE` + ayni `GATEWAY_TOKEN` ile
 kayit ac.
 
+### "Su an veri hangi yoldan gidiyor?" — aktif tasima yolu
+
+Telemetri iki yoldan gidebilir ve **hangisinde oldugunuzu bilmeden ariza
+aramak cok pahali**. Tek GET ile cevaplayin:
+
+```bash
+curl -s http://127.0.0.1:8020/health | jq .outbox.telemetry_transport
+```
+
+```json
+{
+  "install_mode": "remote",
+  "active_transport": "nats",
+  "fallback_enabled": true,
+  "transport_switches": 0,
+  "fallback_delivered_total": 0,
+  "nats_ready": true,
+  "http_ready": true
+}
+```
+
+Boot log'unda da tek satirda gorunur:
+
+```
+telemetry_transport_selected install_mode=remote active=nats fallback=http ...
+```
+
+**Kurulum moduna gore davranis (1.6.0+):**
+
+| `INSTALL_MODE` | Ne zaman | NATS erisilemezse |
+|---|---|---|
+| `local` | "bu cihaza kur" — backend ile ayni makine | **HTTP'ye DUSULMEZ.** Mesajlar outbox'ta birikir, `/health` -> `telemetry_backend_unreachable`. Ayni makinede NATS'a erisilememesi bir yapilandirma hatasidir; gizlenmez. |
+| `remote` (varsayilan) | "baska cihaza kur" — saha sunucusu | **HTTP yedegine duser**, veri akmaya devam eder. `/health` -> `telemetry_transport_fallback_http` (degraded). NATS geri gelince **otomatik doner**. |
+
+Yerel modda `NATS_URL` **acikca verilmelidir**; verilmezse gateway boot'ta
+acik hatayla durur (varsayilan `nats://localhost:4222`'ye sessizce dusmez).
+
+**Yedege dusuldugunu nereden anlarsiniz:** log'da TEK bir olay satiri —
+tekrarlayan deneme uyarisi degil:
+
+```
+telemetry_transport_switched from=nats to=http mode=remote sebep=nats_failed_x3: ...
+telemetry_transport_switched from=http to=nats mode=remote sebep=nats_reachable_again
+```
+
+**HTTP yedegindeyken ne yapmali:** veri kaybi yok ama throughput NATS
+yoluna gore kat kat dusuktur. NATS erisimini duzeltin (port 4222 acik mi,
+kimlik bilgileri gecerli mi); gateway restart GEREKMEZ, en gec
+`TELEMETRY_FALLBACK_PROBE_INTERVAL_SEC` (varsayilan 30sn) sonra
+kendiliginden doner.
+
 ### Telemetri gitmiyor / outbox dolmaya basladi
 
 > **ONCE SUNU KONTROL EDIN:** 1.1.0+ itibariyla telemetri varsayilan olarak
 > **dogrudan NATS JetStream'e** gider (`TELEMETRY_PUBLISHER=nats`).
 > `TELEMETRY_PUBLISHER=http` set edilmisse rollback yolundasiniz: telemetri
 > backend HTTP ingest'e gider ve yuk backend'e biner. Once hangi yolda
-> oldugunuzu `dnp3_gateway_starting ... publisher=...` log satirindan teyit
-> edin.
+> oldugunuzu `dnp3_gateway_starting ... publisher=... install_mode=...` log
+> satirindan ya da yukaridaki `/health` alanindan teyit edin.
 
 ```
 publish_batch_failed_outboxed count=175 error=... consecutive=1
