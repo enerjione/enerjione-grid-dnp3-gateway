@@ -306,6 +306,47 @@ config_404_error gateway=GW-001 — Backendde 'GW-001' kodlu gateway yok.
 **Cozum:** Backend panelinden ayni `GATEWAY_CODE` + ayni `GATEWAY_TOKEN` ile
 kayit ac.
 
+### Cihaz kopuk kaldi / "manuel refresh atinca geliyor"
+
+**1.6.1'den once bu gercek bir hataydi.** Cihaz `lost` ve link'i ACIK
+gorunuyorken gateway ona hicbir sey sormuyordu; kilidi ancak operatorun
+`/refresh-all`'u kiriyordu. 4G/GSM hatlarda kural olan senaryo: modem RRC
+idle'a duser, TCP soketi FIN/RST uretmeden yari-acik kalir, opendnp3
+`OnClose` gormez, outstation da veri gondermeyi keser — iki taraf da sessiz
+kalir.
+
+Artik gateway kendisi yokluyor. Durumu tek GET ile gorun:
+
+```bash
+curl -s http://127.0.0.1:8020/health | jq .devices.recovery
+```
+
+```json
+{ "lost_probe_total": 12, "forced_relink_total": 2, "devices_probing": 1 }
+```
+
+| Alan | Anlami |
+|---|---|
+| `lost_probe_total` | Kopuk cihazlara gonderilen kendiliginden integrity poll sayisi |
+| `forced_relink_total` | Yoklama sonuc vermeyince zorla yenilenen TCP oturumu sayisi |
+| `devices_probing` | SU AN yoklanan (kopuk ama link'i acik) cihaz sayisi |
+
+Ilgili log — yoklamalar DEBUG, yalnizca zorla yenileme olay uretir:
+
+```
+yadnp3_forced_relink device=d3 ip=10.0.0.5 — 3 integrity poll cevapsiz kaldi,
+TCP oturumu zorla yeniden kuruluyor (yari-acik soket suphesi)
+```
+
+**Ayarlar:** `DNP3_LOST_PROBE_INTERVAL_SEC` (varsayilan 30) ve
+`DNP3_LOST_RELINK_AFTER_PROBES` (varsayilan 3). Cok kararsiz 4G hatlarda
+araligi kisaltabilirsiniz; her cihaz basina saatte `3600/aralik` istek eder.
+
+**Hala kopuk kaliyorsa** sorun buyuk olasilikla gateway'de degil:
+`devices_probing` cihazi sayiyorsa gateway aktif olarak deniyor demektir.
+Sunucudan `nc -zv <cihaz-ip> 20000` ile hattı dogrulayin; kapaliysa saha
+tarafinda modem/anten/besleme kontrolu gerekir.
+
 ### "Su an veri hangi yoldan gidiyor?" — aktif tasima yolu
 
 Telemetri iki yoldan gidebilir ve **hangisinde oldugunuzu bilmeden ariza
