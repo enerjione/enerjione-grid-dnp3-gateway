@@ -238,6 +238,38 @@ def map_dnp3_quality(flags: int | None) -> str:
 #     ancak gercek yavas linkleri yanlislikla "lost" yapmaktan korur.
 _RECOVERY_GRACE_SEC = 15.0
 
+# KOPUK CIHAZI KENDILIGINDEN YOKLAMA
+# ----------------------------------
+# SAHADA GOZLENDI: "bazen haberlesme gidiyor, manuel refresh atinca geliyor."
+#
+# Otomatik integrity poll YALNIZCA iki durumda tetikleniyordu: stale-edge'de
+# (online -> recovering) TEK SEFER, ve relink'te (lost -> recovering) ama
+# yalnizca veri ZATEN geliyorsa. Yani "cihaz lost + link acik gorunuyor +
+# veri gelmiyor" durumunda gateway cihaza HICBIR SEY SORMUYOR; ya TCP'nin
+# kopup yeniden acilmasini (OnOpen) ya da verinin kendiliginden gelmesini
+# PASIF bekliyordu. Kilidi kiran tek sey operatorun `/refresh-all`'u idi.
+#
+# Bu senaryo 4G/GSM hatlarda kural: modem RRC idle'a duser, TCP soketi
+# FIN/RST uretmeden yari-acik kalir, opendnp3 OnClose gormez, outstation da
+# unsolicited veri gondermeyi keser. Iki taraf da sessizdir ve kimse ilk
+# hamleyi yapmaz — cihaz sonsuza kadar 'lost' kalir.
+#
+# Cozum iki katmanli:
+#   1) lost + link acik iken PERIYODIK integrity poll (manuel refresh'in
+#      yaptiginin aynisi). Sessiz outstation'i konusturur.
+#   2) Yoklama sonuc vermezse oturumu ZORLA yeniden kur. Yari-acik sokete
+#      poll gondermek ise yaramaz; tek cikis kanali kapatip yeniden acmaktir.
+#
+# 30 sn: 4G'de RRC idle -> aktif gecisi saniyeler surer, 30 sn cihaz basina
+# saatte 120 istek demektir (500 cihazda hepsi kopuk olsa bile ihmal
+# edilebilir). Daha sik yapmak kopuk sahada gereksiz radyo trafigi uretir.
+_LOST_PROBE_INTERVAL_SEC = 30.0
+
+# Kac sonucsuz yoklamadan sonra TCP oturumu yeniden kurulur.
+# 3 x 30 sn = ~90 sn: gercekten yavas bir cihaza sans tanir, ama olu bir
+# soketle dakikalarca oyalanmaz.
+_LOST_RELINK_AFTER_PROBES = 3
+
 
 class Yadnp3AdapterError(RuntimeError):
     """yadnp3 adapter'inda olusan hata."""
@@ -1396,6 +1428,8 @@ class Yadnp3TelemetryReader(TelemetryReader):
         time_sync: str = "lan",
         publish_quality_flags: bool = False,
         device_count_hint: int = 0,
+        lost_probe_interval_sec: float = 0.0,
+        lost_relink_after_probes: int = 0,
     ) -> None:
         if not _YADNP3_AVAILABLE:
             raise Yadnp3AdapterError(
@@ -1437,6 +1471,18 @@ class Yadnp3TelemetryReader(TelemetryReader):
         # nokta her cycle yeniden okunur; uyariyi bir kez basiyoruz.
         self._nan_lock = threading.Lock()
         self._nan_uyarilan: set[tuple[int, int]] = set()
+        # Kopuk cihaz yoklamasi: cihaz kodu -> {"son": monotonic, "deneme": int}.
+        # Master nesnesinde DEGIL burada tutuluyor, cunku zorla relink master'i
+        # yok edip yeniden kuruyor; sayac master ile birlikte silinirse esik
+        # her seferinde sifirlanir ve relink dongusune girilir.
+        # 0/None -> modul varsayilani. Instance degeri set edilirse o kazanir;
+        # testler modul sabitini monkeypatch'leyebilsin diye cagri aninda okunur.
+        self._lost_probe_interval_sec = float(lost_probe_interval_sec or 0.0)
+        self._lost_relink_after_probes = int(lost_relink_after_probes or 0)
+        self._lost_probe_lock = threading.Lock()
+        self._lost_probe: dict[str, dict[str, float]] = {}
+        self._lost_probe_total = 0
+        self._forced_relink_total = 0
 
     @staticmethod
     def _resolve_tcp_port(device: DeviceConfig, default_port: int) -> int:
@@ -1532,6 +1578,100 @@ class Yadnp3TelemetryReader(TelemetryReader):
             mm.connection_fingerprint = want
             self._masters[device.code] = mm
             return mm
+
+    # ---- Kopuk cihaz yoklamasi ------------------------------------------
+    def _lost_probe_durumu(self, mm: Any) -> dict[str, float]:
+        """Test/teshis icin bir cihazin yoklama sayaclari."""
+        kod = mm.device.code
+        with self._lost_probe_lock:
+            d = self._lost_probe.get(kod)
+            return dict(d) if d else {"son": 0.0, "deneme": 0}
+
+    def _lost_probe_sifirla(self, device_code: str) -> None:
+        with self._lost_probe_lock:
+            self._lost_probe.pop(device_code, None)
+
+    def recovery_stats(self) -> dict[str, int]:
+        """Kopuk cihaz kurtarma sayaclari — /health bunu raporlar.
+
+        "Gateway acaba yeniden baglanmayi deniyor mu?" sorusu sahada
+        yalnizca soket durumuna bakarak (SYN_SENT ornekleyerek) cevaplanabiliyordu.
+        Artik sayacla cevaplanir.
+        """
+        with self._lost_probe_lock:
+            return {
+                "lost_probe_total": self._lost_probe_total,
+                "forced_relink_total": self._forced_relink_total,
+                "devices_probing": len(self._lost_probe),
+            }
+
+    def _kopuk_cihazi_yokla(self, mm: Any, device: DeviceConfig, *, connected: bool) -> None:
+        """'lost' cihaza periyodik integrity poll; sonuc yoksa oturumu yenile.
+
+        LINK KAPALIYKEN HICBIR SEY YAPMAYIZ: opendnp3 kanali zaten kendi
+        TCP retry'ini suruyor (SYN gonderiyor). Araya girip master'i yeniden
+        kurmak devam eden baglanti denemesini iptal eder ve toparlanmayi
+        GECIKTIRIR. Bu yol yalnizca "soket acik gorunuyor ama veri yok"
+        durumu icindir — 4G'de yari-acik soket senaryosu.
+        """
+        if not connected:
+            return
+        kod = device.code
+        simdi = time.monotonic()
+        aralik = getattr(self, "_lost_probe_interval_sec", 0.0) or _LOST_PROBE_INTERVAL_SEC
+        esik = getattr(self, "_lost_relink_after_probes", 0) or _LOST_RELINK_AFTER_PROBES
+        with self._lost_probe_lock:
+            d = self._lost_probe.get(kod)
+            if d is None:
+                d = {"son": 0.0, "deneme": 0}
+                self._lost_probe[kod] = d
+            if simdi - d["son"] < aralik:
+                return
+            d["son"] = simdi
+            d["deneme"] += 1
+            deneme = int(d["deneme"])
+            if deneme <= esik:
+                self._lost_probe_total += 1
+            else:
+                self._forced_relink_total += 1
+
+        if deneme <= esik:
+            # Sessiz outstation'i konustur. Log DEBUG: 500 cihazli bir sahada
+            # toplu kopmada her yoklamayi INFO basmak log'u bogar; olay
+            # niteligindeki tek satir asagidaki relink uyarisidir.
+            logger.debug(
+                "yadnp3_lost_probe device=%s deneme=%d/%d — link acik gorunuyor "
+                "ama veri gelmiyor, integrity poll gonderiliyor",
+                kod,
+                deneme,
+                esik,
+            )
+            try:
+                mm.request_integrity_poll()
+            except Exception:  # noqa: BLE001
+                logger.debug("yadnp3_lost_probe_error device=%s", kod, exc_info=True)
+            return
+
+        # Yoklamalar sonuc vermedi: soket olu ama kapanmamis. Tek cikis
+        # oturumu bastan kurmak. Master'i dusuruyoruz; bir sonraki cycle'da
+        # `_ensure_master` yeni kanal + master yaratir.
+        logger.warning(
+            "yadnp3_forced_relink device=%s ip=%s — %d integrity poll cevapsiz "
+            "kaldi, TCP oturumu zorla yeniden kuruluyor (yari-acik soket "
+            "suphesi; 4G/GSM hatlarda modem RRC idle'a dusunce olusur)",
+            kod,
+            device.ip_address,
+            esik,
+        )
+        try:
+            mm.shutdown()
+        except Exception:  # noqa: BLE001
+            logger.debug("yadnp3_forced_relink_shutdown_error device=%s", kod, exc_info=True)
+        with self._lock:
+            if self._masters.get(kod) is mm:
+                self._masters.pop(kod, None)
+        # Sayaci sifirla ki yeni oturum kendi esigiyle baslasin.
+        self._lost_probe_sifirla(kod)
 
     def read_device(
         self,
@@ -1636,10 +1776,22 @@ class Yadnp3TelemetryReader(TelemetryReader):
                 device.ip_address,
                 int(now - last_update) if last_update else "?",
             )
+            # Cihaz yeniden konusuyor: yoklama/relink sayaclarini sifirla.
+            self._lost_probe_sifirla(device.code)
             try:
                 mm.request_integrity_poll()
             except Exception:  # noqa: BLE001
                 logger.debug("yadnp3_relink_integrity_poll_error", exc_info=True)
+
+        # KOPUK CIHAZI KENDILIGINDEN YOKLA
+        # --------------------------------
+        # Buraya gelindiginde cihaz 'lost' ve yukaridaki relink kosulu
+        # tutmadi (yani veri hala gelmiyor). Eskiden bu noktada gateway
+        # cihaza HICBIR SEY sormuyor, pasif bekliyordu; kilidi ancak
+        # operatorun manuel refresh'i kiriyordu. Artik periyodik olarak
+        # kendimiz soruyoruz, sonuc alamazsak oturumu yeniliyoruz.
+        if cache_state == "lost":
+            self._kopuk_cihazi_yokla(mm, device, connected=connected)
 
         # Cihaz "online" degil mi? comm_lost yayini.
         # Ilk edge'de quality=comm_lost, sonrakilerde no_change (mesaj flood'unu
@@ -1669,6 +1821,10 @@ class Yadnp3TelemetryReader(TelemetryReader):
         # Recovery confirmed olduysa (set() flag'i tetiklemis) bir kerelik
         # mark_all_dirty + log. Boylece SCADA tum sinyalleri quality=good ile
         # gorur; cihazin son bilinen degerleri yayilanir.
+        # Cihaz konusuyor: yoklama sayaclarini sifirla ki bir sonraki
+        # kopmada relink esigi bastan baslasin.
+        self._lost_probe_sifirla(device.code)
+
         if cache.consume_recovery_publish():
             cache.reset_stale_announce()
             redirty_count = cache.mark_all_dirty()

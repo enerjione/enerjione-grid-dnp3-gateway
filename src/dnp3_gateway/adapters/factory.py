@@ -89,6 +89,10 @@ def build_adapter(settings: Settings) -> TelemetryReader:
             # yakin degerdir. Sabit 4 thread 400 cihazda 100 cihaz/thread
             # demekti (bkz. dnp3_yadnp3_master.__init__).
             device_count_hint=settings.max_parallel_devices,
+            # Kopuk cihazi kendiliginden yoklama: manuel refresh beklemeden
+            # toparlanma (4G/GSM yari-acik soket senaryosu).
+            lost_probe_interval_sec=settings.dnp3_lost_probe_interval_sec,
+            lost_relink_after_probes=settings.dnp3_lost_relink_after_probes,
         )
         # Log ADAPTER KURULDUKTAN SONRA: `manager_threads` eskiden "auto"
         # yaziyordu ve heuristigin GERCEKTE kac thread sectigi hicbir yerde

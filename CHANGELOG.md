@@ -2,6 +2,62 @@
 
 Semver'a gore tutulur. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.1] - 2026-08-06
+
+Kopan cihaz artik KENDILIGINDEN geri geliyor — manuel refresh gerekmiyor.
+
+### Fixed
+
+- **`lost` durumundaki cihaza gateway hicbir sey sormuyordu.** Otomatik
+  integrity poll yalnizca iki durumda tetikleniyordu: stale-edge'de
+  (`online -> recovering`) TEK SEFER, ve relink'te (`lost -> recovering`)
+  ama yalnizca veri ZATEN geliyorsa. Yani "cihaz lost + link acik gorunuyor
+  + veri gelmiyor" durumunda gateway pasif bekliyordu; kilidi kiran tek sey
+  operatorun elle tetikledigi `/refresh-all` idi.
+
+  Sahada gozlenen: *"bazen haberlesme gidiyor, manuel refresh atinca
+  geliyor."*
+
+  Bu senaryo 4G/GSM hatlarda KURAL: modem RRC idle'a duser, TCP soketi
+  FIN/RST uretmeden yari-acik kalir, opendnp3 `OnClose` gormez, outstation
+  da unsolicited veri gondermeyi keser. Iki taraf da sessizdir ve kimse ilk
+  hamleyi yapmaz — cihaz sonsuza kadar `lost` kalir.
+
+  Cozum iki katmanli:
+  1. **Periyodik kendiliginden yoklama** — `lost` + link acik iken
+     `DNP3_LOST_PROBE_INTERVAL_SEC` (varsayilan 30 sn) araligiyla integrity
+     poll gonderilir; manuel refresh'in yaptiginin aynisi.
+  2. **Zorla oturum yenileme** — `DNP3_LOST_RELINK_AFTER_PROBES`
+     (varsayilan 3) sonucsuz yoklamadan sonra TCP oturumu kapatilip yeniden
+     kurulur. Yari-acik sokete integrity poll ise yaramaz; tek cikis budur.
+
+  **Link KAPALIYKEN hicbir sey yapilmaz:** opendnp3 kanali zaten kendi TCP
+  retry'ini suruyor. Araya girip master'i yeniden kurmak devam eden
+  baglanti denemesini iptal eder ve toparlanmayi GECIKTIRIRDI.
+
+### Added
+
+- **`DNP3_LOST_PROBE_INTERVAL_SEC`** (varsayilan 30) ve
+  **`DNP3_LOST_RELINK_AFTER_PROBES`** (varsayilan 3) ayarlari.
+
+- **`/health` -> `devices.recovery`** — `lost_probe_total`,
+  `forced_relink_total`, `devices_probing`. "Gateway acaba yeniden
+  baglanmayi deniyor mu?" sorusu sahada yalnizca soket durumunu ornekleyerek
+  (`SYN_SENT` saymak) cevaplanabiliyordu; artik tek GET yetiyor.
+
+- Zorla relink olay uretir (`yadnp3_forced_relink`, WARNING). Tek tek
+  yoklamalar DEBUG seviyesindedir — 500 cihazli bir sahada toplu kopmada
+  her yoklamayi INFO basmak log'u bogar ve gercek olayi gizlerdi.
+
+### Notes
+
+- **Canli dogrulama** (izole container, gercek opendnp3 outstation): outstation
+  prosesine `SIGSTOP` gonderilerek yari-acik soket birebir taklit edildi —
+  TCP `ESTABLISHED` kalir, cekirdek ACK'lemeye devam eder, uygulama katmani
+  hicbir sey cevaplamaz. Sonuc: cihaz `lost` oldu, gateway kendi integrity
+  poll'unu gonderdi, cevapsiz kalinca oturumu zorla yeniledi ve `SIGCONT`
+  sonrasi **manuel refresh olmadan** `online`'a dondu. 5/5 kontrol gecti.
+
 ## [1.6.0] - 2026-08-05
 
 Telemetri tasima yolu artik KURULUM SENARYOSUNA gore davraniyor ve aktif yol

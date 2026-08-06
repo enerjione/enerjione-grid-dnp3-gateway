@@ -556,6 +556,33 @@ class Settings(BaseSettings):
             "arada Class 1/2/3 event poll yapilir. Drift toleransi olarak 30-300 sn idealdir."
         ),
     )
+    # ----- Kopuk cihazi kendiliginden yoklama (4G/GSM hatlar icin) -----------
+    # SAHADA: "bazen haberlesme gidiyor, manuel refresh atinca geliyor."
+    # Cihaz 'lost' ve link ACIK gorunuyorken gateway ona hicbir sey sormuyordu;
+    # 4G modem RRC idle'a dusup TCP soketi yari-acik kalinca iki taraf da
+    # sessiz kaliyor ve kimse ilk hamleyi yapmiyordu.
+    dnp3_lost_probe_interval_sec: float = Field(
+        default=30.0,
+        ge=5.0,
+        le=600.0,
+        description=(
+            "Kopuk ('lost') ama link'i acik gorunen cihaza kac saniyede bir "
+            "integrity poll gonderilsin (manuel refresh'in yaptiginin aynisi). "
+            "Sessiz outstation'i konusturur. 4G'de RRC idle -> aktif gecisi "
+            "saniyeler surer; 30 sn cihaz basina saatte 120 istek demektir."
+        ),
+    )
+    dnp3_lost_relink_after_probes: int = Field(
+        default=3,
+        ge=1,
+        le=50,
+        description=(
+            "Kac sonucsuz yoklamadan sonra TCP oturumu ZORLA yeniden kurulsun. "
+            "Yari-acik sokete integrity poll ise yaramaz; tek cikis kanali "
+            "kapatip yeniden acmaktir. 3 x 30 sn = ~90 sn."
+        ),
+    )
+
     dnp3_event_scan_interval_sec: int = Field(
         default=0,
         ge=0,

@@ -376,6 +376,15 @@ def _device_health_snapshot(reader: Any, configured_count: int) -> dict[str, Any
         summary["unknown"] += summary["total"] - tracked
     if oldest_age is not None:
         summary["oldest_frame_age_sec"] = round(oldest_age, 1)
+    # Kopuk cihaz kurtarma sayaclari. "Gateway acaba yeniden baglanmayi
+    # deniyor mu?" sorusu sahada yalnizca soket durumunu ornekleyerek
+    # (SYN_SENT saymak) cevaplanabiliyordu; artik tek GET yetiyor.
+    stats_fn = getattr(reader, "recovery_stats", None)
+    if callable(stats_fn):
+        try:
+            summary["recovery"] = dict(stats_fn())
+        except Exception:  # noqa: BLE001
+            pass
     return summary
 
 
