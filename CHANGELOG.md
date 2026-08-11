@@ -2,6 +2,60 @@
 
 Semver'a gore tutulur. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.2] - 2026-08-07
+
+G110 (Octet String) sinyalleri artik her cihaz modelinde okunuyor.
+
+### Fixed
+
+- **Okuma araligi SN2.0'ye gore ELLE SABITLENMISTI.**
+  `_G110_RANGES = ((3, 23), (65000, 65020))` bir SINIF SABITIYDI ve yalnizca
+  SN2.0'in string index haritasiydi. Ayni gateway'de baska bir model
+  bulundugunda o cihazin string'leri kapsam disinda kaliyordu:
+
+  | Model | String index'leri | Sabit ile istenen |
+  |---|---|---|
+  | SN2.0 | 3, 5-17, 19-23, 65000-65003, 65009-65014, 65020 (30 nokta) | hepsi |
+  | Pole Master Kit | 0-3, 5-50, 65000-65003 (54 nokta) | yalnizca 24'u |
+
+  Pole Master Kit'te SIM CCID / Network Operator / Network Type (0,1,2),
+  Modem Dial-In / GPS Lat-Lon / Network RF Status (24,25,26) ve
+  sat04-sat09'un TUM string'leri (27-50) HIC istenmiyordu.
+
+  Artik aralilar her cihazin KENDI sinyal setinden turetiliyor
+  (`_g110_bloklari`) ve `_ManagedMaster` uzerinde CIHAZ BASINA tutuluyor —
+  ayni gateway'de SN2.0 ile Pole Master Kit birlikte bulunabilir.
+
+- **Ilk baglantida string okumasi HIC tetiklenmiyordu.**
+  `scan_g110_once` yalnizca `request_integrity_poll` icinden cagriliyordu;
+  o da lost-probe / stale / relink / manuel refresh yollarindan geliyordu.
+  Duzgun baglanip HIC KOPMAYAN bir cihazda string okumasi hicbir zaman
+  calismiyordu — kapsam icindeki noktalar bile gelmiyordu. Sahadaki SN2'ler
+  surekli kopup baglandigi icin bu eksik maskelenmisti.
+
+  `_ensure_master` artik master kurulduktan (Enable) sonra bir kez
+  `scan_g110_once` cagiriyor. Mevcut cagri yollari aynen korundu.
+
+- Cihazla ILK TEMAS komut yoluyla olursa (`operate_crob` -> `_ensure_master`,
+  sinyal listesi yok) master bos bloklarla kuruluyordu ve sonraki okuma
+  bloklari doldursa bile tarama bir daha tetiklenmiyordu. Bloklar bostan
+  doluya gecerse string okumasi bir kez tetikleniyor; `signals=None` gelen
+  yollar bloklara DOKUNMUYOR.
+
+### Notes
+
+- **Davranis korumalari:** blok gruplama (bosluk <= 8) disinda iki baraj
+  daha var — blok genisligi `_G110_BLOK_MAX_GENISLIK` (512) asarsa parcalanir,
+  toplam blok sayisi `_G110_MAX_BLOK` (16) asarsa kirpilir; ikisi de WARNING
+  basar. 0-65535 gibi genis tek aralik Mayis 2026'da cihazi bozmustu
+  (revert 1302b83) ve asla uretilmiyor — birim testiyle kilitli.
+- Tarama PERIYODIK DEGIL (one-shot) — string'ler statik.
+- `dnp3_class` alanina dokunulmadi; statik octet string okumasi EVENT
+  sinifindan bagimsizdir.
+- SN2.0 icin turetilen bloklarin eski sabitle BIREBIR ayni oldugu birim
+  testiyle kilitlendi (regresyon korumasi).
+- Birim testler: 413 passed (14 yeni).
+
 ## [1.6.1] - 2026-08-06
 
 Kopan cihaz artik KENDILIGINDEN geri geliyor — manuel refresh gerekmiyor.

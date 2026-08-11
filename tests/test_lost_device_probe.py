@@ -130,7 +130,9 @@ def okuyucu(monkeypatch: pytest.MonkeyPatch):
 
 
 def _oku(okuyucu, mm: SahteMaster, device, signals, *, monkeypatch):
-    monkeypatch.setattr(okuyucu, "_ensure_master", lambda d: mm)
+    # `_ensure_master(device, signals)` — signals G110 bloklarini turetmek
+    # icin gecirilir; bu testler onunla ilgilenmez.
+    monkeypatch.setattr(okuyucu, "_ensure_master", lambda d, s=None: mm)
     return okuyucu.read_device(device=device, signals=signals)
 
 
