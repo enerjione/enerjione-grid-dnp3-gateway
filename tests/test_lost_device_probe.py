@@ -47,11 +47,27 @@ class SahteCache:
         self._state = state
         self._connected = connected
         self._stale = stale
+        self.link_yasi = 9999.0
         self.integrity_istekleri = 0
 
     # --- adapter'in kullandigi yuzey ---
     def is_connected(self) -> bool:
         return self._connected
+
+    def g110_gerekli(self) -> bool:
+        # Bu testler G110 ile ilgilenmiyor: hic tarama istenmesin.
+        return False
+
+    def g110_tukendi_mi(self) -> bool:
+        return False
+
+    def g110_iste(self) -> None:
+        pass
+
+    def link_age(self) -> float:
+        # Varsayilan: oturum coktan yaslanmis (taze-oturum korumasi devrede
+        # olmasin). Taze oturumu sinayan testler bunu kucultur.
+        return self.link_yasi
 
     def state(self) -> str:
         return self._state
@@ -96,6 +112,7 @@ class SahteMaster:
         self.connection_fingerprint: tuple = ()
         self.poll_sayisi = 0
         self.shutdown_sayisi = 0
+        self.last_command_at = 0.0
 
     def request_integrity_poll(self) -> bool:
         self.poll_sayisi += 1
@@ -258,3 +275,140 @@ def test_yoklama_sayaclari_raporlanir(okuyucu, monkeypatch: pytest.MonkeyPatch) 
     stat: dict[str, Any] = okuyucu.recovery_stats()
     assert stat["lost_probe_total"] >= 1
     assert stat["forced_relink_total"] == 1
+
+
+# ============================================================================
+# ZORLA RELINK'TEN VAZGECME KOSULLARI
+# ----------------------------------------------------------------------------
+# SAHADA OLCULDU (2026-08-11): zorla relink ACIK olan TCP oturumunu yikiyor.
+# Yerel agda yeniden baglanma milisaniyeler surer; 4G/GSM hatta ~3 DAKIKA
+# surdu (11:26:37 master enable -> 11:29:23 link open). Yani yavas hatta
+# relink toparlanmayi HIZLANDIRMIYOR, GECIKTIRIYOR. Olusan dongu:
+#   link acilir -> 15sn grace dolar -> lost -> 90sn yoklama -> relink ->
+#   3 dk yeniden baglanma -> ayni yerden basa
+# Cihaz hicbir zaman kararli bir pencere bulamiyordu.
+# ============================================================================
+
+
+def _relink_denemesi(okuyucu, mm, device, signals, monkeypatch, tur: int = 1) -> None:
+    """Esigi asacak kadar yoklama yaptirip relink kararina zorla."""
+    for _ in range(mod._LOST_RELINK_AFTER_PROBES + tur):
+        _oku(okuyucu, mm, device, signals, monkeypatch=monkeypatch)
+
+
+def test_taze_oturum_yikilmaz(okuyucu, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Yeni acilmis TCP oturumu zorla kapatilmamali.
+
+    4G'de yeniden baglanma dakikalar suruyor; taze oturumu yikmak cihaza
+    toparlanma sansi birakmiyordu.
+    """
+    device = make_device(code="d1")
+    signals = [make_signal()]
+    cache = SahteCache(state="lost", connected=True, stale=True)
+    cache.link_yasi = 10.0  # oturum 10 saniyelik
+    mm = SahteMaster(cache, device)
+    okuyucu._masters[device.code] = mm
+
+    monkeypatch.setattr(mod, "_LOST_PROBE_INTERVAL_SEC", 0.0)
+    _relink_denemesi(okuyucu, mm, device, signals, monkeypatch)
+
+    assert mm.shutdown_sayisi == 0, "taze oturum yikilmamali"
+    assert mm.poll_sayisi >= 1, "yoklama yine de surmeli"
+
+
+def test_yaslanmis_oturum_yikilir(okuyucu, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Koruma relink'i tamamen kapatmiyor — gercekten olu oturum yenilenir."""
+    device = make_device(code="d1")
+    signals = [make_signal()]
+    cache = SahteCache(state="lost", connected=True, stale=True)
+    cache.link_yasi = mod._LOST_RELINK_MIN_LINK_AGE_SEC + 1.0
+    mm = SahteMaster(cache, device)
+    okuyucu._masters[device.code] = mm
+
+    monkeypatch.setattr(mod, "_LOST_PROBE_INTERVAL_SEC", 0.0)
+    _relink_denemesi(okuyucu, mm, device, signals, monkeypatch)
+
+    assert mm.shutdown_sayisi == 1
+
+
+def test_komut_ucustayken_oturum_yikilmaz(okuyucu, monkeypatch: pytest.MonkeyPatch) -> None:
+    """ASIL HATA: CROB gorevi master uzerinde asenkron kosar.
+
+    Ortasinda shutdown() cagrilirsa gorev cevap alamadan olur ve sonuc
+    CommandStatus.UNDEFINED doner — sahada tam olarak bu gorulduu.
+    """
+    import time as _t
+
+    device = make_device(code="d1")
+    signals = [make_signal()]
+    cache = SahteCache(state="lost", connected=True, stale=True)
+    mm = SahteMaster(cache, device)
+    mm.last_command_at = _t.monotonic()  # komut az once gonderildi
+    okuyucu._masters[device.code] = mm
+
+    monkeypatch.setattr(mod, "_LOST_PROBE_INTERVAL_SEC", 0.0)
+    _relink_denemesi(okuyucu, mm, device, signals, monkeypatch)
+
+    assert mm.shutdown_sayisi == 0, "komut ucustayken oturum yikilmamali"
+
+
+def test_eski_komut_relinki_engellemez(okuyucu, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Koruma penceresi dolduysa relink yine calismali."""
+    import time as _t
+
+    device = make_device(code="d1")
+    signals = [make_signal()]
+    cache = SahteCache(state="lost", connected=True, stale=True)
+    mm = SahteMaster(cache, device)
+    mm.last_command_at = _t.monotonic() - (mod._LOST_RELINK_COMMAND_GRACE_SEC + 5.0)
+    okuyucu._masters[device.code] = mm
+
+    monkeypatch.setattr(mod, "_LOST_PROBE_INTERVAL_SEC", 0.0)
+    _relink_denemesi(okuyucu, mm, device, signals, monkeypatch)
+
+    assert mm.shutdown_sayisi == 1
+
+
+def test_ard_arda_relink_ustel_bekler(okuyucu, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Relink ise yaramiyorsa surekli TCP acip kapatilmamali."""
+    device = make_device(code="d1")
+    signals = [make_signal()]
+    cache = SahteCache(state="lost", connected=True, stale=True)
+    mm = SahteMaster(cache, device)
+    okuyucu._masters[device.code] = mm
+
+    monkeypatch.setattr(mod, "_LOST_PROBE_INTERVAL_SEC", 0.0)
+    _relink_denemesi(okuyucu, mm, device, signals, monkeypatch)
+    assert mm.shutdown_sayisi == 1
+
+    # Ayni master yeniden kayitli (gercekte _ensure_master yenisini kurar);
+    # backoff dolmadan ikinci relink OLMAMALI.
+    okuyucu._masters[device.code] = mm
+    _relink_denemesi(okuyucu, mm, device, signals, monkeypatch, tur=2)
+
+    assert mm.shutdown_sayisi == 1, "backoff dolmadan ikinci relink yapilmamali"
+
+
+def test_cihaz_ses_verince_yoklama_sifirlanir(okuyucu, monkeypatch: pytest.MonkeyPatch) -> None:
+    """KULLANICI HIPOTEZI: cihaz yoklama penceresinde geri gelirse sayac
+    ilerlemeye devam edip calisan oturumu yikabiliyordu.
+
+    Artik taze veri gelir gelmez (durum makinesinden BAGIMSIZ) sayac sifirlanir.
+    """
+    device = make_device(code="d1")
+    signals = [make_signal()]
+    cache = SahteCache(state="lost", connected=True, stale=True)
+    mm = SahteMaster(cache, device)
+    okuyucu._masters[device.code] = mm
+
+    monkeypatch.setattr(mod, "_LOST_PROBE_INTERVAL_SEC", 0.0)
+    _oku(okuyucu, mm, device, signals, monkeypatch=monkeypatch)
+    _oku(okuyucu, mm, device, signals, monkeypatch=monkeypatch)
+    assert okuyucu._lost_probe_durumu(mm)["deneme"] >= 2
+
+    # Cihaz ses verdi: veri taze, ama durum makinesi hala 'lost'.
+    cache._stale = False
+    _oku(okuyucu, mm, device, signals, monkeypatch=monkeypatch)
+
+    assert okuyucu._lost_probe_durumu(mm)["deneme"] == 0
+    assert mm.shutdown_sayisi == 0

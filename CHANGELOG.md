@@ -2,6 +2,83 @@
 
 Semver'a gore tutulur. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.3] - 2026-08-11
+
+Iki ayri saha bulgusu: G110 okumasi yanlis anda tetikleniyordu, ve zorla
+relink yavas hatlarda toparlanmayi geciktiriyordu.
+
+### Fixed
+
+- **G110 (string) okumasi YANLIS ANDA tetikleniyordu — v1.6.2 eksik kaldi.**
+  Aralik turetmesi dogruydu ama tarama `_ensure_master` icinden, `Enable()`in
+  hemen ardindan cagriliyordu. `Enable()` ASENKRON: o noktada TCP oturumu
+  ACIK DEGIL (listening modda cihaz kendi baglanana kadar dakikalar
+  surebilir). opendnp3'te ad-hoc `ScanRange` master OFFLINE iken kuyruga
+  ALINMAZ, aninda fail edilir — ama `ScanRange()` istisna atmadigi icin kod
+  "queued" yazip True donuyordu: SAHTE BASARI.
+
+  Sahadaki SN2'ler surekli flap ettigi icin recovery/relink yolundan
+  `request_integrity_poll` -> `scan_g110_once` tetikleniyor ve sorun
+  maskeleniyordu. KARARLI baglanan Pole Master Kit bu yola hic girmiyor ve
+  string'leri hicbir zaman gelmiyordu.
+
+  Artik tetikleme link ACILDIKTAN SONRA ve POLL THREAD'inden yapiliyor:
+  `OnOpen` yalnizca bayrak kurar (`cache.g110_iste`) — o callback opendnp3'un
+  IO thread'inden gelir ve oradan ScanRange cagirmak risklidir; gercek istegi
+  `read_device` gonderir.
+
+  **Varis dogrulanir, gerekirse tekrar denenir:** basari, ISTEGIN
+  GONDERILMESIYLE degil cihazdan GERCEKTEN bir G110 degeri gelmesiyle
+  olculur (`_DeviceCache.set`). Gelmezse 15/30/60/120/240 sn ustel backoff,
+  6 deneme tavani. Tavana ulasilirsa cihaz basina BIR KEZ WARNING
+  (`yadnp3_g110_okunamadi`). Link kopup acilirsa bayrak yeniden kurulur.
+
+  PERIYODIK SCAN YOK: deger geldikten sonra bir daha istenmez.
+
+- **Zorla relink yavas hatlarda toparlanmayi GECIKTIRIYORDU.** Sahada
+  olculdu (2026-08-11): relink ACIK olan TCP oturumunu yikiyor; yerel agda
+  yeniden baglanma milisaniyeler surerken 4G/GSM hatta ~3 DAKIKA surdu
+  (11:26:37 master enable -> 11:29:23 link open). Olusan dongu:
+
+      link acilir -> 15sn grace dolar -> lost -> 90sn yoklama -> relink ->
+      3 dk yeniden baglanma -> ayni yerden basa
+
+  Cihaz hicbir zaman kararli bir pencere bulamiyordu. Dort koruma eklendi:
+
+  1. **Taze oturum yikilmaz** — link `_LOST_RELINK_MIN_LINK_AGE_SEC` (300 sn)
+     dolmadan zorla kapatilmaz; o sureye kadar yalnizca yoklanir.
+  2. **Komut ucustayken yikilmaz** — CROB gorevi master uzerinde asenkron
+     kosar; ortasinda `shutdown()` cagrilirsa gorev cevap alamadan olur ve
+     sonuc **`CommandStatus.UNDEFINED`** doner. Sahada tam olarak bu
+     gorulmustu. Komuttan sonra 60 sn oturuma dokunulmaz.
+  3. **Ustel bekleme** — ard arda relink'ler 300 sn'den baslayip iki katina
+     cikar (tavan 1 saat). Relink ise yaramiyorsa surekli TCP acip kapatmak
+     modem/hat uzerinde gereksiz yuk.
+  4. **Cihaz ses verirse sayac ANINDA sifirlanir** — durum makinesinden
+     BAGIMSIZ. Eskiden sifirlama yalnizca relink/online yollarina bagliydi;
+     cihaz yoklama penceresinde geri gelip durum makinesi hala 'lost' iken
+     sayac ilerlemeye devam edebiliyor ve calisan bir oturum yikilabiliyordu.
+
+### Changed
+
+- **Ilk basarili G110 okumasi INFO seviyesine cikti**
+  (`yadnp3_g110_okundu device=... nokta=N`), cihaz basina TEK satir. Bu
+  hatanin sessiz kalma sebebi tum G110 loglarinin DEBUG olmasiydi —
+  varsayilan `LOG_LEVEL=INFO` ile hicbiri gorunmuyordu.
+- `scan_g110_once` link KAPALIYKEN istek gondermeden False doner ve DEBUG
+  basar; sahte basari uretmez.
+
+### Notes
+
+- Zorla relink artik belirgin sekilde daha MUHAFAZAKAR: pratikte yalnizca
+  uzun suredir acik ama olu soketler icin calisir. Bu bilincli bir geri
+  cekilme — sahadaki olcum agresif relink'in fayda degil zarar verdigini
+  gosterdi. Yari-acik soket durumu yine kapaniyor, sadece daha sabirli.
+- v1.6.2'deki `_g110_bloklari` aralik turetmesine DOKUNULMADI; SN2.0 ->
+  ((3,23),(65000,65020)) ve PMK -> ((0,50),(65000,65003)) testleri aynen
+  geciyor.
+- Birim testler: 423 passed.
+
 ## [1.6.2] - 2026-08-07
 
 G110 (Octet String) sinyalleri artik her cihaz modelinde okunuyor.
