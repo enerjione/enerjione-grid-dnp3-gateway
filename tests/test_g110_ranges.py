@@ -120,22 +120,154 @@ def test_cok_parcali_dagilimda_blok_sayisi_kapakli(caplog: pytest.LogCaptureFixt
     assert any("g110_blok_sayisi" in r.getMessage() for r in caplog.records), "kirpma sessiz olmamali"
 
 
-# --------------------------------------------- ilk baglantida tetikleme
+# ============================================================================
+# TETIKLEME ANI — v1.6.2'de EKSIK KALAN KISIM
+# ----------------------------------------------------------------------------
+# v1.6.2 taramayi `_ensure_master` icinden, `Enable()`in HEMEN ardindan
+# cagiriyordu ve yorumu "task kuyruga alinir, oturum acilinca kosar" diyordu.
+# Bu YANLISTI: `Enable()` asenkron, o noktada TCP oturumu ACIK DEGIL
+# (listening modda cihaz kendi baglanana kadar dakikalar surebilir).
+# opendnp3'te ad-hoc ScanRange master OFFLINE iken kuyruga ALINMAZ, aninda
+# fail edilir — ama `ScanRange()` exception atmadigi icin kod "queued" yazip
+# True donuyordu: SAHTE BASARI.
+#
+# Sahadaki SN2'ler surekli flap ettigi icin recovery/relink yolundan
+# `request_integrity_poll` -> `scan_g110_once` tetikleniyor ve sorun
+# maskeleniyordu. Kararli hattaki Pole Master Kit bu yola hic girmiyor ve
+# string'leri hicbir zaman gelmiyordu.
+# ============================================================================
+
+
+def _cache() -> Any:
+    return mod._DeviceCache()
+
+
+def test_link_kapaliyken_tarama_istenmez() -> None:
+    """Bayrak kurulmus olsa bile link kapaliyken istek gonderilmez."""
+    c = _cache()
+    c.g110_iste()
+    assert c.g110_gerekli() is True  # bayrak duruyor
+    # ...ama gercek gonderim `scan_g110_once` icinde link kontrolunden gecer:
+    # link kapaliyken sahte basari uretmeden False doner (asagidaki test).
+
+
+def test_scan_g110_once_link_kapaliyken_sahte_basari_uretmez() -> None:
+    """ESKI HATA: link kapaliyken bile 'queued' yazip True donuyordu."""
+
+    class _Master:
+        def __init__(self) -> None:
+            self.cache = _cache()
+            self.g110_ranges = ((3, 5),)
+            self.device = make_device(code="d1")
+            self.istek = 0
+
+        def _g110_gvid(self):
+            return object()
+
+    m = _Master()
+    # cache baglanti kurmadi -> is_connected False
+    assert mod._ManagedMaster.scan_g110_once(m) is False
+    assert m.istek == 0
+
+
+def test_baglanti_acilinca_bayrak_kurulur() -> None:
+    c = _cache()
+    assert c.g110_gerekli() is False, "baglanti yokken istenmez"
+    c.set_connected(True)
+    c.g110_iste()  # OnOpen bunu yapar
+    assert c.g110_gerekli() is True
+
+
+def test_deger_gelmezse_backoff_ile_tekrar_denenir(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tek atisa guvenilmez: istek dusmus olabilir."""
+    c = _cache()
+    c.g110_iste()
+    assert c.g110_gerekli() is True  # 1. deneme
+    assert c.g110_gerekli() is False, "backoff dolmadan tekrar istenmez"
+
+    # Backoff dolsun
+    ileri = [0.0]
+    gercek = mod.time.monotonic
+
+    def _sahte():
+        return gercek() + ileri[0]
+
+    monkeypatch.setattr(mod.time, "monotonic", _sahte)
+    ileri[0] = mod._G110_BACKOFF_BASE_SEC + 1.0
+    assert c.g110_gerekli() is True, "backoff dolunca yeniden denenmeli"
+
+
+def test_deger_gelince_bir_daha_denenmez(monkeypatch: pytest.MonkeyPatch) -> None:
+    """PERIYODIK SCAN YOK: string'ler statik, basarili okumadan sonra durur."""
+    c = _cache()
+    c.g110_iste()
+    assert c.g110_gerekli() is True
+
+    # Cihazdan gercek bir G110 degeri geldi.
+    c.set(110, 3, 0.0, value_string="SN-12345")
+
+    gercek = mod.time.monotonic
+    monkeypatch.setattr(mod.time, "monotonic", lambda: gercek() + 10_000.0)
+    assert c.g110_gerekli() is False, "deger geldikten sonra tekrar istenmemeli"
+    bekliyor, geldi, _ = c.g110_durum()
+    assert geldi is True and bekliyor is False
+
+
+def test_deneme_tavani_ve_uyari(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sonsuza kadar denemez; tavana ulasinca sessiz kalmaz."""
+    c = _cache()
+    c.g110_iste()
+    gercek = mod.time.monotonic
+    ileri = [0.0]
+    monkeypatch.setattr(mod.time, "monotonic", lambda: gercek() + ileri[0])
+
+    deneme = 0
+    for _ in range(mod._G110_MAX_DENEME + 5):
+        ileri[0] += mod._G110_BACKOFF_MAX_SEC + 1.0
+        if c.g110_gerekli():
+            deneme += 1
+    assert deneme == mod._G110_MAX_DENEME
+    assert c.g110_tukendi_mi() is True, "tavan doldu, operator uyarilmali"
+
+
+def test_link_kopup_acilinca_yeniden_tetiklenir() -> None:
+    """Cihaz degistirilmis / konfigi guncellenmis olabilir."""
+    c = _cache()
+    c.set_connected(True)
+    c.g110_iste()
+    c.g110_gerekli()
+    c.set(110, 3, 0.0, value_string="SN-1")
+    assert c.g110_gerekli() is False
+
+    c.set_connected(False)  # link koptu
+    c.set_connected(True)
+    c.g110_iste()  # sonraki OnOpen
+    assert c.g110_gerekli() is True
+
+
+# ------------------------------------------- adapter seviyesinde tetikleme
 class _SahteMaster:
-    def __init__(self) -> None:
+    def __init__(self, cache: Any, device: Any) -> None:
+        self.cache = cache
+        self.device = device
         self.g110_ranges: tuple[tuple[int, int], ...] = ()
         self.connection_fingerprint: tuple = ()
         self.scan_sayisi = 0
-        self.cache = object()
-        self.device = None
+        self.last_command_at = 0.0
 
     def scan_g110_once(self) -> bool:
         self.scan_sayisi += 1
         return True
 
+    def request_integrity_poll(self) -> bool:
+        return True
+
+    def shutdown(self) -> None:
+        pass
+
 
 @pytest.fixture
-def okuyucu(monkeypatch: pytest.MonkeyPatch):
+def okuyucu():
     import threading
 
     r = mod.Yadnp3TelemetryReader.__new__(mod.Yadnp3TelemetryReader)
@@ -147,80 +279,50 @@ def okuyucu(monkeypatch: pytest.MonkeyPatch):
     r._default_dnp3_tcp_port = 20000
     r._time_sync = "lan"
     r._manager = None
+    r._lost_probe_lock = threading.Lock()
+    r._lost_probe = {}
+    r._lost_probe_total = 0
+    r._forced_relink_total = 0
+    r._g110_uyarilan = set()
+    r._publish_dnp3_quality = False
     return r
 
 
-def _master_yakala(okuyucu, monkeypatch: pytest.MonkeyPatch) -> list[_SahteMaster]:
+def test_master_kurulurken_tarama_gonderilmez(okuyucu, monkeypatch: pytest.MonkeyPatch) -> None:
+    """KABUL KRITERI: link henuz acik degilken hicbir ScanRange gitmez."""
     uretilen: list[_SahteMaster] = []
 
     def _sahte(*a: Any, **kw: Any) -> _SahteMaster:
-        m = _SahteMaster()
+        m = _SahteMaster(_cache(), kw.get("device"))
         uretilen.append(m)
         return m
 
     monkeypatch.setattr(mod, "_ManagedMaster", _sahte)
-    return uretilen
-
-
-def test_ilk_kurulumda_string_okumasi_tetiklenir(okuyucu, monkeypatch: pytest.MonkeyPatch) -> None:
-    """ASIL DUZELTME 2: hic kopmayan cihazda string'ler hic okunmuyordu."""
-    uretilen = _master_yakala(okuyucu, monkeypatch)
     device = make_device(code="PMK-1")
 
     mm = okuyucu._ensure_master(device, _g110(PMK_INDEXLER))
 
-    assert uretilen and mm is uretilen[0]
-    assert mm.scan_sayisi == 1, "Enable() sonrasi bir kez string okunmali"
-    assert mm.g110_ranges == ((0, 50), (65000, 65003))
+    assert mm.scan_sayisi == 0, "Enable() sonrasi ANINDA tarama gonderilmemeli"
+    assert mm.g110_ranges == ((0, 50), (65000, 65003)), "aralilar yine de kurulmali"
 
 
-def test_g110_olmayan_cihazda_istek_gonderilmez(okuyucu, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Bos G110 setinde ScanRange cagrilmamali."""
-    _master_yakala(okuyucu, monkeypatch)
-    device = make_device(code="d1")
-
-    mm = okuyucu._ensure_master(device, [make_signal(object_group=30, index=0)])
-
-    assert mm.g110_ranges == ()
-    # scan_g110_once cagrilir ama bos aralikta hicbir ScanRange uretmez;
-    # gercek davranis `scan_g110_once` icinde erken donus ile kilitli.
-    assert mod._g110_bloklari([make_signal(object_group=30, index=0)]) == ()
-
-
-def test_ikinci_cagride_tekrar_taranmaz(okuyucu, monkeypatch: pytest.MonkeyPatch) -> None:
-    """One-shot: her poll cycle'inda string taramasi YAPILMAZ."""
-    _master_yakala(okuyucu, monkeypatch)
+def test_link_acilinca_ilk_cycle_bir_kez_tarar(okuyucu, monkeypatch: pytest.MonkeyPatch) -> None:
+    """KABUL KRITERI: OnOpen sonrasi ilk read_device'da TAM BIR KEZ."""
     device = make_device(code="PMK-1")
-    signals = _g110(PMK_INDEXLER)
+    signals = _g110([3, 4, 5])
+    mm = _SahteMaster(_cache(), device)
+    mm.g110_ranges = ((3, 5),)
+    okuyucu._masters[device.code] = mm
+    monkeypatch.setattr(okuyucu, "_ensure_master", lambda d, s=None: mm)
 
-    mm = okuyucu._ensure_master(device, signals)
+    # Link acildi (OnOpen'in yaptigi)
+    mm.cache.set_connected(True)
+    mm.cache.g110_iste()
+
+    okuyucu.read_device(device=device, signals=signals)
+    assert mm.scan_sayisi == 1
+
+    # Ayni cycle'lar tekrar etse de backoff dolmadan yeniden istenmez.
     for _ in range(5):
-        okuyucu._ensure_master(device, signals)
-
+        okuyucu.read_device(device=device, signals=signals)
     assert mm.scan_sayisi == 1
-
-
-def test_komut_yolu_bloklari_silmez(okuyucu, monkeypatch: pytest.MonkeyPatch) -> None:
-    """`signals=None` (komut gonderme) okuma yolunun bloklarini bozmamali."""
-    _master_yakala(okuyucu, monkeypatch)
-    device = make_device(code="PMK-1")
-    mm = okuyucu._ensure_master(device, _g110(PMK_INDEXLER))
-
-    okuyucu._ensure_master(device)  # komut yolu
-
-    assert mm.g110_ranges == ((0, 50), (65000, 65003))
-    assert mm.scan_sayisi == 1
-
-
-def test_sonradan_string_eklenirse_bir_kez_taranir(okuyucu, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Ilk temas komutla olmus ya da config refresh string eklemis olabilir."""
-    _master_yakala(okuyucu, monkeypatch)
-    device = make_device(code="d1")
-
-    mm = okuyucu._ensure_master(device, [make_signal(object_group=30, index=0)])
-    assert mm.scan_sayisi == 1  # kurulum aninda (bos aralikla, istek uretmez)
-
-    okuyucu._ensure_master(device, _g110([3, 4, 5]))
-
-    assert mm.g110_ranges == ((3, 5),)
-    assert mm.scan_sayisi == 2, "bos -> dolu gecisinde bir kez taranmali"

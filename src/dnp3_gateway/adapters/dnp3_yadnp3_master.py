@@ -270,6 +270,40 @@ _LOST_PROBE_INTERVAL_SEC = 30.0
 # soketle dakikalarca oyalanmaz.
 _LOST_RELINK_AFTER_PROBES = 3
 
+# TAZE OTURUMU YIKMA — sahada olculdu (2026-08-11).
+# Zorla relink, ACIK olan TCP oturumunu kapatir. Yerel agda yeniden baglanma
+# milisaniyeler surer; 4G/GSM hatta ise ~3 DAKIKA surdu (11:26:37 master
+# enable -> 11:29:23 link open). Yani yavas hatta relink toparlanmayi
+# HIZLANDIRMIYOR, GECIKTIRIYOR. Daha kotusu dongu kuruyordu:
+#   link acilir -> 15sn grace dolar -> lost -> 90sn yoklama -> relink ->
+#   3 dk yeniden baglanma -> ayni yerden basa
+# Cihaz hicbir zaman kararli bir pencere bulamiyor. Bu yuzden oturum en az
+# bu kadar sure ACIK KALMADAN yikilmaz; o sureye kadar yalnizca yoklanir.
+_LOST_RELINK_MIN_LINK_AGE_SEC = 300.0
+
+# Ard arda relink'ler arasinda ustel bekleme. Ilk relink sonrasi bu kadar,
+# sonra iki kati... tavana kadar. Relink ise yaramiyorsa (cihaz gercekten
+# kapali) saniyede bir TCP acip kapatmanin anlami yok; modem/hat uzerinde
+# gereksiz yuk yaratir.
+_LOST_RELINK_BACKOFF_BASE_SEC = 300.0
+_LOST_RELINK_BACKOFF_MAX_SEC = 3600.0
+
+# Komut gonderildikten sonra bu sure boyunca oturum YIKILMAZ. CROB gorevi
+# master uzerinde asenkron kosar; ortasinda `shutdown()` cagrilirsa gorev
+# cevap alamadan olur ve sonuc `CommandStatus.UNDEFINED` doner. Poll thread'i
+# ile komut yolu arasinda baska bir koordinasyon yok.
+_LOST_RELINK_COMMAND_GRACE_SEC = 60.0
+
+# G110 tarama tekrar denemesi. Ad-hoc ScanRange istegi DUSEBILIR ve binding
+# exception atmadigi icin bunu anlayamayiz; basari, istegin gonderilmesiyle
+# degil cihazdan gercekten bir string gelmesiyle olculur. Gelmezse:
+# 15, 30, 60, 120, 240 sn ... tavana kadar.
+_G110_BACKOFF_BASE_SEC = 15.0
+_G110_BACKOFF_MAX_SEC = 240.0
+# Deneme tavani. Ulasilirsa BIR KEZ WARNING basilir; periyodik scan'e
+# donusmemesi icin sinirli.
+_G110_MAX_DENEME = 6
+
 
 # G110 (Octet String) okuma bloklarinin turetilmesi
 # -------------------------------------------------
@@ -395,6 +429,14 @@ class _DeviceCache:
         # Outstation IIN bayraklarinin son gorulen hali (edge-trigger log icin).
         self._iin_flags: dict[str, bool] = {}
         self._connected = False
+        # Mevcut link oturumunun acilis damgasi (monotonic). Taze bir oturumu
+        # zorla yikmamak icin okunur; bkz. `link_age`.
+        self._link_opened_at = 0.0
+        # G110 (string) okuma durumu — bkz. `g110_iste` / `g110_gerekli`.
+        self._g110_bekliyor = False
+        self._g110_geldi = False
+        self._g110_deneme = 0
+        self._g110_sonraki_at = 0.0
         # SURE OLCUMLERI MONOTONIC SAATLE YAPILIR.
         #
         # Bu alan "en son ne zaman frame geldi" sorusunu cevapliyor ve
@@ -477,6 +519,13 @@ class _DeviceCache:
         """
         key = (group, index)
         with self._lock:
+            if group == _OBJECT_GROUP_STRING:
+                # G110 VARIS ONAYI: tarama istegi gonderilmis olabilir ama
+                # DUSMUS de olabilir ve `ScanRange()` exception atmadigi icin
+                # bunu anlayamayiz. Bu yuzden basariyi ISTEK degil GELEN
+                # DEGER tanimlar; bayrak burada temizlenir, tekrar deneme durur.
+                self._g110_geldi = True
+                self._g110_bekliyor = False
             prev = self._values.get(key)
             self._values[key] = (raw, value_string, flags, device_time, time_quality)
             now = time.monotonic()
@@ -664,8 +713,83 @@ class _DeviceCache:
         with self._lock:
             return self._mark_all_dirty_unsafe()
 
+    # ---- G110 (string) okuma durumu -------------------------------------
+    # NEDEN BAYRAK: tarama istegi `OnOpen` icinden yapilamaz — o callback
+    # opendnp3'un IO thread'inden gelir ve oradan ScanRange cagirmak riskli.
+    # OnOpen yalnizca "istendi" der; gercek istegi poll thread'i (read_device)
+    # gonderir.
+    #
+    # NEDEN TEKRAR DENEME: ad-hoc ScanRange istegi dusebilir ve `ScanRange()`
+    # exception atmadigi icin bunu anlayamayiz. Bu yuzden basari, ISTEGIN
+    # GONDERILMESIYLE degil cihazdan GERCEKTEN bir G110 degeri gelmesiyle
+    # olculur (`set()` icinde isaretlenir). Gelmezse ustel backoff ile
+    # yeniden denenir.
+    def g110_iste(self) -> None:
+        """Link acildi — string okumasi (yeniden) istensin."""
+        with self._lock:
+            self._g110_bekliyor = True
+            self._g110_geldi = False
+            self._g110_deneme = 0
+            self._g110_sonraki_at = 0.0
+
+    def g110_gerekli(self) -> bool:
+        """SU AN bir tarama istegi gonderilmeli mi? (deneme sayacini ilerletir)
+
+        True donerse caller `scan_g110_once()` cagirmali. Backoff dolmadiysa
+        ya da deger zaten geldiyse False doner.
+        """
+        with self._lock:
+            if not self._g110_bekliyor or self._g110_geldi:
+                return False
+            simdi = time.monotonic()
+            if simdi < self._g110_sonraki_at:
+                return False
+            if self._g110_deneme >= _G110_MAX_DENEME:
+                return False
+            self._g110_deneme += 1
+            # 15, 30, 60, 120... sn — tavana kadar.
+            gecikme = min(
+                _G110_BACKOFF_MAX_SEC,
+                _G110_BACKOFF_BASE_SEC * (2 ** (self._g110_deneme - 1)),
+            )
+            self._g110_sonraki_at = simdi + gecikme
+            return True
+
+    def g110_durum(self) -> tuple[bool, bool, int]:
+        """(bekliyor, geldi, deneme) — teshis/test icin."""
+        with self._lock:
+            return self._g110_bekliyor, self._g110_geldi, self._g110_deneme
+
+    def g110_tukendi_mi(self) -> bool:
+        """Deneme tavanina ulasildi ve hala deger gelmedi mi?"""
+        with self._lock:
+            return self._g110_bekliyor and not self._g110_geldi and self._g110_deneme >= _G110_MAX_DENEME
+
+    def link_age(self) -> float:
+        """Mevcut link oturumu kac saniyedir acik? Kapaliysa -1.
+
+        Zorla relink karari bunu okur: TAZE kurulmus bir oturumu yikmak
+        yavas hatlarda toparlanmayi HIZLANDIRMAZ, geciktirir (4G'de yeniden
+        baglanma ~3 dakika surebiliyor).
+        """
+        with self._lock:
+            if not self._connected or self._link_opened_at == 0.0:
+                return -1.0
+            return time.monotonic() - self._link_opened_at
+
     def set_connected(self, ok: bool) -> None:
         with self._lock:
+            if ok and not self._connected:
+                self._link_opened_at = time.monotonic()
+            elif not ok:
+                self._link_opened_at = 0.0
+                # Link koptu: string'ler statik ama cihaz degistirilmis /
+                # konfigi guncellenmis olabilir. Sonraki OnOpen yeniden
+                # tetiklesin.
+                self._g110_bekliyor = False
+                self._g110_geldi = False
+                self._g110_deneme = 0
+                self._g110_sonraki_at = 0.0
             self._connected = ok
             # Link tamamen koptu → state'i lost'a dusur. recovery flag'lerini
             # temizle ki sonraki OnOpen yeniden recovering tetiklesin.
@@ -757,6 +881,9 @@ def _make_soe_handler(cache: _DeviceCache, device_code: str) -> Any:
     if not _YADNP3_AVAILABLE:
         raise Yadnp3AdapterError(f"yadnp3 yuklu degil: {_YADNP3_IMPORT_ERROR}")
 
+    # Ilk basarili G110 okumasini bir kez INFO'ya basmak icin (bkz. Process).
+    g110_bildirildi = False
+
     class _CacheSOEHandler(opendnp3.ISOEHandler):  # type: ignore[misc]
         def __init__(self) -> None:
             super().__init__()
@@ -771,6 +898,7 @@ def _make_soe_handler(cache: _DeviceCache, device_code: str) -> Any:
             pass
 
         def Process(self, info, values):  # noqa: N802
+            nonlocal g110_bildirildi
             if not values:
                 return
             first = values[0].value
@@ -859,6 +987,18 @@ def _make_soe_handler(cache: _DeviceCache, device_code: str) -> Any:
                             text,
                         )
                         cache.set(_OBJECT_GROUP_STRING, it.index, 0.0, value_string=text)
+                    # ILK basarili okumayi INFO'ya cikar: bu hatanin sessiz
+                    # kalma sebebi tum G110 loglarinin DEBUG olmasiydi
+                    # (varsayilan LOG_LEVEL=INFO ile hic gorunmuyorlardi).
+                    # Cihaz basina TEK satir — log spam yok.
+                    if not g110_bildirildi:
+                        g110_bildirildi = True  # noqa: F841 — nonlocal asagida
+                        logger.info(
+                            "yadnp3_g110_okundu device=%s nokta=%d — string "
+                            "(seri no / IMEI / IP / firmware) alindi",
+                            device_code,
+                            len(values),
+                        )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "yadnp3_soe_process_error device=%s error=%s",
@@ -999,6 +1139,10 @@ def _make_master_app(cache: _DeviceCache, device_code: str) -> Any:
             # comm_lost yayinlayarak SCADA'yi yaniltmamaya devam eder.
             cache.set_connected(True)
             cache.begin_recovery()
+            # String taramasini ISTE — istegi buradan GONDERME. Bu callback
+            # opendnp3'un IO thread'inden gelir; ScanRange'i poll thread'i
+            # (read_device) gonderir.
+            cache.g110_iste()
             logger.info("yadnp3_master_link_open device=%s state=recovering", device_code)
 
         def OnClose(self):  # noqa: N802
@@ -1091,6 +1235,10 @@ class _ManagedMaster:
         # gateway'de SN2.0 ile Pole Master Kit birlikte bulunabilir ve
         # string index haritalari farklidir.
         self.g110_ranges: tuple[tuple[int, int], ...] = ()
+        # Son CROB gonderiminin monotonic damgasi. Zorla relink bunu okur:
+        # komut ucustayken oturumu yikmak gorevi cevapsiz birakir ve sonuc
+        # CommandStatus.UNDEFINED doner (sahada olculdu 2026-08-11).
+        self.last_command_at: float = 0.0
 
         endpoint_type = (device.ip_endpoint_type or "listening").lower()
         channel_mode: str
@@ -1260,6 +1408,16 @@ class _ManagedMaster:
         if not self.g110_ranges:
             # Cihazin G110 sinyali yok — hicbir istek gonderilmez.
             return False
+        if not self.cache.is_connected():
+            # LINK KAPALI: ad-hoc ScanRange master OFFLINE iken kuyruga
+            # ALINMAZ, aninda fail edilir — ama `ScanRange()` exception
+            # atmadigi icin eskiden "queued" yazip True donuyorduk. Sahte
+            # basari uretmek yerine acikca vazgeciyoruz.
+            logger.debug(
+                "yadnp3_g110_scan_atlandi device=%s sebep=link_kapali",
+                self.device.code,
+            )
+            return False
         gv = self._g110_gvid()
         scan_range = getattr(self._master, "ScanRange", None)
         if gv is None or scan_range is None:
@@ -1375,6 +1533,9 @@ class _ManagedMaster:
           dnp3_state (CommandPointState), control (op_type), mode, points[].
           Toplam sure operate_device'da olculur.
         """
+        # Komut BASLANGICINI isaretle: poll thread'i bu pencerede zorla
+        # relink yapmasin (bkz. _LOST_RELINK_COMMAND_GRACE_SEC).
+        self.last_command_at = time.monotonic()
         # ---- Baglanti fail-fast: cihaz online degilse komut GONDERME ----
         # (offline'da DirectOperate/SBO 10s bloklar sonra timeout doner; erken
         # kesip net "offline" don.) cache.state(): online|recovering|lost.
@@ -1580,6 +1741,8 @@ class Yadnp3TelemetryReader(TelemetryReader):
         self._lost_probe: dict[str, dict[str, float]] = {}
         self._lost_probe_total = 0
         self._forced_relink_total = 0
+        # G110 okunamadi uyarisi verilmis cihazlar (cihaz basina TEK uyari).
+        self._g110_uyarilan: set[str] = set()
 
     @staticmethod
     def _resolve_tcp_port(device: DeviceConfig, default_port: int) -> int:
@@ -1689,15 +1852,17 @@ class Yadnp3TelemetryReader(TelemetryReader):
             self._g110_araliklarini_guncelle(hazir, g110, signals)
             return hazir
 
-        # ILK BAGLANTIDA STRING OKUMASI — lock DISINDA.
-        # Eskiden `scan_g110_once` yalnizca `request_integrity_poll` icinden
-        # cagriliyordu; o da lost-probe / stale / relink / manuel refresh
-        # yollarindan geliyordu. Yani duzgun baglanip HIC KOPMAYAN bir cihazda
-        # string okumasi hicbir zaman tetiklenmiyordu. Sahadaki SN2'ler surekli
-        # kopup baglandigi icin bu eksik maskelenmisti.
-        # Enable() `_ManagedMaster.__init__` icinde yapildi; task kuyruga
-        # alinir ve oturum acilinca kosar.
-        mm.scan_g110_once()
+        # STRING OKUMASI BURADA TETIKLENMEZ.
+        # v1.6.2'de buradan `scan_g110_once()` cagriliyordu ve yorumu "task
+        # kuyruga alinir, oturum acilinca kosar" diyordu — BU YANLISTI.
+        # `Enable()` asenkron; bu noktada TCP oturumu ACIK DEGIL (listening
+        # modda cihaz kendi baglanana kadar dakikalar surebilir). opendnp3'te
+        # ad-hoc ScanRange master OFFLINE iken kuyruga ALINMAZ, aninda fail
+        # edilir; `ScanRange()` exception atmadigi icin kod "queued" yazip
+        # True donuyordu — SAHTE BASARI. Kararli baglanan cihazda string'ler
+        # bu yuzden hic gelmiyordu.
+        # Artik tetikleme link ACILDIKTAN SONRA, poll thread'inden yapiliyor:
+        # OnOpen -> cache.g110_iste(), read_device -> scan_g110_once().
         return mm
 
     @staticmethod
@@ -1721,7 +1886,9 @@ class Yadnp3TelemetryReader(TelemetryReader):
         onceden_bos = not mm.g110_ranges
         mm.g110_ranges = g110
         if onceden_bos and g110:
-            mm.scan_g110_once()
+            # Taramayi BURADAN gonderme (link acik olmayabilir); iste yeter.
+            # Poll thread'i link acikken gerçekleştirir.
+            mm.cache.g110_iste()
 
     # ---- Kopuk cihaz yoklamasi ------------------------------------------
     def _lost_probe_durumu(self, mm: Any) -> dict[str, float]:
@@ -1732,6 +1899,10 @@ class Yadnp3TelemetryReader(TelemetryReader):
             return dict(d) if d else {"son": 0.0, "deneme": 0}
 
     def _lost_probe_sifirla(self, device_code: str) -> None:
+        # Hot-path: saglikli cihazlarda her cycle cagrilir (bkz. read_device
+        # "cihaz ses verdiyse" blogu). Kayit yoksa lock bile alma.
+        if device_code not in self._lost_probe:
+            return
         with self._lost_probe_lock:
             self._lost_probe.pop(device_code, None)
 
@@ -1796,6 +1967,55 @@ class Yadnp3TelemetryReader(TelemetryReader):
                 logger.debug("yadnp3_lost_probe_error device=%s", kod, exc_info=True)
             return
 
+        # ---- ZORLA RELINK'TEN VAZGECME KOSULLARI --------------------------
+        # Bu uc kontrol sahada olculen bir dongunun sonucu (2026-08-11):
+        # relink acik TCP oturumunu yikiyor, 4G'de yeniden baglanma ~3 dakika
+        # suruyor ve cihaz hicbir zaman kararli bir pencere bulamiyordu.
+
+        # 1) TAZE OTURUM: link henuz yeni acildiysa yikma, yoklamaya devam et.
+        try:
+            link_yasi = float(mm.cache.link_age())
+        except Exception:  # noqa: BLE001
+            link_yasi = -1.0
+        if 0.0 <= link_yasi < _LOST_RELINK_MIN_LINK_AGE_SEC:
+            logger.debug(
+                "yadnp3_relink_ertelendi device=%s sebep=taze_oturum link_yasi=%.0fs min=%.0fs",
+                kod,
+                link_yasi,
+                _LOST_RELINK_MIN_LINK_AGE_SEC,
+            )
+            self._relink_denemesini_geri_al(kod)
+            return
+
+        # 2) KOMUT UCUSTA: CROB gorevi master uzerinde asenkron kosar.
+        # Ortasinda shutdown() cagrilirsa gorev cevap alamadan olur ve sonuc
+        # CommandStatus.UNDEFINED doner — sahada tam olarak bu gorulduu.
+        son_komut = float(getattr(mm, "last_command_at", 0.0) or 0.0)
+        if son_komut and (simdi - son_komut) < _LOST_RELINK_COMMAND_GRACE_SEC:
+            logger.info(
+                "yadnp3_relink_ertelendi device=%s sebep=komut_ucusta yas=%.0fs — "
+                "oturum yikilirsa komut cevapsiz kalir (CommandStatus.UNDEFINED)",
+                kod,
+                simdi - son_komut,
+            )
+            self._relink_denemesini_geri_al(kod)
+            return
+
+        # 3) USTEL BEKLEME: onceki relink ise yaramadiysa saniyede bir TCP
+        # acip kapatmanin anlami yok; modem/hat uzerinde gereksiz yuk.
+        with self._lost_probe_lock:
+            d = self._lost_probe.setdefault(kod, {"son": simdi, "deneme": 0})
+            bekleme = float(d.get("relink_bekleme") or 0.0)
+            son_relink = float(d.get("son_relink") or 0.0)
+        if son_relink and bekleme and (simdi - son_relink) < bekleme:
+            logger.debug(
+                "yadnp3_relink_ertelendi device=%s sebep=backoff kalan=%.0fs",
+                kod,
+                bekleme - (simdi - son_relink),
+            )
+            self._relink_denemesini_geri_al(kod)
+            return
+
         # Yoklamalar sonuc vermedi: soket olu ama kapanmamis. Tek cikis
         # oturumu bastan kurmak. Master'i dusuruyoruz; bir sonraki cycle'da
         # `_ensure_master` yeni kanal + master yaratir.
@@ -1814,8 +2034,37 @@ class Yadnp3TelemetryReader(TelemetryReader):
         with self._lock:
             if self._masters.get(kod) is mm:
                 self._masters.pop(kod, None)
-        # Sayaci sifirla ki yeni oturum kendi esigiyle baslasin.
-        self._lost_probe_sifirla(kod)
+        # Yoklama sayacini sifirla ama BACKOFF'u koru: bir sonraki relink
+        # daha uzun beklesin. `_lost_probe_sifirla` her seyi silseydi ard
+        # arda relink dongusune girilirdi (sahada gorulen davranis).
+        with self._lost_probe_lock:
+            onceki = float((self._lost_probe.get(kod) or {}).get("relink_bekleme") or 0.0)
+            yeni_bekleme = min(
+                _LOST_RELINK_BACKOFF_MAX_SEC,
+                onceki * 2.0 if onceki else _LOST_RELINK_BACKOFF_BASE_SEC,
+            )
+            self._lost_probe[kod] = {
+                "son": 0.0,
+                "deneme": 0,
+                "son_relink": simdi,
+                "relink_bekleme": yeni_bekleme,
+            }
+
+    def _relink_denemesini_geri_al(self, device_code: str) -> None:
+        """Relink ertelendi — sayaci esikte tut, sonsuza kadar buyutme.
+
+        Deneme sayaci esigin bir ustunde birakilirsa her yoklama araliginda
+        yeniden relink denenir ve erteleme kontrolleri bosa doner. Esige geri
+        cekmek, kosullar duzeldiginde relink'in bir sonraki turda calismasini
+        saglar; `_forced_relink_total` sayaci da sismez.
+        """
+        esik = getattr(self, "_lost_relink_after_probes", 0) or _LOST_RELINK_AFTER_PROBES
+        with self._lost_probe_lock:
+            d = self._lost_probe.get(device_code)
+            if d is not None:
+                d["deneme"] = esik
+            if self._forced_relink_total > 0:
+                self._forced_relink_total -= 1
 
     def read_device(
         self,
@@ -1828,6 +2077,27 @@ class Yadnp3TelemetryReader(TelemetryReader):
         mm = self._ensure_master(device, signals)
         cache = mm.cache
         connected = cache.is_connected()
+
+        # G110 (string) okumasi — link ACILDIKTAN SONRA, POLL THREAD'inden.
+        # `OnOpen` yalnizca "istendi" der (o callback opendnp3'un IO
+        # thread'inden gelir; oradan ScanRange cagirmak riskli). Gercek istek
+        # burada gonderilir. Basari, istegin gonderilmesiyle DEGIL cihazdan
+        # gercekten bir G110 degeri gelmesiyle olculur; gelmezse `g110_gerekli`
+        # ustel backoff ile yeniden izin verir. Deger gelince tekrar denenmez
+        # (string'ler statik — periyodik scan YOK).
+        if connected and cache.g110_gerekli():
+            mm.scan_g110_once()
+        elif cache.g110_tukendi_mi() and device.code not in self._g110_uyarilan:
+            self._g110_uyarilan.add(device.code)
+            logger.warning(
+                "yadnp3_g110_okunamadi device=%s ip=%s deneme=%d — string "
+                "(G110) degerleri cihazdan alinamadi; seri no / IMEI / IP / "
+                "firmware alanlari BOS kalacak. Cihaz bu noktalari destekliyor "
+                "mu ve sinyal index'leri dogru mu kontrol edin.",
+                device.code,
+                device.ip_address,
+                _G110_MAX_DENEME,
+            )
 
         # Stale-data guard: OpenDNP3'in `OnOpen`/`OnClose` callback'leri her
         # turde TCP kopmasinda tetiklenmeyebilir (channel auto-retry icin
@@ -1864,6 +2134,15 @@ class Yadnp3TelemetryReader(TelemetryReader):
         #   * connected=True ve online → normal event-driven yayin.
 
         cache_state = cache.state()
+
+        # CIHAZ SES VERDIYSE YOKLAMAYI SIFIRLA — durum makinesinden BAGIMSIZ.
+        # Taze veri geliyorsa cihaz konusuyor demektir; relink sayacinin
+        # ilerlemeye devam etmesi anlamsiz. Eskiden sifirlama yalnizca
+        # relink/online yollarina bagliydi; cihaz yoklama penceresinde geri
+        # gelip durum makinesi henuz 'lost'ta iken sayac ilerlemeye devam
+        # edebiliyor ve calisan bir oturum yikilabiliyordu.
+        if connected and not stale:
+            self._lost_probe_sifirla(device.code)
 
         # Stale-edge: link OnOpen demis ama frame gelmiyor. State'i recovery'e
         # cek ki SCADA hala comm_lost gorsun, fresh frame beklensin.
