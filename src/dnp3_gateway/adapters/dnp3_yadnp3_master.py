@@ -271,6 +271,93 @@ _LOST_PROBE_INTERVAL_SEC = 30.0
 _LOST_RELINK_AFTER_PROBES = 3
 
 
+# G110 (Octet String) okuma bloklarinin turetilmesi
+# -------------------------------------------------
+# Aralilar eskiden SINIF SABITI idi: ((3, 23), (65000, 65020)) — SN2.0'in
+# index haritasi. Ayni gateway'e Pole Master Kit eklendiginde o cihazin 54
+# string'inin 30'u HIC istenmiyordu (SIM CCID, sebeke bilgileri, sat04-sat09).
+# Artik her cihazin KENDI sinyal setinden turetiliyor.
+#
+# Bitisik olmayan index'ler bloklara gruplanir: iki index arasindaki mesafe
+# bu esikten kucuk/esitse ayni bloga girer. Amac tek tek yuzlerce istek
+# yerine birkac dar blok gondermek; 8 SN2.0'in gercek bosluklarini
+# (3->5, 17->19, 65003->65009, 65014->65020) kapsayacak kadar genis,
+# 23 -> 65000 gibi ucurumlari birlestirmeyecek kadar dar.
+_G110_BLOK_BOSLUK = 8
+
+# Tek bir blogun ust genislik siniri. 0-65535 gibi genis tek aralik ASLA
+# istenmemeli — Mayis 2026'da cihazi bozdu (revert 1302b83). Blok gruplama
+# zaten bunu engelliyor; bu sinir ikinci baraj: hesaplanan blok bu genisligi
+# asarsa parcalanir.
+_G110_BLOK_MAX_GENISLIK = 512
+
+# Toplam blok sayisi kapagi: her blok ayri bir DNP3 read task'i demek.
+# Asilirsa fazlasi kirpilir ve WARNING atilir (sessiz kirpma olmaz).
+_G110_MAX_BLOK = 16
+
+
+def _g110_bloklari(
+    signals: list[SignalConfig] | None,
+    *,
+    device_code: str = "",
+) -> tuple[tuple[int, int], ...]:
+    """Cihazin G110 sinyallerinden dar okuma bloklari uret.
+
+    Girdi `read_device`in zaten aldigi sinyal listesidir; ekstra veri
+    gerekmez. G110 sinyali olmayan cihaz icin bos demet doner ve hicbir
+    ScanRange istegi gonderilmez.
+    """
+    indeksler = sorted(
+        {
+            int(s.dnp3_index)
+            for s in (signals or [])
+            if int(s.dnp3_object_group or 0) == 110 and s.dnp3_index is not None
+        }
+    )
+    if not indeksler:
+        return ()
+
+    bloklar: list[tuple[int, int]] = []
+    bas = son = indeksler[0]
+    for i in indeksler[1:]:
+        if i - son <= _G110_BLOK_BOSLUK:
+            son = i
+        else:
+            bloklar.append((bas, son))
+            bas = son = i
+    bloklar.append((bas, son))
+
+    # Genislik bariyeri: bir blok tavani asarsa parcala (nokta kaybetmeden).
+    parcali: list[tuple[int, int]] = []
+    for bas, son in bloklar:
+        if son - bas + 1 <= _G110_BLOK_MAX_GENISLIK:
+            parcali.append((bas, son))
+            continue
+        logger.warning(
+            "yadnp3_g110_blok_genis device=%s blok=%s-%s genislik=%s max=%s — parcalaniyor",
+            device_code,
+            bas,
+            son,
+            son - bas + 1,
+            _G110_BLOK_MAX_GENISLIK,
+        )
+        p = bas
+        while p <= son:
+            parcali.append((p, min(son, p + _G110_BLOK_MAX_GENISLIK - 1)))
+            p += _G110_BLOK_MAX_GENISLIK
+
+    if len(parcali) > _G110_MAX_BLOK:
+        logger.warning(
+            "yadnp3_g110_blok_sayisi device=%s blok=%d max=%d — fazlasi kirpildi; "
+            "sinyal setindeki index dagilimi cok parcali olabilir",
+            device_code,
+            len(parcali),
+            _G110_MAX_BLOK,
+        )
+        parcali = parcali[:_G110_MAX_BLOK]
+    return tuple(parcali)
+
+
 class Yadnp3AdapterError(RuntimeError):
     """yadnp3 adapter'inda olusan hata."""
 
@@ -999,6 +1086,11 @@ class _ManagedMaster:
         self._manager = manager
         self._scan_interval_sec = max(1, int(scan_interval_sec))
         self._baseline_interval_sec = max(self._scan_interval_sec, int(baseline_interval_sec))
+        # G110 (string) okuma bloklari — CIHAZ BASINA, o cihazin sinyal
+        # setinden turetilir (`_g110_bloklari`). Sinif sabiti OLAMAZ: ayni
+        # gateway'de SN2.0 ile Pole Master Kit birlikte bulunabilir ve
+        # string index haritalari farklidir.
+        self.g110_ranges: tuple[tuple[int, int], ...] = ()
 
         endpoint_type = (device.ip_endpoint_type or "listening").lower()
         channel_mode: str
@@ -1151,10 +1243,6 @@ class _ManagedMaster:
                     continue
         return None
 
-    # Cihazin G110 (string) index'leri iki dar blokta topli. 0-65535 ASLA
-    # istenmez (Mayis 2026'da cihazi bozdu, revert 1302b83); sadece bu iki blok.
-    _G110_RANGES = ((3, 23), (65000, 65020))
-
     def scan_g110_once(self) -> bool:
         """G110 string'leri BIR KEZ dar-range oku (one-shot, periyodik DEGIL).
 
@@ -1162,13 +1250,22 @@ class _ManagedMaster:
         String'ler statik oldugu icin tek okuma yeterli; surekli scan cihaz/modem
         yuku + link riski yaratir. `ScanRange` yoksa sessizce atla.
 
+        Aralilar `g110_ranges`ten gelir ve CIHAZ BASINA turetilir (bkz.
+        `_g110_bloklari`). Eskiden bu bir SINIF SABITI idi — ((3,23),
+        (65000,65020)) — ve SN2.0'in index haritasiydi. Ayni gateway'de
+        Pole Master Kit gibi baska bir model bulundugunda o cihazin
+        string'lerinin buyuk kismi HIC istenmiyordu (54 noktanin 30'u).
+
         Returns: True = en az bir range task kuyruga alindi."""
+        if not self.g110_ranges:
+            # Cihazin G110 sinyali yok — hicbir istek gonderilmez.
+            return False
         gv = self._g110_gvid()
         scan_range = getattr(self._master, "ScanRange", None)
         if gv is None or scan_range is None:
             return False
         ok = False
-        for start, stop in self._G110_RANGES:
+        for start, stop in self.g110_ranges:
             try:
                 scan_range(gv, int(start), int(stop), self._soe, opendnp3.TaskConfig.Default())
                 ok = True
@@ -1513,7 +1610,11 @@ class Yadnp3TelemetryReader(TelemetryReader):
             int(device.master_ip_port or 0),
         )
 
-    def _ensure_master(self, device: DeviceConfig) -> _ManagedMaster:
+    def _ensure_master(
+        self,
+        device: DeviceConfig,
+        signals: list[SignalConfig] | None = None,
+    ) -> _ManagedMaster:
         """Cihaz icin _ManagedMaster doner — varsa cache'den, yoksa olusturur.
 
         Double-check pattern: hot-path'te (master zaten var VE imzasi ayni)
@@ -1540,16 +1641,19 @@ class Yadnp3TelemetryReader(TelemetryReader):
         adapter'da yoktu.)
         """
         want = self._connection_fingerprint(device)
+        g110 = _g110_bloklari(signals, device_code=device.code)
         # Hot-path: lock-free dict lookup + imza karsilastirmasi
         existing = self._masters.get(device.code)
         if existing is not None and existing.connection_fingerprint == want:
+            self._g110_araliklarini_guncelle(existing, g110, signals)
             return existing
 
+        hazir: _ManagedMaster | None = None
         with self._lock:
             existing = self._masters.get(device.code)
-            if existing is not None:
-                if existing.connection_fingerprint == want:
-                    return existing
+            if existing is not None and existing.connection_fingerprint == want:
+                hazir = existing
+            elif existing is not None:
                 # Baglanti parametreleri degisti -> eskisini kapat, yeniden kur.
                 logger.warning(
                     "yadnp3_master_rebuild device=%s eski=%s yeni=%s — cihaz "
@@ -1564,20 +1668,60 @@ class Yadnp3TelemetryReader(TelemetryReader):
                     logger.debug("yadnp3_master_shutdown_error device=%s", device.code, exc_info=True)
                 self._masters.pop(device.code, None)
 
-            port = self._resolve_tcp_port(device, self._default_dnp3_tcp_port)
-            local_addr = self._resolve_local_address(device, self._local_address)
-            mm = _ManagedMaster(
-                self._manager,
-                device=device,
-                local_address=local_addr,
-                tcp_port=port,
-                scan_interval_sec=self._scan_interval_sec,
-                baseline_interval_sec=self._baseline_interval_sec,
-                time_sync=self._time_sync,
-            )
-            mm.connection_fingerprint = want
-            self._masters[device.code] = mm
-            return mm
+            if hazir is None:
+                port = self._resolve_tcp_port(device, self._default_dnp3_tcp_port)
+                local_addr = self._resolve_local_address(device, self._local_address)
+                mm = _ManagedMaster(
+                    self._manager,
+                    device=device,
+                    local_address=local_addr,
+                    tcp_port=port,
+                    scan_interval_sec=self._scan_interval_sec,
+                    baseline_interval_sec=self._baseline_interval_sec,
+                    time_sync=self._time_sync,
+                )
+                mm.connection_fingerprint = want
+                mm.g110_ranges = g110
+                self._masters[device.code] = mm
+
+        # Yarista baska bir thread kurmus: yalnizca bloklari tazele.
+        if hazir is not None:
+            self._g110_araliklarini_guncelle(hazir, g110, signals)
+            return hazir
+
+        # ILK BAGLANTIDA STRING OKUMASI — lock DISINDA.
+        # Eskiden `scan_g110_once` yalnizca `request_integrity_poll` icinden
+        # cagriliyordu; o da lost-probe / stale / relink / manuel refresh
+        # yollarindan geliyordu. Yani duzgun baglanip HIC KOPMAYAN bir cihazda
+        # string okumasi hicbir zaman tetiklenmiyordu. Sahadaki SN2'ler surekli
+        # kopup baglandigi icin bu eksik maskelenmisti.
+        # Enable() `_ManagedMaster.__init__` icinde yapildi; task kuyruga
+        # alinir ve oturum acilinca kosar.
+        mm.scan_g110_once()
+        return mm
+
+    @staticmethod
+    def _g110_araliklarini_guncelle(
+        mm: _ManagedMaster,
+        g110: tuple[tuple[int, int], ...],
+        signals: list[SignalConfig] | None,
+    ) -> None:
+        """Mevcut master'in G110 bloklarini sinyal setine gore tazele.
+
+        `signals=None` ile cagrilan yollar (komut gonderme) bloklara
+        DOKUNMAZ; aksi halde komut yolu, sinyal listesini bilmedigi icin
+        okuma yolunun kurdugu bloklari silerdi.
+
+        Bloklar BOS iken doluya gecerse string okumasi bir kez tetiklenir:
+        cihazla ilk temas komut yoluyla olmus (master signals'siz kurulmus)
+        ya da config refresh ile yeni string noktalari eklenmis olabilir.
+        """
+        if signals is None or mm.g110_ranges == g110:
+            return
+        onceden_bos = not mm.g110_ranges
+        mm.g110_ranges = g110
+        if onceden_bos and g110:
+            mm.scan_g110_once()
 
     # ---- Kopuk cihaz yoklamasi ------------------------------------------
     def _lost_probe_durumu(self, mm: Any) -> dict[str, float]:
@@ -1679,7 +1823,9 @@ class Yadnp3TelemetryReader(TelemetryReader):
         device: DeviceConfig,
         signals: list[SignalConfig],
     ) -> list[SignalReading]:
-        mm = self._ensure_master(device)
+        # signals GECIRILIYOR: G110 okuma bloklari cihazin kendi sinyal
+        # setinden turetiliyor (bkz. _g110_bloklari).
+        mm = self._ensure_master(device, signals)
         cache = mm.cache
         connected = cache.is_connected()
 
