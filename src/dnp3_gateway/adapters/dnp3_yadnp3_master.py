@@ -294,6 +294,41 @@ _LOST_RELINK_BACKOFF_MAX_SEC = 3600.0
 # ile komut yolu arasinda baska bir koordinasyon yok.
 _LOST_RELINK_COMMAND_GRACE_SEC = 60.0
 
+# BAYATLIK ESIGI — "bu sure boyunca hic ses cikmadiysa gercekten kopuktur".
+# Cok agresif olursa baseline scan'in dogal jitter'inde bile false comm_lost
+# uretir (60sn'lik scan icin 60sn esik sik tetikliyordu); 4 kat tolerans
+# birakilir. Sabitler MODUL SEVIYESINDE cunku (a) esik iki yerde gerekiyor
+# — bayatlik karari ve komut yolunun ulasilabilirlik olcutu — ve ayri ayri
+# hesaplanip birbirinden kaymamalari sart, (b) testler gercek DNP3 trafigiyle
+# kopma senaryosunu makul surede kosabilmeli.
+_STALE_BASELINE_MULT = 4
+_STALE_SCAN_MULT = 10
+_STALE_MIN_THRESHOLD_SEC = 60
+
+
+def _bayatlik_esigi_sn(scan_interval_sec: float, baseline_interval_sec: float) -> float:
+    """Bayatlik/ulasilabilirlik esigi (saniye) — TEK kaynak."""
+    return float(
+        max(
+            baseline_interval_sec * _STALE_BASELINE_MULT,
+            scan_interval_sec * _STALE_SCAN_MULT,
+            _STALE_MIN_THRESHOLD_SEC,
+        )
+    )
+
+
+# OLCUM SESSIZLIGI YOKLAMASI — "kopuk deme, SOR".
+# Cihaz cevap veriyor (kanit taze) ama olcum tablosu bayat kaldiysa periyodik
+# integrity poll gonderilir. Bu, eskiden sahte comm_lost URETEN kosulun
+# yerine gecen hamledir: ayni belirtiye artik "kopuk ilan et" yerine
+# "tekrar sor" ile cevap veriyoruz.
+#
+# 60 sn: durgun bir fiderde bu kosul KALICIDIR (hicbir deger degismez), yani
+# maliyeti surekli odenir. 500 cihazda 60 sn = saniyede ~8 integrity poll —
+# 2 cekirdekli saha kutusunun ve 4G hattinin kaldirabilecegi bir tempo.
+# Daha sik yapmak durgun sahada hicbir yeni bilgi getirmez.
+_DATA_SILENCE_POLL_INTERVAL_SEC = 60.0
+
 # G110 tarama tekrar denemesi. Ad-hoc ScanRange istegi DUSEBILIR ve binding
 # exception atmadigi icin bunu anlayamayiz; basari, istegin gonderilmesiyle
 # degil cihazdan gercekten bir string gelmesiyle olculur. Gelmezse:
@@ -451,6 +486,35 @@ class _DeviceCache:
         # Duvar saati karsiligi — YALNIZCA gosterim icin (`/health`
         # `last_frame_epoch`). Karar mekanizmasinda KULLANILMAZ.
         self._last_update_wall: float = 0.0
+        # KANIT SAATI — "cihaz konusuyor mu?" (VERI GELDI MI DEGIL)
+        # ---------------------------------------------------------
+        # SAHA ARIZASI (SN2.0, 2026-08): bir arıza gostergesi saatlerce ayni
+        # degerleri tasiyabilir. event-driven modda degismeyen deger YAYIN
+        # URETMEZ, dolayisiyla `_last_update_at` ilerlemez ve gateway ayakta
+        # olan cihazi `comm_lost` ilan ederdi. Sonuclari uc katliydi:
+        #   1) SCADA'da sahte "haberlesme koptu",
+        #   2) `read_device` tum sinyalleri 0.0/comm_lost'a cevirdigi icin
+        #      GERCEK bir alarm degeri yayina hic cikmiyordu,
+        #   3) `operate_crob` state != online diye KESICI KOMUTUNU reddediyordu.
+        # Yani "deger degismedi" sessizce "kumanda edemiyorum"a donusuyordu.
+        #
+        # Oysa DNP3 canliligi ZATEN soyluyor ve biz kanitlari atiyorduk:
+        #   * outstation'in HER uygulama yaniti bir IIN tasir (OnReceiveIIN),
+        #   * her tamamlanan gorev SUCCESS/FAILURE olarak sonuclanir
+        #     (OnTaskComplete) — bos donen bir Class 1/2/3 event scan'i bile
+        #     SUCCESS'tir ve cihazin cevap verdiginin ispatidir.
+        # Olculdu (gercek DNP3 loopback, sessiz outstation): saniyede bir
+        # `USER_TASK/SUCCESS` + IIN geliyor, SIFIR veri noktasiyla.
+        #
+        # Bu yuzden canlilik AYRI bir saatte tutulur. `set()` bu saati de
+        # besledigi icin DAIMA `kanit_yasi <= veri_yasi`; yani bu ayrim var
+        # olan bir kopma tespitini GECIKTIREBILIR ama YENI bir sahte kopma
+        # URETEMEZ. Gercek kopmada (yari-acik soket, yanlis master adresi)
+        # ne IIN gelir ne de gorev SUCCESS doner — kanit saati de bayatlar ve
+        # mevcut lost/probe/relink kendiliginden isler.
+        #
+        # Monotonic: NTP siçramasi tum sahayi ayni anda "kopuk" yapmasin.
+        self._last_evidence_at: float = 0.0
         # Cihaz stale/disconnected oldugunda comm_lost yayinini SADECE bir kez
         # yapmak icin edge-trigger flag'i.
         #
@@ -531,6 +595,9 @@ class _DeviceCache:
             now = time.monotonic()
             self._last_update_at = now
             self._last_update_wall = time.time()
+            # Veri gelmesi en guclu canlilik kanitidir; kanit saatini de besler.
+            # Bu sayede `kanit_yasi <= veri_yasi` degismezligi korunur.
+            self._last_evidence_at = now
             # Kalite bayragi degisimi de bir DEGISIKLIKTIR: deger ayni kalsa
             # bile nokta 'gecerli'den 'REFERENCE_ERR'e gecmisse SCADA bunu
             # gormeli.
@@ -798,6 +865,10 @@ class _DeviceCache:
                 self._recovery_started_at = 0.0
                 self._recovery_anchor_at = 0.0
                 self._pending_recovery_publish = False
+                # Kanit da GECERSIZ: link kapandiysa onceki yanitlar artik
+                # "cihaz ulasilabilir" demez. Sifirlanmasaydi kopmus bir cihaz
+                # kanit esigi dolana kadar komut kabul ediyor gorunurdu.
+                self._last_evidence_at = 0.0
 
     def is_connected(self) -> bool:
         with self._lock:
@@ -816,6 +887,28 @@ class _DeviceCache:
         """Son frame'in duvar saati karsiligi — yalnizca gosterim icin."""
         with self._lock:
             return self._last_update_wall
+
+    def note_evidence(self) -> None:
+        """Outstation'dan CANLILIK KANITI geldi (veri gelmis olmasi sart degil).
+
+        Cagiranlar opendnp3 IO thread'indeki iki callback:
+          * `OnReceiveIIN`   — her uygulama yanitinda gelir,
+          * `OnTaskComplete` — YALNIZCA `result == SUCCESS` oldugunda.
+
+        Basarisiz gorevler (RESPONSE_TIMEOUT / NO_COMMS) BILEREK kanit
+        sayilmaz; ayrica ASSIGN_CLASS / ENABLE_UNSOLICITED gibi cihazin
+        desteklemedigi gorevler saglikli sahada da FAILURE_BAD_RESPONSE
+        dondurebilir — onlari "kopuk" delili saymak da yanlis olurdu.
+        Bu yuzden kural tek yonlu: yalnizca BASARI kanittir.
+        """
+        now = time.monotonic()
+        with self._lock:
+            self._last_evidence_at = now
+
+    def last_evidence_at(self) -> float:
+        """Son canlilik kanitinin MONOTONIC damgasi (0.0 = hic kanit yok)."""
+        with self._lock:
+            return self._last_evidence_at
 
     # ---- Recovery state machine ------------------------------------------------
     # Cihaz haberlesme durumu icin uc-state model:
@@ -1115,8 +1208,12 @@ def _make_master_app(cache: _DeviceCache, device_code: str) -> Any:
             super().__init__()
 
         def OnReceiveIIN(self, iin):  # noqa: N802
-            # ESKIDEN BOSTU. Outstation'in bize soyledigi iki kritik durum
-            # goruluyor ama hicbir yere yansimiyordu:
+            # IIN yalnizca outstation'in GERCEK bir uygulama yanitiyla gelir —
+            # yani bu cagri "cihaz konusuyor"un kanitidir. Kanit ONCE islenir:
+            # `_report_iin` icindeki beklenmedik bir hata canlilik bilgisini
+            # dusurmemeli (asil sikayet zaten sahte kopmaydi).
+            cache.note_evidence()
+            # Outstation'in bize soyledigi iki kritik durum:
             #   * IIN2.3 EVENT_BUFFER_OVERFLOW -> outstation event tamponu
             #     dolmus ve EN ESKI OLAYLARI DUSURMUS. Yani telemetride
             #     acikliklar var ve kimse bilmiyor.
@@ -1130,7 +1227,21 @@ def _make_master_app(cache: _DeviceCache, device_code: str) -> Any:
             pass
 
         def OnTaskComplete(self, info):  # noqa: N802
-            pass
+            # ESKIDEN `pass` IDI. Tamamlanan her gorev cihazin cevap verip
+            # vermedigini soyluyordu ve bu bilgi cope gidiyordu — sessiz ama
+            # SAGLAM bir cihazin sahte comm_lost almasinin sebebi buydu.
+            #
+            # SADECE SUCCESS kanittir (bkz. `note_evidence` docstring'i).
+            # Enum karsilastirmasi ISIMLE yapiliyor: binding surumleri arasinda
+            # enum nesnesi degisebilir ama `.name` sabittir; ayrica bu callback
+            # opendnp3'un IO thread'inden geldigi icin hicbir istisna disari
+            # sizmamali.
+            try:
+                sonuc = getattr(info, "result", None)
+                if getattr(sonuc, "name", str(sonuc)) == "SUCCESS":
+                    cache.note_evidence()
+            except Exception:  # noqa: BLE001
+                logger.debug("yadnp3_task_complete_error device=%s", device_code, exc_info=True)
 
         def OnOpen(self):  # noqa: N802
             # Link acildi — connected flag'i set ama henuz "online" sayma.
@@ -1456,6 +1567,35 @@ class _ManagedMaster:
         except Exception:  # noqa: BLE001
             logger.debug("yadnp3_channel_shutdown_error", exc_info=True)
 
+    def kanit_esigi_sn(self) -> float:
+        """Canlilik kanitinin bayat sayildigi sure.
+
+        `read_device`'in bayatlik esigiyle AYNI deger (tek kaynak:
+        `_bayatlik_esigi_sn`). Anlami: bu sure boyunca outstation'dan tek bir
+        yanit bile alamadiysak cihaz gercekten ulasilamaz durumdadir.
+        """
+        return _bayatlik_esigi_sn(self._scan_interval_sec, self._baseline_interval_sec)
+
+    def kanit_yasi(self) -> float:
+        """Son canlilik kanitinin uzerinden gecen sure; kanit yoksa -1."""
+        kanit = self.cache.last_evidence_at()
+        if kanit == 0.0:
+            return -1.0
+        return time.monotonic() - kanit
+
+    def ulasilabilir(self) -> bool:
+        """Cihaz SU AN cevap veriyor mu? (veri uretiyor mu DEGIL)
+
+        Komut yolu bunu kullanir: kesici komutunu bloke etmesi gereken tek sey
+        cihaza ULASILAMAMASIDIR — degerlerinin degismemesi degil.
+        """
+        if not self.cache.is_connected():
+            return False
+        yas = self.kanit_yasi()
+        if yas < 0:
+            return False
+        return yas <= self.kanit_esigi_sn()
+
     def request_integrity_poll(self) -> bool:
         """Cihaza ANINDA Class 0+1+2+3 integrity poll gonderir.
 
@@ -1536,21 +1676,39 @@ class _ManagedMaster:
         # Komut BASLANGICINI isaretle: poll thread'i bu pencerede zorla
         # relink yapmasin (bkz. _LOST_RELINK_COMMAND_GRACE_SEC).
         self.last_command_at = time.monotonic()
-        # ---- Baglanti fail-fast: cihaz online degilse komut GONDERME ----
-        # (offline'da DirectOperate/SBO 10s bloklar sonra timeout doner; erken
-        # kesip net "offline" don.) cache.state(): online|recovering|lost.
+        # ---- Baglanti fail-fast: cihaz ULASILAMAZ ise komut GONDERME ----
+        # (kopuk cihazda DirectOperate/SBO 10s bloklar sonra timeout doner;
+        # erken kesip net "offline" don.)
+        #
+        # OLCUT `state == "online"` DEGIL, ULASILABILIRLIK (2026-08 saha arizasi)
+        # ---------------------------------------------------------------------
+        # `state` cihazin VERI URETIP uretmedigine bagliydi: degeri degismeyen
+        # saglikli bir SN2.0 'lost'a dusuyor ve bu kapi KESICI KOMUTUNU
+        # reddediyordu. Yani "deger degismedi" sessizce "kumanda edemiyorum"a
+        # donusuyordu — bu arizanin en tehlikeli belirtisi buydu.
+        #
+        # Fail-fast'in GERCEK gerekcesi "olu bir soket uzerinde 10 saniye
+        # bloklama" idi; onun dogru olcutu de canlilik kanitidir. Kanit tazeyse
+        # cihaz bu saniyelerde cevap vermis demektir, komut bloklamaz.
+        # Kanit yoksa davranis eskisi gibi: hic gonderme.
+        #
+        # Not: kanit taze ama komut yine de basarisiz olursa artik UYDURULMUS
+        # bir "offline" degil, cihazin GERCEK DNP3 sonucu (timeout/failed +
+        # TaskCompletion) doner — operator icin dogru bilgi budur.
         state = self.cache.state()
-        if state != "online":
+        if not self.ulasilabilir():
             logger.warning(
-                "yadnp3_operate_skipped_offline device=%s index=%s state=%s — komut GONDERILMEDI",
+                "yadnp3_operate_skipped_offline device=%s index=%s state=%s "
+                "kanit_yasi=%.0fs — komut GONDERILMEDI",
                 self.device.code,
                 index,
                 state,
+                self.kanit_yasi(),
             )
             return {
                 "ok": False,
                 "status": "offline",
-                "error": f"cihaz online degil (state={state}); komut gonderilmedi",
+                "error": f"cihaza ulasilamiyor (state={state}); komut gonderilmedi",
                 "control": op_type,
             }
 
@@ -1741,6 +1899,11 @@ class Yadnp3TelemetryReader(TelemetryReader):
         self._lost_probe: dict[str, dict[str, float]] = {}
         self._lost_probe_total = 0
         self._forced_relink_total = 0
+        # Olcum sessizligi yoklamasi: cihaz kodu -> {"son": monotonic, "uyarildi": 0|1}.
+        # `_lost_probe_lock` ile korunuyor (ayri bir lock acmaya deger bir
+        # cekisme yok; ikisi de yalnizca sozluk guncelliyor).
+        self._veri_sessizligi: dict[str, dict[str, float]] = {}
+        self._veri_sessizligi_poll_total = 0
         # G110 okunamadi uyarisi verilmis cihazlar (cihaz basina TEK uyari).
         self._g110_uyarilan: set[str] = set()
 
@@ -1918,7 +2081,77 @@ class Yadnp3TelemetryReader(TelemetryReader):
                 "lost_probe_total": self._lost_probe_total,
                 "forced_relink_total": self._forced_relink_total,
                 "devices_probing": len(self._lost_probe),
+                "data_silence_poll_total": self._veri_sessizligi_poll_total,
+                # SU AN sessizlik epizodunda olanlar (kapanmis epizotlar hiz
+                # siniri icin kayitta kalir ama BURAYA SAYILMAZ).
+                "devices_alive_no_data": sum(1 for d in self._veri_sessizligi.values() if d.get("aktif")),
             }
+
+    def _veri_sessizligini_yokla(
+        self, mm: Any, device: DeviceConfig, *, now: float, veri_yasi: float
+    ) -> None:
+        """Cihaz cevap veriyor ama olcum bayat: periyodik integrity poll.
+
+        BU FONKSIYON CIHAZ DURUMUNU DEGISTIRMEZ. Tek yaptigi soru sormak.
+        Eskiden ayni kosul cihazi 'recovering' -> 'lost' zincirine sokuyor,
+        SCADA'ya sahte comm_lost gonderiyor ve kesici komutunu bloke ediyordu.
+
+        `_kopuk_cihazi_yokla`dan farki: o cihaz ZATEN 'lost' iken (kanit da yok)
+        calisir ve sonuc alamazsa TCP oturumunu YIKAR. Burada kanit TAZE —
+        yani calisan bir oturum var; onu yikmak (sahada olculdu: 4G'de yeniden
+        baglanma ~3 dakika) toparlanmayi hizlandirmaz, geciktirir. Bu yuzden
+        burada relink YOK, yalnizca sorgu var.
+        """
+        kod = device.code
+        with self._lost_probe_lock:
+            d = self._veri_sessizligi.get(kod)
+            if d is None:
+                # Ilk kez bu duruma girdi: hemen sor, sonra periyodik.
+                d = {"son": 0.0, "uyarildi": 0.0, "aktif": 0.0}
+                self._veri_sessizligi[kod] = d
+            d["aktif"] = 1.0
+            # HIZ SINIRI EPIZOTLAR ARASINDA DA GECERLI. `son` damgasi olcum
+            # tazelendiginde SILINMEZ (bkz. `_veri_sessizligi_sifirla`): silinse
+            # her tazelenme sayaci sifirlar ve sorgu araligi kendiliginden
+            # "bayatlik esigi" kadar sikisirdi — 500 cihazda esik 120 sn iken
+            # niyet edilenin iki kati trafik demekti.
+            if d["son"] and (now - d["son"]) < _DATA_SILENCE_POLL_INTERVAL_SEC:
+                return
+            d["son"] = now
+            self._veri_sessizligi_poll_total += 1
+            ilk_kez = not d["uyarildi"]
+            d["uyarildi"] = 1.0
+
+        if ilk_kez:
+            # Edge-trigger: durgun bir fiderde bu durum saatlerce surebilir,
+            # her turda log basmak defteri doldururdu.
+            logger.info(
+                "yadnp3_veri_sessizligi device=%s ip=%s veri_yasi=%.0fs — cihaz "
+                "CEVAP VERIYOR (kanit taze) ama olcum tazelenmiyor; kopuk "
+                "SAYILMADI, integrity poll gonderiliyor",
+                kod,
+                device.ip_address,
+                veri_yasi,
+            )
+        try:
+            mm.request_integrity_poll()
+        except Exception:  # noqa: BLE001
+            logger.debug("yadnp3_veri_sessizligi_poll_error device=%s", kod, exc_info=True)
+
+    def _veri_sessizligi_sifirla(self, device_code: str) -> None:
+        """Olcum yeniden akmaya basladi: epizodu kapat.
+
+        Kayit SILINMEZ, yalnizca pasife alinir — `son` damgasi hiz sinirinin
+        epizotlar arasinda da gecerli olmasi icin korunur (bkz.
+        `_veri_sessizligini_yokla`). `uyarildi` sifirlanir ki YENI bir sessizlik
+        epizodu tekrar bir kez loglansin.
+        """
+        d = self._veri_sessizligi.get(device_code)
+        if d is None or not d.get("aktif"):
+            return
+        with self._lost_probe_lock:
+            d["aktif"] = 0.0
+            d["uyarildi"] = 0.0
 
     def _kopuk_cihazi_yokla(self, mm: Any, device: DeviceConfig, *, connected: bool) -> None:
         """'lost' cihaza periyodik integrity poll; sonuc yoksa oturumu yenile.
@@ -2102,24 +2335,30 @@ class Yadnp3TelemetryReader(TelemetryReader):
         # Stale-data guard: OpenDNP3'in `OnOpen`/`OnClose` callback'leri her
         # turde TCP kopmasinda tetiklenmeyebilir (channel auto-retry icin
         # session ayakta gorunmeye devam edebilir). Bu yuzden link flag'ine
-        # ek olarak "son frame'den bu yana gecen sure" kontrolune da bakariz.
-        # Threshold = max(4*baseline, 10*scan, 60s) — cok agresif olursa
-        # baseline scan'in dogal jitter'inde bile false comm_lost uretir
-        # (60sn'lik scan icin 60sn threshold sik tetikliyordu). 4x daha
-        # tolerans birakir; gercekten kopuk cihaz icin yine de 2 dakika
-        # icinde tetiklenir.
-        threshold = max(
-            self._baseline_interval_sec * 4,
-            self._scan_interval_sec * 10,
-            60,
-        )
+        # ek olarak "son ses cikardigindan bu yana gecen sure"ye de bakariz.
+        # Esik `_bayatlik_esigi_sn` ile TEK yerde hesaplanir (komut yolundaki
+        # ulasilabilirlik olcutuyle ayni deger olmasi sart).
+        threshold = _bayatlik_esigi_sn(self._scan_interval_sec, self._baseline_interval_sec)
         # MONOTONIC: bayatlik bir SUREDIR, tarih degil. Duvar saatiyle
         # olculdugunde tek bir NTP siçramasi (ya da RTC'si bos bir sahada
         # acilis sonrasi saat duzeltmesi) TUM cihazlari ayni anda "bayat"
         # yapip toplu sahte comm_lost dalgasi uretirdi.
+        #
+        # BAYATLIK ARTIK KANIT SAATINDEN URETILIYOR (veri saatinden DEGIL).
+        # "Veri gelmiyor" ile "haberlesme yok" ayni sey degildir: event-driven
+        # modda degeri degismeyen saglikli bir cihaz veri URETMEZ ama her
+        # tarama turunda cevap verir. Eski kod bu ikisini ayirt edemedigi icin
+        # sessiz cihazi kopuk ilan ediyordu (bkz. `_last_evidence_at`).
+        # `set()` kanit saatini de besledigi icin kanit_yasi <= veri_yasi;
+        # yani bu satir sahte kopmayi kaldirir, GERCEK kopmayi geciktirmez:
+        # kanit da susmussa esik yine ayni anda dolar.
         last_update = cache.last_update_at()
+        last_evidence = cache.last_evidence_at()
         now = time.monotonic()
-        stale = last_update == 0.0 or (now - last_update) > threshold
+        stale = last_evidence == 0.0 or (now - last_evidence) > threshold
+        # Olcum sessizligi AYRI bir gozlemdir ve comm_lost URETMEZ; yalnizca
+        # "cihaza tekrar sor" tetigidir (asagida).
+        veri_bayat = last_update == 0.0 or (now - last_update) > threshold
 
         # Recovery state machine ile birlikte cihaz haberlesme durumu su sekilde
         # belirlenir:
@@ -2143,6 +2382,26 @@ class Yadnp3TelemetryReader(TelemetryReader):
         # edebiliyor ve calisan bir oturum yikilabiliyordu.
         if connected and not stale:
             self._lost_probe_sifirla(device.code)
+
+        # CIHAZ KONUSUYOR AMA OLCUM GELMIYOR -> KOPUK ILAN ETME, SOR.
+        # ------------------------------------------------------------
+        # Kanit taze (outstation cevapliyor) ama olcum bayat. Iki sebebi olur:
+        #   a) NORMAL: durgun bir fiderde hicbir deger degismiyor. Yapilacak
+        #      bir sey yok, cihaz saglikli.
+        #   b) ARIZA: Class 0 integrity poll'u dusuyor (yavas link, buyuk
+        #      fragment, event tamponu sorunu). Cihaz "yasiyorum" diyor ama
+        #      tablo tazelenmiyor.
+        # Ikisini disaridan ayirt edemeyiz; ikisinde de DOGRU hamle ayni:
+        # cihaza yeniden sormak. Eski kod bunun yerine cihazi comm_lost ilan
+        # ediyordu — hem yanlis hem de kesici komutunu bloke eden karar.
+        # Kopuk cihaz yoklamasinin (`_kopuk_cihazi_yokla`) bu duruma karsiligi
+        # YOKTU: o yalnizca cihaz ZATEN 'lost' iken devreye giriyor.
+        if connected and not stale and veri_bayat:
+            self._veri_sessizligini_yokla(
+                mm, device, now=now, veri_yasi=(now - last_update) if last_update else -1.0
+            )
+        elif not veri_bayat:
+            self._veri_sessizligi_sifirla(device.code)
 
         # Stale-edge: link OnOpen demis ama frame gelmiyor. State'i recovery'e
         # cek ki SCADA hala comm_lost gorsun, fresh frame beklensin.
@@ -2409,12 +2668,24 @@ class Yadnp3TelemetryReader(TelemetryReader):
                 # KARARI ise monotonic damga uzerinden verilir (bkz.
                 # `last_update_at`) — ikisi kasitli olarak ayri.
                 last = mm.cache.last_update_wall()
+                # KANIT ve VERI yaslarini AYRI raporla. Sahada "cihaz kopuk mu
+                # yoksa sadece degeri mi degismiyor" sorusu tek bir yasa
+                # bakarak cevaplanamiyordu; teshis ancak gateway log'una
+                # girilerek yapilabiliyordu.
+                kanit_yasi = mm.kanit_yasi()
+                veri_yasi = -1.0
+                son_veri = mm.cache.last_update_at()
+                if son_veri:
+                    veri_yasi = time.monotonic() - son_veri
                 out[code] = {
                     "state": mm.cache.state(),
                     "connected": mm.cache.is_connected(),
                     "last_frame_epoch": last or None,
                     "pending_signals": mm.cache.dirty_count(),
                     "known_points": mm.cache.size(),
+                    "evidence_age_sec": round(kanit_yasi, 1) if kanit_yasi >= 0 else None,
+                    "data_age_sec": round(veri_yasi, 1) if veri_yasi >= 0 else None,
+                    "reachable": mm.ulasilabilir(),
                 }
             except Exception:  # noqa: BLE001
                 out[code] = {"state": "unknown", "last_frame_epoch": None}

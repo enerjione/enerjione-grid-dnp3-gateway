@@ -347,6 +347,76 @@ araligi kisaltabilirsiniz; her cihaz basina saatte `3600/aralik` istek eder.
 Sunucudan `nc -zv <cihaz-ip> 20000` ile hattı dogrulayin; kapaliysa saha
 tarafinda modem/anten/besleme kontrolu gerekir.
 
+### "Cihaz kopuk gorunuyor ama aslinda sadece degeri degismiyor" (1.7.0'dan once)
+
+**1.7.0'dan once bu gercek bir hataydi ve UC belirtisi vardi:** SCADA'da sahte
+"haberlesme koptu", alarmin gec gelmesi, ve **kesici komutunun hic
+gonderilememesi**. Sebep tekti: gateway canliligi "cache'e olcum dustu mu" ile
+olcuyordu. event-driven modda degeri degismeyen bir cihaz yayin uretmez; bir
+arıza gostergesi saatlerce ayni degerleri tasiyabilir.
+
+Belirtiler tanidik geliyorsa once **surumu dogrulayin** (`/health` -> `version`).
+1.7.0 ve sonrasinda canlilik DNP3 yanitlarindan uretilir (`OnReceiveIIN` +
+`OnTaskComplete(SUCCESS)`); degerin degismesi GEREKMEZ.
+
+Ayrimi tek GET ile gorun. **`/metrics` kullanin, `/health` DEGIL**: `/health`
+auth'suz oldugu icin bilerek yalnizca SAYIM doner (cihaz kodu/IP sizdirmaz),
+cihaz bazinda teshis Bearer ile korunan `/metrics` ucundadir (bkz. bolum 5).
+
+```bash
+curl -s -H "Authorization: Bearer $GATEWAY_TOKEN" \
+  http://127.0.0.1:8020/metrics | jq .devices_detail
+```
+
+```json
+{
+  "d7": { "state": "online", "reachable": true,
+          "evidence_age_sec": 1.2, "data_age_sec": 184.0 }
+}
+```
+
+Filo seviyesi ozet auth'suz uctan alinabilir:
+
+```bash
+curl -s http://127.0.0.1:8020/health | jq '.devices.alive_no_data, .devices.recovery'
+```
+
+Cihaz basina uc alan belirleyici:
+
+| Alan | Anlami |
+|---|---|
+| `evidence_age_sec` | Cihaz en son NE ZAMAN cevap verdi (canlilik) |
+| `data_age_sec` | Olcum en son NE ZAMAN tazelendi (veri) |
+| `reachable` | Komut yolunun kullandigi olcut — `false` ise komut GONDERILMEZ |
+
+Okuma kilavuzu:
+
+* `evidence_age_sec` kucuk + `data_age_sec` buyuk -> **cihaz saglikli, sadece
+  sessiz.** Kopuk DEGILDIR, komut kabul eder. Gateway bu durumda kendiliginden
+  integrity poll gonderir (`data_silence_poll_total` artar) ve filo
+  seviyesinde `devices_alive_no_data` issue kodu cikar. Durgun bir fiderde bu
+  NORMALDIR; KALICI ise Class 0 integrity poll'unun dustugunu dusundurur —
+  link kalitesi / fragment boyutu / cihaz tarafi kontrol edilmeli.
+* Ikisi de buyuk -> **gercek kopma.** `lost` durumu, yoklama ve zorla relink
+  devreye girer (bkz. bir onceki bolum).
+
+Ilgili log etiketleri:
+
+```
+yadnp3_veri_sessizligi device=d7 ip=10.0.0.9 veri_yasi=180s — cihaz CEVAP
+VERIYOR (kanit taze) ama olcum tazelenmiyor; kopuk SAYILMADI, integrity poll
+gonderiliyor
+```
+
+Komut reddedildiyse log su etiketi basar; `kanit_yasi` alanina bakin:
+
+```
+yadnp3_operate_skipped_offline device=d7 index=2 state=lost kanit_yasi=240s
+```
+
+`kanit_yasi` gercekten buyukse cihaza ulasilamiyordur (komut dogru olarak
+gonderilmedi). Kucukse — ve komut yine reddediliyorsa — surum eskidir.
+
 ### "Su an veri hangi yoldan gidiyor?" — aktif tasima yolu
 
 Telemetri iki yoldan gidebilir ve **hangisinde oldugunuzu bilmeden ariza

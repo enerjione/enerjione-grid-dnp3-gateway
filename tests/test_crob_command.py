@@ -142,9 +142,13 @@ def yadnp3_master(monkeypatch):
     monkeypatch.setattr(mod._ManagedMaster, "_OP_MAP_LAZY", None, raising=False)
 
     mm = mod._ManagedMaster.__new__(mod._ManagedMaster)  # __init__ ATLA
-    # operate_crob'un ihtiyaci: self.cache (state), self._master, self.device
-    mm.cache = types.SimpleNamespace(state=lambda: "online")
+    # operate_crob'un ihtiyaci: self.cache (durum + CANLILIK KANITI),
+    # self._master, self.device ve kanit esigini ureten tarama araliklari.
+    mm.cache = _sahte_cache("online")
     mm.device = types.SimpleNamespace(code="SN-TEST", dnp3_address=12345)
+    # Kanit esigi = max(4*baseline, 10*scan, 60) = 120 sn.
+    mm._scan_interval_sec = 5
+    mm._baseline_interval_sec = 30
 
     calls = {}
 
@@ -163,6 +167,21 @@ def yadnp3_master(monkeypatch):
 
     mm._master = _FakeMaster()
     return mm, calls, fake, mod
+
+
+def _sahte_cache(state: str, *, connected: bool = True, kanit_yasi_sn: float = 0.0):
+    """`_DeviceCache` taklidi: durum + canlilik kaniti ayri ayri ayarlanabilir.
+
+    `kanit_yasi_sn=None` -> hic kanit yok (cihaza ulasilamiyor).
+    """
+    import time as _t
+
+    kanit = 0.0 if kanit_yasi_sn is None else _t.monotonic() - kanit_yasi_sn
+    return types.SimpleNamespace(
+        state=lambda: state,
+        is_connected=lambda: connected,
+        last_evidence_at=lambda: kanit,
+    )
 
 
 def _success_result(fake, index=0):
@@ -269,9 +288,9 @@ def test_not_supported_status_is_failed(yadnp3_master):
 
 
 def test_offline_device_command_not_sent(yadnp3_master):
-    """Test 9: cihaz offline (state != online) -> komut GONDERILMEZ."""
+    """Test 9: cihaza ULASILAMIYOR (kanit yok) -> komut GONDERILMEZ."""
     mm, calls, fake, _ = yadnp3_master
-    mm.cache = types.SimpleNamespace(state=lambda: "lost")
+    mm.cache = _sahte_cache("lost", kanit_yasi_sn=None)
     calls["result"] = _success_result(fake)
     res = mm.operate_crob(index=0)
     assert res["ok"] is False
@@ -280,13 +299,50 @@ def test_offline_device_command_not_sent(yadnp3_master):
     assert calls.get("sbo_called") is not True
 
 
-def test_recovering_device_command_not_sent(yadnp3_master):
-    """recovering durumu da online degil -> gonderme."""
+def test_link_kapaliysa_komut_gonderilmez(yadnp3_master):
+    """Kanit taze gorunse bile link KAPALI ise komut gonderilmez.
+
+    `set_connected(False)` kaniti zaten sifirliyor; bu test o korumanin
+    kaldirilmasi halinde sessizce kopan davranisi yakalar.
+    """
     mm, calls, fake, _ = yadnp3_master
-    mm.cache = types.SimpleNamespace(state=lambda: "recovering")
+    mm.cache = _sahte_cache("lost", connected=False, kanit_yasi_sn=0.0)
     calls["result"] = _success_result(fake)
     res = mm.operate_crob(index=0)
     assert res["status"] == "offline"
+    assert calls.get("direct_called") is not True
+
+
+def test_kanit_bayatsa_komut_gonderilmez(yadnp3_master):
+    """Kanit esigi (120 sn) asilmissa cihaz ulasilamaz sayilir."""
+    mm, calls, fake, _ = yadnp3_master
+    mm.cache = _sahte_cache("online", kanit_yasi_sn=121.0)
+    calls["result"] = _success_result(fake)
+    res = mm.operate_crob(index=0)
+    assert res["status"] == "offline"
+    assert calls.get("direct_called") is not True
+
+
+@pytest.mark.parametrize("state", ["lost", "recovering"])
+def test_sessiz_ama_cevap_veren_cihaza_komut_GONDERILIR(yadnp3_master, state):
+    """SAHA ARIZASI KILIDI (2026-08): kesici komutu 'deger degismedi' diye reddedilmemeli.
+
+    Eski kapi `state != "online"` idi. `state` cihazin VERI URETIP uretmedigine
+    bagli oldugu icin, degerleri degismeyen saglikli bir SN2.0 'lost'a dusuyor
+    ve KESICI KOMUTU hic gonderilmeden "offline" ile geri ceviriliyordu —
+    sahada gorulen "komut gonderilemiyor" belirtisi tam olarak buydu.
+
+    Yeni olcut ULASILABILIRLIK: cihaz DNP3'e cevap veriyorsa (kanit taze)
+    komut GONDERILIR; sonucu ne olursa olsun operator UYDURULMUS bir "offline"
+    degil, cihazin gercek yanitini gorur.
+    """
+    mm, calls, fake, _ = yadnp3_master
+    mm.cache = _sahte_cache(state, kanit_yasi_sn=1.0)
+    calls["result"] = _success_result(fake)
+    res = mm.operate_crob(index=0)
+    assert calls.get("direct_called") is True, "komut GONDERILMELIYDI"
+    assert res["status"] == "ok"
+    assert res["ok"] is True
 
 
 def test_timeout_when_no_callback(yadnp3_master):
