@@ -96,7 +96,11 @@ def build_payload(
     """Backend'in bekledigi govdeyi kurar."""
     devices: dict[str, Any] = {}
     if device_summary:
-        for anahtar in ("total", "online", "recovering", "lost", "unknown"):
+        # `alive_no_data`: cihaz CEVAP VERIYOR ama olcumu tazelenmiyor. Bu
+        # sayim eskiden sahte comm_lost'a donusuyordu; artik ayri bir gozlem
+        # ve merkezden gorulebilmesi gerekiyor. Yayindaki backend tanimadigi
+        # anahtarlari `raw_json`e yaziyor — ek kolon/migration GEREKMEZ.
+        for anahtar in ("total", "online", "recovering", "lost", "unknown", "alive_no_data"):
             if anahtar in device_summary:
                 devices[anahtar] = device_summary[anahtar]
 

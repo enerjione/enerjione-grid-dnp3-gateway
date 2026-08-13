@@ -382,7 +382,13 @@ def _device_health_snapshot(reader: Any, configured_count: int) -> dict[str, Any
     stats_fn = getattr(reader, "recovery_stats", None)
     if callable(stats_fn):
         try:
-            summary["recovery"] = dict(stats_fn())
+            recovery = dict(stats_fn())
+            summary["recovery"] = recovery
+            # "Cevap veriyor ama olcum gelmiyor" SAYIMI ust seviyeye de
+            # cikariliyor: `recovery` sozlugu backend'e tasinmiyor, oysa bu
+            # sayim sahte kopmanin yerini alan durumu anlatiyor ve merkezden
+            # gorulmesi gerekiyor (bkz. build_payload whitelist'i).
+            summary["alive_no_data"] = int(recovery.get("devices_alive_no_data") or 0)
         except Exception:  # noqa: BLE001
             pass
     return summary
@@ -634,6 +640,20 @@ def _make_handler(
                     **metrics.snapshot(),
                     **outbox_snap,
                 }
+                # CIHAZ BAZINDA TESHIS — "kopuk mu, yoksa sadece sessiz mi?"
+                # `/health` bunu TASIYAMAZ: auth'suz oldugu icin bilerek yalnizca
+                # SAYIM doner (cihaz kodu/IP sizdirmaz). Bu uc ise Bearer ile
+                # korunuyor, dolayisiyla cihaz bazinda `evidence_age_sec` /
+                # `data_age_sec` / `reachable` verilebilir. Bu ucu olmadan saha
+                # teshisi ancak container log'una girerek yapilabiliyordu.
+                metrics_reader = reader_provider() if reader_provider else None
+                dh_fn = getattr(metrics_reader, "device_health", None)
+                if callable(dh_fn):
+                    try:
+                        body["devices_detail"] = dh_fn() or {}
+                    except Exception:  # noqa: BLE001
+                        # Teshis alani metrik ucunu DUSURMEMELI.
+                        body["devices_detail"] = {}
                 self._respond_json(body)
                 return
             # Bilinmeyen GET path — rate-limit ZATEN method girisinde yapildi,
@@ -1088,6 +1108,17 @@ def _build_health_body(
         else:
             issues.append("some_devices_comm_lost")
             severity_score = max(severity_score, 1)
+
+    # --- Cevap veriyor ama olcum gelmiyor ----------------------------------
+    # Bu durum comm_lost DEGILDIR (cihaz konusuyor) ve artik sahte kopma
+    # uretmiyor; ama gorunmez de olmamali: kalici olmasi Class 0 integrity
+    # poll'unun dustugune isaret eder. `issues` backend'e `gateway_health`
+    # tablosundaki ayni adli kolonla tasindigi icin merkezden gorulebilir —
+    # yeni bir alan/migration gerektirmeden.
+    alive_no_data = int(devices_snap.get("alive_no_data") or 0)
+    if alive_no_data > 0:
+        issues.append("devices_alive_no_data")
+        severity_score = max(severity_score, 1)
 
     # --- Bozuk/karantinaya alinmis veritabani ------------------------------
     quarantined = _quarantined_dbs()

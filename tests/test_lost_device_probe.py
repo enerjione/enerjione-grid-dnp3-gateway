@@ -43,10 +43,25 @@ from tests.conftest import make_device, make_signal
 class SahteCache:
     """`_DeviceCache` yerine gecen, durumu testin kontrol ettigi taklit."""
 
-    def __init__(self, *, state: str, connected: bool, stale: bool) -> None:
+    def __init__(
+        self,
+        *,
+        state: str,
+        connected: bool,
+        stale: bool,
+        kanit_taze: bool | None = None,
+    ) -> None:
         self._state = state
         self._connected = connected
         self._stale = stale
+        # CANLILIK KANITI ile VERI ayri seylerdir (bkz. `_last_evidence_at`).
+        # Bu dosyadaki testlerin senaryosu "cihaz tamamen sessiz": ne veri var
+        # ne de yanit. Bu yuzden varsayilan olarak kanit da veriyi izler.
+        # `kanit_taze=True` yeni durumu anlatir: cihaz CEVAP VERIYOR ama
+        # olcum tazelenmiyor — o zaman kopuk yoklamasi DEVREYE GIRMEMELI.
+        # Override None ise kanit VERIYI IZLER — ve testler `_stale`i sonradan
+        # degistirdigi icin bu turetme cagri aninda yapilmali (init'te DEGIL).
+        self._kanit_override = kanit_taze
         self.link_yasi = 9999.0
         self.integrity_istekleri = 0
 
@@ -75,6 +90,10 @@ class SahteCache:
     def last_update_at(self) -> float:
         # stale=True -> cok eski; stale=False -> su an
         return 0.0 if self._stale else time.monotonic()
+
+    def last_evidence_at(self) -> float:
+        taze = (not self._stale) if self._kanit_override is None else self._kanit_override
+        return time.monotonic() if taze else 0.0
 
     def begin_recovery(self) -> None:
         self._state = "recovering"
@@ -143,6 +162,9 @@ def okuyucu(monkeypatch: pytest.MonkeyPatch):
     r._lost_probe = {}
     r._lost_probe_total = 0
     r._forced_relink_total = 0
+    r._veri_sessizligi = {}
+    r._veri_sessizligi_poll_total = 0
+    r._g110_uyarilan = set()
     return r
 
 

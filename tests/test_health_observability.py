@@ -421,3 +421,75 @@ def test_backend_erisilebilirken_uyari_yok() -> None:
     body, code = _body(publisher=_Publisher(ready=True))
     assert "telemetry_backend_unreachable" not in body["issues"]
     assert code == 200
+
+
+# --------------------------------------------------------------------------
+# "cevap veriyor ama olcum gelmiyor" gorunurlugu (1.7.0)
+# --------------------------------------------------------------------------
+#
+# Bu durum comm_lost DEGILDIR — cihaz konusuyor — ve artik sahte kopma
+# uretmiyor. Ama GORUNMEZ de olmamali: kalici olmasi Class 0 integrity
+# poll'unun dustugune isaret eder. Eskiden ayni belirti `some_devices_comm_lost`
+# olarak raporlaniyordu, yani operator "kopuk" arayip bosuna modem/anten
+# kontrol ediyordu.
+
+
+class _SessizReader(_FakeReader):
+    """`recovery_stats` da doner — gercek adapter gibi."""
+
+    def __init__(self, health, alive_no_data: int) -> None:
+        super().__init__(health)
+        self._alive_no_data = alive_no_data
+
+    def recovery_stats(self) -> dict[str, int]:
+        return {
+            "lost_probe_total": 0,
+            "forced_relink_total": 0,
+            "devices_probing": 0,
+            "data_silence_poll_total": 3,
+            "devices_alive_no_data": self._alive_no_data,
+        }
+
+
+def test_cevap_veren_ama_sessiz_cihaz_issue_uretir() -> None:
+    now = time.time()
+    reader = _SessizReader(
+        {f"DEV-{i}": {"state": "online", "last_frame_epoch": now} for i in (1, 2)},
+        alive_no_data=1,
+    )
+    m = GatewayMetrics()
+    m.record_cycle(devices=2, published=0)
+    body, code = _body(reader=reader, metrics=m, state=_state(device_count=2))
+
+    assert "devices_alive_no_data" in body["issues"]
+    assert body["devices"]["alive_no_data"] == 1
+    # KOPUK DEGIL: comm_lost kodlari CIKMAMALI.
+    assert not [i for i in body["issues"] if "comm_lost" in i]
+    # Uyari seviyesi: degraded, unhealthy DEGIL (cihaz calisiyor).
+    assert body["status"] == "degraded"
+    assert code == 200
+
+
+def test_sessizlik_yoksa_issue_uretilmez() -> None:
+    now = time.time()
+    reader = _SessizReader(
+        {f"DEV-{i}": {"state": "online", "last_frame_epoch": now} for i in (1, 2)},
+        alive_no_data=0,
+    )
+    m = GatewayMetrics()
+    m.record_cycle(devices=2, published=4)
+    body, _c = _body(reader=reader, metrics=m, state=_state(device_count=2))
+
+    assert "devices_alive_no_data" not in body["issues"]
+    assert body["status"] == "ok"
+
+
+def test_sessizlik_sayimi_health_de_kod_sizdirmaz() -> None:
+    """Filo sayimi auth'suz uctan gorulur ama cihaz kodu YINE sizmamali."""
+    now = time.time()
+    reader = _SessizReader(
+        {"DEV-GIZLI": {"state": "online", "last_frame_epoch": now}}, alive_no_data=1
+    )
+    body, _c = _body(reader=reader, state=_state(device_count=1))
+    assert "DEV-GIZLI" not in repr(body)
+    assert body["devices"]["alive_no_data"] == 1

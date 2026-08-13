@@ -2,6 +2,76 @@
 
 Semver'a gore tutulur. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.7.0] - 2026-08-13
+
+Sahadaki SN2.0 cihazlari "haberlesme koptu" veriyordu, alarmlar gec geliyordu
+ve KESICI KOMUTU gonderilemiyordu. Ucunun de tek bir sebebi vardi: gateway
+bir cihazin canli olup olmadigini "cache'e olcum dustu mu" ile olcuyordu.
+
+### Fixed
+
+- **Sessiz ama saglam cihaz "kopuk" ilan ediliyordu (sahte comm_lost).**
+  Canlilik kaniti tek bir yerde uretiliyordu: `_DeviceCache.set()` icindeki
+  `_last_update_at`. event-driven modda DEGERI DEGISMEYEN bir cihaz yayin
+  URETMEZ; bir arıza gostergesi saatlerce ayni degerleri tasiyabilir. Bu
+  yuzden ayakta olan cihaz esik dolunca `stale -> recovering -> lost`
+  zincirine giriyordu.
+
+  Oysa DNP3 canliligi ZATEN soyluyordu ve iki kanit da cope gidiyordu:
+  `OnReceiveIIN` (outstation'in HER uygulama yanitinda gelir) yalnizca log
+  basiyor, `OnTaskComplete` ise `pass` idi. Gercek DNP3 loopback'inde
+  olculdu: sessiz bir outstation saniyede bir `USER_TASK/SUCCESS` + IIN
+  uretiyor, SIFIR veri noktasiyla.
+
+  Artik canlilik AYRI bir saatte tutuluyor (`_last_evidence_at`); kanit
+  `OnReceiveIIN` ve `OnTaskComplete(result == SUCCESS)` ile besleniyor.
+  Basarisiz gorevler (RESPONSE_TIMEOUT / NO_COMMS) ve cihazin desteklemedigi
+  gorevler (ASSIGN_CLASS/ENABLE_UNSOLICITED -> BAD_RESPONSE) kanit SAYILMAZ.
+
+  **Kopma tespiti KAPATILMADI.** `set()` kanit saatini de besledigi icin
+  daima `kanit_yasi <= veri_yasi`: bu ayrim var olan bir tespiti geciktirmez,
+  yalnizca sahte olani kaldirir. Gercek kopmada (yari-acik soket, yanlis
+  master adresi) ne IIN gelir ne de gorev SUCCESS doner; mevcut
+  lost/probe/relink kendiliginden isler. Regresyon testi bunu GERCEK trafikle
+  kanitliyor (`test_susan_cihaz_comm_lost_OLUR`).
+
+- **KESICI KOMUTU "deger degismedi" diye reddediliyordu.** `operate_crob`
+  kapisi `state != "online"` idi; `state` cihazin VERI URETIP uretmedigine
+  bagli oldugu icin sessiz cihazin komutu DNP3'e hic cikmadan
+  `status: "offline"` ile geri ceviriliyordu (`yadnp3_operate_skipped_offline`).
+  Fail-fast'in gercek gerekcesi "olu soket uzerinde 10 sn bloklama" idi;
+  dogru olcut de ULASILABILIRLIK. Kanit tazeyse komut GONDERILIR; basarisiz
+  olursa operator uydurulmus bir "offline" degil cihazin gercek DNP3 sonucunu
+  gorur. Kanit yoksa davranis eskisi gibi (hic gonderme).
+
+- **Alarm gec geliyordu.** Cihaz `lost`/`recovering` iken `read_device` TUM
+  sinyalleri `raw_value=0.0, quality=comm_lost` ile donduruyor, gercek alarm
+  degeri yayina hic cikmiyordu. Backend'de `comm_lost` alarm degerlendirmesini
+  DONDURDUGU icin alarm ancak "haberlesme geri geldiginde" goruluyordu. Sahte
+  kopma kalkinca bu yol da kendiliginden duzeldi.
+
+### Added
+
+- **Olcum sessizliginde gateway KENDISI SORUYOR.** Kanit taze ama olcum
+  bayatsa (orn. Class 0 integrity poll dusuyorsa) cihaza periyodik integrity
+  poll gonderilir — cihaz comm_lost ILAN EDILMEDEN. Eskiden ayni belirtinin
+  cevabi "kopuk ilan et" idi. Aralik `_DATA_SILENCE_POLL_INTERVAL_SEC` (60 sn)
+  ve hiz siniri epizotlar ARASINDA da gecerli. Calisan oturum YIKILMAZ
+  (relink yok) — `_kopuk_cihazi_yokla`dan farki budur.
+
+- **Teshis gorunurlugu.** `/health` cihaz basina `evidence_age_sec`,
+  `data_age_sec` ve `reachable` raporluyor; "cihaz kopuk mu yoksa yalnizca
+  degeri mi degismiyor" sorusu artik tek GET ile cevaplaniyor. Filo
+  seviyesinde `devices.alive_no_data` sayimi ve `devices_alive_no_data` issue
+  kodu backend'e tasiniyor (mevcut `issues` kolonu; migration GEREKMEZ).
+  `recovery_stats()` icine `data_silence_poll_total` eklendi.
+
+### Changed
+
+- Bayatlik esigi tek kaynaktan uretiliyor (`_bayatlik_esigi_sn`); ayni deger
+  hem bayatlik karari hem komut yolunun ulasilabilirlik olcutu icin
+  kullaniliyor. Formul degismedi: `max(4*baseline, 10*scan, 60)`.
+
 ## [1.6.3] - 2026-08-11
 
 Iki ayri saha bulgusu: G110 okumasi yanlis anda tetikleniyordu, ve zorla
