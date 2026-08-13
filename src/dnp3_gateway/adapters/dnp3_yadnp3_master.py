@@ -1241,9 +1241,7 @@ def _make_master_app(cache: _DeviceCache, device_code: str) -> Any:
                 if getattr(sonuc, "name", str(sonuc)) == "SUCCESS":
                     cache.note_evidence()
             except Exception:  # noqa: BLE001
-                logger.debug(
-                    "yadnp3_task_complete_error device=%s", device_code, exc_info=True
-                )
+                logger.debug("yadnp3_task_complete_error device=%s", device_code, exc_info=True)
 
         def OnOpen(self):  # noqa: N802
             # Link acildi — connected flag'i set ama henuz "online" sayma.
@@ -2086,9 +2084,7 @@ class Yadnp3TelemetryReader(TelemetryReader):
                 "data_silence_poll_total": self._veri_sessizligi_poll_total,
                 # SU AN sessizlik epizodunda olanlar (kapanmis epizotlar hiz
                 # siniri icin kayitta kalir ama BURAYA SAYILMAZ).
-                "devices_alive_no_data": sum(
-                    1 for d in self._veri_sessizligi.values() if d.get("aktif")
-                ),
+                "devices_alive_no_data": sum(1 for d in self._veri_sessizligi.values() if d.get("aktif")),
             }
 
     def _veri_sessizligini_yokla(
@@ -2342,9 +2338,7 @@ class Yadnp3TelemetryReader(TelemetryReader):
         # ek olarak "son ses cikardigindan bu yana gecen sure"ye de bakariz.
         # Esik `_bayatlik_esigi_sn` ile TEK yerde hesaplanir (komut yolundaki
         # ulasilabilirlik olcutuyle ayni deger olmasi sart).
-        threshold = _bayatlik_esigi_sn(
-            self._scan_interval_sec, self._baseline_interval_sec
-        )
+        threshold = _bayatlik_esigi_sn(self._scan_interval_sec, self._baseline_interval_sec)
         # MONOTONIC: bayatlik bir SUREDIR, tarih degil. Duvar saatiyle
         # olculdugunde tek bir NTP siçramasi (ya da RTC'si bos bir sahada
         # acilis sonrasi saat duzeltmesi) TUM cihazlari ayni anda "bayat"

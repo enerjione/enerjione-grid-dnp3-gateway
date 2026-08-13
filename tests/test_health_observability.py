@@ -487,9 +487,7 @@ def test_sessizlik_yoksa_issue_uretilmez() -> None:
 def test_sessizlik_sayimi_health_de_kod_sizdirmaz() -> None:
     """Filo sayimi auth'suz uctan gorulur ama cihaz kodu YINE sizmamali."""
     now = time.time()
-    reader = _SessizReader(
-        {"DEV-GIZLI": {"state": "online", "last_frame_epoch": now}}, alive_no_data=1
-    )
+    reader = _SessizReader({"DEV-GIZLI": {"state": "online", "last_frame_epoch": now}}, alive_no_data=1)
     body, _c = _body(reader=reader, state=_state(device_count=1))
     assert "DEV-GIZLI" not in repr(body)
     assert body["devices"]["alive_no_data"] == 1

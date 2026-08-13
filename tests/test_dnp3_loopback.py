@@ -528,9 +528,7 @@ def test_sessiz_cihaz_comm_lost_olmaz(sessiz_saha, monkeypatch: pytest.MonkeyPat
     while time.monotonic() < son:
         okumalar = reader.read_device(device=device, signals=sinyaller)
         kaliteler = {x.quality for x in okumalar}
-        assert "comm_lost" not in kaliteler, (
-            "SAHTE KOPMA: cihaz cevap veriyor, yalnizca degeri degismiyor"
-        )
+        assert "comm_lost" not in kaliteler, "SAHTE KOPMA: cihaz cevap veriyor, yalnizca degeri degismiyor"
         time.sleep(0.25)
 
     saglik = reader.device_health()[device.code]
@@ -539,8 +537,7 @@ def test_sessiz_cihaz_comm_lost_olmaz(sessiz_saha, monkeypatch: pytest.MonkeyPat
     # Kanit taze, VERI bayat: tam olarak ayirt etmek istedigimiz durum.
     assert saglik["evidence_age_sec"] is not None and saglik["evidence_age_sec"] < esik
     assert saglik["data_age_sec"] > esik, (
-        "test kurulumu gecersiz: olcum gercekten bayatlamamis, "
-        f"saglik={saglik}"
+        f"test kurulumu gecersiz: olcum gercekten bayatlamamis, saglik={saglik}"
     )
 
 
@@ -573,9 +570,7 @@ def test_sessiz_cihaza_komut_gonderilir(sessiz_saha, monkeypatch: pytest.MonkeyP
 
     assert sonuc["ok"] is True, f"sessiz cihaza komut GONDERILEMEDI: {sonuc}"
     assert sonuc["status"] != "offline", "komut uydurma 'offline' ile geri cevrildi"
-    assert 2 in os_.komutlar.operasyonlar, (
-        f"CROB outstation'a ULASMADI (gelen: {os_.komutlar.operasyonlar})"
-    )
+    assert 2 in os_.komutlar.operasyonlar, f"CROB outstation'a ULASMADI (gelen: {os_.komutlar.operasyonlar})"
 
 
 def test_susan_cihaz_comm_lost_olur(sessiz_saha) -> None:
