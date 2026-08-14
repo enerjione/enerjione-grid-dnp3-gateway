@@ -30,6 +30,7 @@ from threading import Event, Lock, Thread
 from typing import Any
 
 from dnp3_gateway import __version__
+from dnp3_gateway.command_authorization import authorize_output_command
 from dnp3_gateway.state import GatewayState
 
 logger = logging.getLogger(__name__)
@@ -712,8 +713,19 @@ def _make_handler(
             bos ise 503. Backend cihaz komut butonlarini (Trigger Download,
             Config Update, Reset...) bu endpoint'e proxy eder.
 
-            Body (JSON): {device_code, index, op_type?, count?, on_time_ms?,
-            off_time_ms?, timeout_sec?, command_id?}
+            Body (JSON): {device_code, command, index, op_type?, count?,
+            on_time_ms?, off_time_ms?, timeout_sec?, command_id?}
+              * `command`: **ZORUNLU** komut slug'i (`master.` oneki OLMADAN,
+                orn. `reset_all_fcis`). Pull yoluyla ayni yerel yetkilendirmeden
+                gecer (F1+F2); slug olmadan komut NIYETI dogrulanamaz ve istek
+                `command_missing` ile reddedilir.
+
+                Bu alan zorunlu kilinirken sozlesme kirilma riski olculdu:
+                filodaki HICBIR gateway'de `command_token` tanimli degil (yani
+                endpoint her yerde 503) ve backend'de bu endpoint'i cagiran kod
+                YOK — yalnizca `gateways.command_token` / `control_host`
+                kolonlari mevcut. Canli cagiran olmadigi icin siki sozlesme
+                simdi, ilk kullanicisi olmadan once konuyor.
               * `index`: cihazin binary output index'i
               * `op_type`: **default `latch_on`** (docstring eskiden `pulse_on`
                 diyordu ama kod `latch_on` kullaniyordu — bu ikisi DNP3'te
@@ -767,6 +779,34 @@ def _make_handler(
                 self._respond_json(
                     {"ok": False, "detail": "Reader komut desteklemiyor"},
                     status_code=503,
+                )
+                return
+
+            # ---- F1 + F2: yerel cikis yetkilendirmesi -----------------------
+            # Pull yolundakiyle AYNI fonksiyon; iki kanalin karari ayrisamaz.
+            # Ledger rezervasyonundan ONCE calisir: yetkisiz bir komut
+            # command_id'yi tuketmemeli, cunku operator duzeltilmis komutu
+            # ayni id ile yeniden gonderebilmeli.
+            karar = authorize_output_command(
+                state.signals_for(device),
+                dnp3_index=index,
+                command=payload.get("command"),
+            )
+            if not karar.authorized:
+                logger.warning(
+                    "command_authorization_rejected gateway=%s device=%s command_id=%s "
+                    "command=%s dnp3_index=%s reason=%s detail=%s — CROB GONDERILMEDI",
+                    gateway_code,
+                    device_code,
+                    payload.get("command_id"),
+                    payload.get("command"),
+                    index,
+                    karar.status,
+                    karar.detail,
+                )
+                self._respond_json(
+                    {"ok": False, "status": karar.status, "detail": karar.detail},
+                    status_code=403,
                 )
                 return
 

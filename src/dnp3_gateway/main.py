@@ -36,6 +36,7 @@ from dnp3_gateway.backend import (
     health_header,
     parse_device_ip_allowlist,
 )
+from dnp3_gateway.command_authorization import authorize_output_command
 from dnp3_gateway.config import Settings, get_settings
 from dnp3_gateway.health_server import (
     ThreadLiveness,
@@ -102,12 +103,22 @@ def _mask_secret(value: str, *, keep: int = 2) -> str:
     return f"{v[:keep]}...{v[-keep:]}"
 
 
-def _execute_pending_commands(reader, state: GatewayState, pending) -> list[dict]:
+def _execute_pending_commands(reader, state: GatewayState, pending, *, gateway_code: str = "") -> list[dict]:
     """Bekleyen komutlari operate_device (CROB) ile calistirir, sonuc listesi doner.
 
     Her sonuc: {id, ok, status, error?} — backend command-results endpoint'inin
     bekledigi bicim. Cihaz bulunamaz/hata olursa ok=False + anlamli status.
     Bir komutun hatasi digerlerini durdurmaz.
+
+    YEREL YETKILENDIRME (F1+F2): CROB gonderilmeden once komut, cihazin KENDI
+    sinyal katalogu ile dogrulanir (bkz. `command_authorization`). Bu, hem
+    `/pending` hem de `config.pending_commands` kanalini kapsar — ikisi de
+    `state.take_pending_commands()` kuyrugundan gecer, ayri bir dogrulama
+    noktasina gerek yoktur.
+
+    Reddedilen komut SESSIZCE DUSURULMEZ: kalici bir sonuc uretir, caller onu
+    ledger'a yazar ve backend'e bildirir. Ledger'da `start_dispatch` zaten
+    tuketildigi icin ayni komut sonraki poll'larda TEKRAR islenmez.
     """
     results: list[dict] = []
     devices_by_code = {d.code: d for d in state.devices()}
@@ -128,6 +139,38 @@ def _execute_pending_commands(reader, state: GatewayState, pending) -> list[dict
                 }
             )
             continue
+
+        # ---- F1 + F2: yerel cikis yetkilendirmesi --------------------------
+        # Cihazin KENDI seti kullanilir; global index listesi DEGIL. Ayni slug
+        # modeller arasinda farkli index'e duser (master.boost_mode: SN2=26,
+        # Pole Master=30) ve global liste ikisini de kabul ederdi.
+        karar = authorize_output_command(
+            state.signals_for(device),
+            dnp3_index=cmd.dnp3_index,
+            command=cmd.command,
+        )
+        if not karar.authorized:
+            logger.warning(
+                "command_authorization_rejected gateway=%s device=%s command_id=%s "
+                "command=%s dnp3_index=%s reason=%s detail=%s — CROB GONDERILMEDI",
+                gateway_code,
+                cmd.device_code,
+                cmd.id,
+                cmd.command,
+                cmd.dnp3_index,
+                karar.status,
+                karar.detail,
+            )
+            results.append(
+                {
+                    "id": cmd.id,
+                    "ok": False,
+                    "status": karar.status,
+                    "error": karar.detail,
+                }
+            )
+            continue
+
         try:
             res = reader.operate_device(
                 device=device,
@@ -225,7 +268,7 @@ def _run_command_poll(
                     fresh.append(cmd)  # yeni -> calistir
                 # False -> zaten dispatch edilmis (restart/duplicate), atla
             if fresh:
-                results = _execute_pending_commands(reader, state, fresh)
+                results = _execute_pending_commands(reader, state, fresh, gateway_code=client.gateway_code)
                 for res in results:
                     ledger.record_result(res)
 

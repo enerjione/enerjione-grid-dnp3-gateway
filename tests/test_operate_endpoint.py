@@ -28,9 +28,20 @@ from dnp3_gateway.backend import DeviceConfig
 from dnp3_gateway.health_server import start_health_server
 from dnp3_gateway.state import GatewayState
 
-from .conftest import make_gateway_config
+from .conftest import make_gateway_config, make_signal
 
 _TOKEN = "komut-token-yeterince-uzun-1234567890"
+
+#: Gercek Horstmann katalogunun alt kumesi (saha runtime'indan alindi).
+#: `index 2 = firmware_update` bilincli olarak burada: F2'nin "gecerli ama
+#: YANLIS nokta" vakasini yakaladigini kanitlayan test bunu kullanir.
+_KATALOG = [
+    make_signal("master.firmware_update", data_type="binary_output", object_group=10, index=2),
+    make_signal("master.start_csv_upload", data_type="binary_output", object_group=10, index=3),
+    make_signal("master.reset_all_fcis", data_type="binary_output", object_group=10, index=7),
+    # Binary INPUT — komut hedefi OLAMAZ (data_type filtresi).
+    make_signal("master.overcurrent_tripped", data_type="binary", object_group=1, index=3),
+]
 
 
 class _FakeReader:
@@ -76,7 +87,7 @@ def sunucu():
     state.update(
         make_gateway_config(
             devices=[DeviceConfig(code="DEV-1", name="DEV-1", ip_address="192.168.10.5", dnp3_address=1)],
-            signals=[],
+            signals=list(_KATALOG),
         )
     )
     hazir = Event()
@@ -133,7 +144,9 @@ def test_basarili_komut_crob_gonderir(sunucu) -> None:
     tutucu["reader"] = reader
     tutucu["ledger"] = _FakeLedger()
 
-    status, govde = _operate(port, {"device_code": "DEV-1", "index": 3, "command_id": 11})
+    status, govde = _operate(
+        port, {"device_code": "DEV-1", "command": "start_csv_upload", "index": 3, "command_id": 11}
+    )
 
     assert status == 200
     assert len(reader.calls) == 1
@@ -152,7 +165,9 @@ def test_yanlis_token_reddedilir(sunucu) -> None:
     tutucu["reader"] = reader
     tutucu["ledger"] = _FakeLedger()
 
-    status, _g = _operate(port, {"device_code": "DEV-1", "index": 3}, token="yanlis")
+    status, _g = _operate(
+        port, {"device_code": "DEV-1", "command": "start_csv_upload", "index": 3}, token="yanlis"
+    )
     assert status == 401
     assert reader.calls == [], "auth basarisizken CROB gonderilmis"
 
@@ -168,8 +183,10 @@ def test_ayni_command_id_crob_u_tekrarlamaz(sunucu) -> None:
     tutucu["reader"] = reader
     tutucu["ledger"] = _FakeLedger()
 
-    _operate(port, {"device_code": "DEV-1", "index": 3, "command_id": 42})
-    status, govde = _operate(port, {"device_code": "DEV-1", "index": 3, "command_id": 42})
+    _operate(port, {"device_code": "DEV-1", "command": "start_csv_upload", "index": 3, "command_id": 42})
+    status, govde = _operate(
+        port, {"device_code": "DEV-1", "command": "start_csv_upload", "index": 3, "command_id": 42}
+    )
 
     assert status == 200
     assert len(reader.calls) == 1, "AYNI command_id ile kesici IKI KEZ surulmus"
@@ -195,7 +212,9 @@ def test_sonucu_bilinmeyen_duplicate_ok_false_donmez(sunucu) -> None:
     # suruyor ya da sonuc backend'e teslim edilip kayittan dusuruldu).
     ledger.dispatched.add(77)
 
-    status, govde = _operate(port, {"device_code": "DEV-1", "index": 3, "command_id": 77})
+    status, govde = _operate(
+        port, {"device_code": "DEV-1", "command": "start_csv_upload", "index": 3, "command_id": 77}
+    )
 
     assert status == 200
     assert govde["duplicate"] is True
@@ -217,7 +236,9 @@ def test_defter_erisilemezken_komut_gonderilmez(sunucu) -> None:
     tutucu["reader"] = reader
     tutucu["ledger"] = _FakeLedger(patlat=True)
 
-    status, govde = _operate(port, {"device_code": "DEV-1", "index": 3, "command_id": 5})
+    status, govde = _operate(
+        port, {"device_code": "DEV-1", "command": "start_csv_upload", "index": 3, "command_id": 5}
+    )
 
     assert status == 503
     assert reader.calls == [], "defter erisilemezken CROB gonderilmis (fail-open)"
@@ -232,7 +253,7 @@ def test_command_id_yoksa_komut_yine_calisir(sunucu) -> None:
     tutucu["reader"] = reader
     tutucu["ledger"] = _FakeLedger()
 
-    status, govde = _operate(port, {"device_code": "DEV-1", "index": 3})
+    status, govde = _operate(port, {"device_code": "DEV-1", "command": "start_csv_upload", "index": 3})
 
     assert status == 200
     assert len(reader.calls) == 1
@@ -261,6 +282,104 @@ def test_gecersiz_command_id_400(sunucu) -> None:
     tutucu["reader"] = reader
     tutucu["ledger"] = _FakeLedger()
 
-    status, _g = _operate(port, {"device_code": "DEV-1", "index": 1, "command_id": "abc"})
+    status, _g = _operate(
+        port, {"device_code": "DEV-1", "command": "start_csv_upload", "index": 3, "command_id": "abc"}
+    )
     assert status == 400
     assert reader.calls == []
+
+
+# --------------------------------------------------------------------------
+# F1+F2 — yerel cikis yetkilendirmesi (pull yoluyla AYNI fonksiyon)
+# --------------------------------------------------------------------------
+
+
+def test_niyet_uyusmazliginda_crob_gonderilmez(sunucu) -> None:
+    """`reset_all_fcis` + index 2 (firmware_update) -> 403, CROB YOK.
+
+    Index 2 katalogda GECERLI bir output; yalnizca index allowlist'i bunu
+    gecirirdi. Durduran sey komut niyeti dogrulamasidir (F2).
+    """
+    tutucu, port = sunucu
+    reader = _FakeReader()
+    tutucu["reader"] = reader
+    tutucu["ledger"] = _FakeLedger()
+
+    status, govde = _operate(
+        port, {"device_code": "DEV-1", "command": "reset_all_fcis", "index": 2, "command_id": 101}
+    )
+
+    assert status == 403
+    assert reader.calls == [], "yetkisiz komut icin CROB GONDERILDI"
+    assert govde["status"] == "command_index_mismatch"
+
+
+def test_katalogda_olmayan_index_reddedilir(sunucu) -> None:
+    tutucu, port = sunucu
+    reader = _FakeReader()
+    tutucu["reader"] = reader
+    tutucu["ledger"] = _FakeLedger()
+
+    status, govde = _operate(
+        port, {"device_code": "DEV-1", "command": "reset_all_fcis", "index": 999, "command_id": 102}
+    )
+
+    assert status == 403
+    assert reader.calls == []
+    assert govde["status"] == "index_not_authorized"
+
+
+def test_command_alani_zorunlu(sunucu) -> None:
+    """Slug olmadan F2 dogrulanamaz -> komut reddedilir (bypass kapali)."""
+    tutucu, port = sunucu
+    reader = _FakeReader()
+    tutucu["reader"] = reader
+    tutucu["ledger"] = _FakeLedger()
+
+    status, govde = _operate(port, {"device_code": "DEV-1", "index": 3, "command_id": 103})
+
+    assert status == 403
+    assert reader.calls == []
+    assert govde["status"] == "command_missing"
+
+
+def test_binary_input_index_i_reddedilir(sunucu) -> None:
+    """G1 index 3 katalogda var ama data_type='binary' — komut hedefi olamaz."""
+    tutucu, port = sunucu
+    reader = _FakeReader()
+    tutucu["reader"] = reader
+    tutucu["ledger"] = _FakeLedger()
+
+    status, govde = _operate(
+        port,
+        {"device_code": "DEV-1", "command": "overcurrent_tripped", "index": 3, "command_id": 104},
+    )
+
+    assert status == 403
+    assert reader.calls == []
+    assert govde["status"] == "command_index_mismatch"
+
+
+def test_yetkisiz_komut_command_id_yi_tuketmez(sunucu) -> None:
+    """Reddedilen komut ledger rezervasyonu YAPMAMALI.
+
+    Operator duzeltilmis komutu AYNI command_id ile yeniden gonderebilmeli;
+    aksi halde 'duplicate' cevabi alir ve dogru komut hic calismaz.
+    """
+    tutucu, port = sunucu
+    reader = _FakeReader()
+    tutucu["reader"] = reader
+    ledger = _FakeLedger()
+    tutucu["ledger"] = ledger
+
+    # Yanlis index ile red
+    _operate(port, {"device_code": "DEV-1", "command": "reset_all_fcis", "index": 2, "command_id": 7})
+    assert ledger.dispatched == set(), "yetkisiz komut command_id'yi tuketmis"
+
+    # Ayni id, DOGRU index -> calismali
+    status, govde = _operate(
+        port, {"device_code": "DEV-1", "command": "reset_all_fcis", "index": 7, "command_id": 7}
+    )
+    assert status == 200
+    assert govde["ok"] is True
+    assert len(reader.calls) == 1
