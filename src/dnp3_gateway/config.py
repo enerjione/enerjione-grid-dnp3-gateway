@@ -187,6 +187,38 @@ class Settings(BaseSettings):
     # Hafif komut-poll araligi: pending komutlar + nonce'lar. Komut anlik gelsin
     # diye kisa (1sn). GET /gateways/{code}/pending — agir config serialize yok.
     command_poll_sec: int = Field(default=1, ge=1, le=60)
+    command_max_age_sec: float = Field(
+        default=120.0,
+        ge=5.0,
+        le=86400.0,
+        description=(
+            "Bekleyen bir DNP3 komutunun AZAMI YASI (sn). Backend'in bildirdigi "
+            "`created_at` bu sureden eskiyse komut CALISTIRILMAZ ve `expired` "
+            "olarak bildirilir. Gerekce: gateway 30 dakika kapali kaldiktan "
+            "sonra acildiginda kuyrukta bekleyen bir komut (orn. firmware "
+            "update / software reset) oldugu gibi calisiyordu.\n"
+            "\n"
+            "120 sn olculerek secildi: sahada komutun kuyruktan gateway'e "
+            "teslimi p95=0.92 sn, uctan uca en kotu gozlem 10.1 sn (adapter "
+            "CROB timeout'u). 120 sn hem bu dagilimin cok uzerinde hem de bir "
+            "deploy/restart penceresini (30-60 sn) kapsar. Daha kisa degerler "
+            "deploy sirasinda mesru komutlari sahte `expired` yapar."
+        ),
+    )
+    command_require_timestamp: bool = Field(
+        default=False,
+        description=(
+            "Zaman damgasi TASIMAYAN komut reddedilsin mi. VARSAYILAN KAPALI "
+            "cunku backend `created_at` alanini pending payload'ina HENUZ "
+            "koymuyor; acik olsaydi bugun TUM komutlar reddedilirdi.\n"
+            "\n"
+            "Bu bir GECIS bayragidir, TTL'yi kapatan bir feature flag DEGILDIR: "
+            "`created_at` GELDIGI anda azami yas her kosulda uygulanir, bayrak "
+            "bunu bypass ETMEZ. Backend alani gondermeye basladiktan sonra "
+            "`true` yapilacak; damgasiz komutu kalici olarak kabul etmek bir "
+            "cozum degildir."
+        ),
+    )
     config_timeout_sec: int = Field(default=5, ge=1, le=60)
     # Command-poll READ timeout (sn). Config fetch'ten AYRI: poll kisa read
     # timeout ile hizli hata verip bir sonraki turda yeniden dener, uzun
