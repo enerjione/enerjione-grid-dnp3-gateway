@@ -120,6 +120,17 @@ class Outstation:
         b.Update(opendnp3.Binary(bool(deger), opendnp3.Flags(bayraklar)), index)
         self._outstation.Apply(b.Build())
 
+    def double_bit_yaz(self, index: int, durum: str) -> None:
+        """G3 double-bit (kesici pozisyonu) yaz.
+
+        Bayrak PARAMETRESI YOK — bilincli: bu tipte pozisyon bayrak byte'inin
+        6/7. bitlerinde tasinir ve kutuphane onu `DoubleBit` degerinden KENDISI
+        uretir (DETERMINED_OFF -> 0x41). Testin butun anlami zaten bu.
+        """
+        b = opendnp3.UpdateBuilder()
+        b.Update(opendnp3.DoubleBitBinary(opendnp3.DoubleBit.__members__[durum]), index)
+        self._outstation.Apply(b.Build())
+
     def sustur(self) -> None:
         """Outstation'i SUSTUR ama TCP sunucusunu ayakta birak.
 
@@ -245,6 +256,101 @@ def test_gercek_dnp3_okumasi(saha) -> None:
     # Kalite bayraklari GERCEK cihazdan geliyor (ONLINE biti)
     assert degerler["master.a0"].dnp3_flags is not None
     assert degerler["master.a0"].dnp3_flags & 0x01, "ONLINE biti tasinmadi"
+
+
+def test_ayni_bayrak_byte_i_tipe_gore_farkli_kalite_uretir(saha) -> None:
+    """REGRESYON (uctan uca): kalite bayragi TIPE GORE okunmali.
+
+    Tek bir byte — 0x41 — iki tipte TAMAMEN farkli anlam tasir:
+
+      * G3 double-bit : ONLINE | STATE1  -> kesici ACIK, olcum SAGLAM
+      * G30 analog    : ONLINE | REFERENCE_ERR -> CT referansi kayip, BOZUK
+
+    Tip-kor esleme ikisini de `invalid` yapiyordu; yani bayrak yayina
+    acildigi anda SAHADAKI HER ACIK KESICI "olcum gecersiz" gorunecekti.
+    Bu test iki yonu de AYNI ANDA, gercek DNP3 trafigiyle kanitlar —
+    `map_dnp3_quality` birim testleri cagri yerinin `dnp3_object_group`'u
+    gercekten ilettigini gosteremez.
+    """
+    os_, reader, device = saha
+    os_.double_bit_yaz(0, "DETERMINED_OFF")  # kesici ACIK
+    os_.analog_yaz(0, 0.0, bayraklar=0x41)  # ONLINE | REFERENCE_ERR
+
+    sinyaller = [
+        _sinyal("master.kesici", 0, data_type="binary", group=3),
+        _sinyal("master.akim", 0),
+    ]
+    # Bayragin DOLU olmasi, olcumun gercekten cihazdan geldiginin kanitidir.
+    # (`quality != "no_change"` YETMEZ: baglanti kurulmadan once cihaz
+    # seviyesinde `comm_lost` doner ve o okumada bayrak yoktur.)
+    okumalar = _bekle(
+        lambda: (
+            r
+            if (r := reader.read_device(device=device, signals=sinyaller))
+            and all(x.dnp3_flags is not None for x in r)
+            else None
+        )
+    )
+
+    assert okumalar is not None, "gercek outstation'dan veri okunamadi"
+    d = {x.signal_key: x for x in okumalar}
+
+    kesici = d["master.kesici"]
+    assert kesici.dnp3_flags == 0x41, f"G3 DETERMINED_OFF bayragi 0x41 olmali, {kesici.dnp3_flags:#04x} geldi"
+    assert kesici.quality == "good", "ACIK kesici `invalid` yayinlandi — tip-kor esleme geri gelmis"
+    assert kesici.scaled_value == 1.0, "DETERMINED_OFF degeri 1.0 olmali (pozisyon KAYBOLMAMALI)"
+
+    akim = d["master.akim"]
+    assert akim.dnp3_flags == 0x41
+    assert akim.quality == "invalid", "G30 REFERENCE_ERR hala `invalid` olmali (kapsam daralmamali)"
+
+
+def test_kesici_kapali_pozisyonu_da_good_kalir(saha) -> None:
+    """DETERMINED_ON -> 0x81 (STATE2). 0x80 hicbir tipte kalite biti degil."""
+    os_, reader, device = saha
+    os_.double_bit_yaz(1, "DETERMINED_ON")
+
+    sinyaller = [_sinyal("master.kesici", 1, data_type="binary", group=3)]
+    okumalar = _bekle(
+        lambda: (
+            r
+            if (r := reader.read_device(device=device, signals=sinyaller)) and r[0].dnp3_flags is not None
+            else None
+        )
+    )
+
+    assert okumalar is not None
+    r = okumalar[0]
+    assert r.dnp3_flags == 0x81
+    assert r.quality == "good", "KAPALI kesici `invalid` yayinlandi"
+    assert r.scaled_value == 2.0, "DETERMINED_ON degeri 2.0 olmali"
+
+
+def test_g110_string_noktasi_invalid_olmaz(saha) -> None:
+    """REGRESYON RISKI: G110 kalite byte'i TASIMAZ.
+
+    `flags is None -> invalid` kuralinin kor uygulanmasi, bayrak yayina
+    acildigi anda seri no / IMEI / firmware / IP noktalarinin TAMAMINI
+    `invalid` yapardi. Fixture'da G110 noktasi olmadigi icin cache'e
+    dogrudan yaziliyor — onemli olan `read_device`'in bayraksiz G110'u
+    nasil degerlendirdigi.
+    """
+    os_, reader, device = saha
+    os_.analog_yaz(0, 1.0)
+    assert _ilk_iyi_okuma(reader, device, [_sinyal("master.a0", 0)]) is not None
+
+    # Baglanti kurulmus master'in cache'ine G110 noktasi dusur (SOE handler
+    # bunu bayraksiz yazar — bkz. `cache.set(_OBJECT_GROUP_STRING, ...)`).
+    cache = reader._masters[device.code].cache
+    cache.set(110, 3, 0.0, value_string="SN-12345")
+
+    okumalar = reader.read_device(
+        device=device, signals=[_sinyal("master.seri_no", 3, data_type="string", group=110)]
+    )
+    r = okumalar[0]
+    assert r.dnp3_flags is None, "G110 bayrak tasimamali"
+    assert r.quality == "good", "bayraksiz G110 noktasi `invalid` yayinlandi"
+    assert r.value_string == "SN-12345"
 
 
 def test_scale_ve_offset_gercek_trafikte_uygulanir(saha) -> None:

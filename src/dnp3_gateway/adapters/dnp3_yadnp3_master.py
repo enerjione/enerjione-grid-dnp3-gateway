@@ -68,15 +68,68 @@ _FROZEN_COUNTER_CLS = getattr(opendnp3, "FrozenCounter", None) if _YADNP3_AVAILA
 # Somut ornek: outstation CT referansini kaybedip analog noktayi
 # `value=0.0, flags=ONLINE|REFERENCE_ERR` raporluyor -> SCADA hat akimini 0 A
 # kabul ediyor -> "hat enerjisiz" yorumu, yanlis alarm bastirma.
+#
+# BAYRAK BYTE'I TIPE GORE OKUNUR — 5, 6 ve 7. bitler object group'a gore
+# TAMAMEN FARKLI anlam tasir. Bu ayrim yapilmadan (eski hali) bayrak yayina
+# acildiginda sahayi bozacak iki somut hata vardi:
+#
+#   1. G3 Double-bit'te 0x40/0x80 KESICI POZISYONUDUR, kalite degil. Kutuphane
+#      ile dogrulandi: DETERMINED_OFF -> flags=0x41, INDETERMINATE -> 0xC1.
+#      Eski tip-kor esleme 0x41'i "REFERENCE_ERR" sanip **her ACIK kesiciyi**
+#      `quality=invalid` yayinlardi.
+#   2. G1/G10'da 0x20 OVER_RANGE degil CHATTER_FILTER / RESERVED1'dir;
+#      G20/G21'de ROLLOVER'dir. Hicbiri "bu deger guvenilmez" demez.
+#
+# Asagidaki tablo yadnp3 3.2.1.1'in kendi enum'lariyla dogrulanmistir
+# (`test_bayrak_tablosu_kutuphaneyle_uyumlu` bunu CI'da pinler).
+#
+#            0x20              0x40             0x80
+#   G1   CHATTER_FILTER     RESERVED          STATE
+#   G3   CHATTER_FILTER     STATE1            STATE2
+#   G10  RESERVED1          RESERVED2         STATE
+#   G20  ROLLOVER           DISCONTINUITY     RESERVED
+#   G21  ROLLOVER           DISCONTINUITY     RESERVED
+#   G30  OVERRANGE          REFERENCE_ERR     RESERVED
+#   G40  OVERRANGE          REFERENCE_ERR     RESERVED
+#   G110 (bayrak TASIMAZ — OctetString kalite byte'i olmadan cache'e yazilir)
+
+# 0. - 4. bitler TUM gruplarda ayni anlami tasir.
 _FLAG_ONLINE = 0x01
 _FLAG_RESTART = 0x02
 _FLAG_COMM_LOST = 0x04
 _FLAG_REMOTE_FORCED = 0x08
 _FLAG_LOCAL_FORCED = 0x10
-# Bit 5 tipe gore degisir: binary'de CHATTER_FILTER, analog/counter'da OVER_RANGE
-_FLAG_CHATTER_OR_OVERRANGE = 0x20
-# Bit 6 analog/counter'da REFERENCE_ERR (binary'de kullanilmaz)
-_FLAG_REFERENCE_ERR = 0x40
+_FLAG_FORCED = _FLAG_REMOTE_FORCED | _FLAG_LOCAL_FORCED
+
+# Tipe gore degisen bitler.
+_BIT5 = 0x20
+_BIT6 = 0x40
+
+#: Bit 5/6'nin "bu SAYIYA guvenme" anlamina geldigi gruplar (OVERRANGE /
+#: REFERENCE_ERR). YALNIZCA analog gruplar. Diger gruplarda ayni bitler ya
+#: durum bilgisidir (STATE1/STATE2), ya nokta davranisi hakkinda BILGILENDIRME
+#: yapar (CHATTER_FILTER, ROLLOVER, DISCONTINUITY), ya da RESERVED'dir —
+#: hicbiri olcumu gecersiz kilmaz. Bu bitler ham `dnp3_flags` byte'inda
+#: korunur; backend isterse oradan decode eder.
+_DEGER_BUTUNLUGU_BITLERI: dict[int, int] = {
+    _OBJECT_GROUP_ANALOG_INPUT: _BIT5 | _BIT6,
+    _OBJECT_GROUP_ANALOG_OUTPUT: _BIT5 | _BIT6,
+}
+
+#: Kalite bayragi TASIYAN gruplar. Bu kumede olan bir grup icin bayrak
+#: okunamamissa bu bir ANOMALIDIR (bkz. `map_dnp3_quality`); kumede olmayan
+#: gruplar (G110) icin bayragin yoklugu NORMALDIR.
+_KALITE_TASIYAN_GRUPLAR: frozenset[int] = frozenset(
+    {
+        _OBJECT_GROUP_BINARY_INPUT,
+        _OBJECT_GROUP_DOUBLE_BIT_BINARY,
+        _OBJECT_GROUP_BINARY_OUTPUT,
+        _OBJECT_GROUP_COUNTER,
+        _OBJECT_GROUP_FROZEN_COUNTER,
+        _OBJECT_GROUP_ANALOG_INPUT,
+        _OBJECT_GROUP_ANALOG_OUTPUT,
+    }
+)
 
 
 def _extract_flags(measurement: Any) -> int | None:
@@ -202,29 +255,56 @@ def _double_bit_to_float(value: Any) -> float:
         return 0.0
 
 
-def map_dnp3_quality(flags: int | None) -> str:
+def map_dnp3_quality(flags: int | None, object_group: int) -> str:
     """Ham DNP3 bayrak byte'ini gateway kalite sozlugune esler.
+
+    `object_group` ZORUNLU: 5/6/7. bitler tipe gore farkli anlam tasidigi icin
+    bayrak byte'i tipi bilinmeden okunamaz (bkz. yukaridaki tablo). Varsayilan
+    deger BILEREK verilmedi — tip-kor bir cagri sessizce yanlis kalite uretir.
+
+    Donen sozluk backend'in v2.28.0'dan beri tanidigi 5 token ile SINIRLIDIR:
+      `good | invalid | restart | forced | comm_lost`
+    Yeni token EKLENMEZ; kapsam (nokta/cihaz) ayrimini govdedeki `dnp3_flags`
+    alaninin VARLIGI belirler (bkz. `poller.build_telemetry_payload`).
 
     Oncelik sirasi en kotu durumdan iyiye:
       comm_lost > restart > invalid (ONLINE yok / OVER_RANGE / REFERENCE_ERR)
       > forced (LOCAL/REMOTE_FORCED) > good
 
-    NOT: Bu esleme YAYINA henuz baglanmadi — `quality` alaninda yeni degerler
-    (`invalid`, `restart`, `forced`) backend tag-engine'i bunlari tanidiktan
-    SONRA acilacak. Bkz. docs/BACKEND_TODO.md#B1 ve
-    `GATEWAY_PUBLISH_DNP3_QUALITY` env bayragi.
+    `comm_lost` EN USTTE kalir: backend'de cihaz seviyesine kilitli tek
+    kalitedir. Altina cekilirse gercekten olu bir cihaz "online ama bir noktasi
+    bozuk" gorunurdu.
+
+    Bayrak yoklugu (`flags is None`) TIPE GORE degerlendirilir:
+      * G110 (OctetString) -> `good`. Bu tip kalite byte'i TASIMAZ; seri no /
+        IMEI / firmware noktalari bayraksiz cache'e yazilir. Bunlari `invalid`
+        yapmak, bayrak yayina acildigi anda tum string noktalarini bozardi.
+      * Kalite tasiyan gruplar -> `invalid` (FAIL-SAFE). Bayragi okunamamis bir
+        olcumu `good` saymak, tam da kapatmaya calistigimiz hatanin ta kendisi
+        olurdu: desteksiz bir "bu deger saglam" iddiasi. Bu yol yadnp3
+        3.2.1.1'de ULASILAMAZ (yedi kalite tipinin hepsi `.flags` tasiyor);
+        binding degisirse diye duran bilincli bir savunmadir ve cagri yerinde
+        nokta basina bir kez WARNING loglanir.
+      * Bilinmeyen grup -> yalnizca ortak bitler degerlendirilir; 5/6. bitlerin
+        anlami bilinmediginden onlardan `invalid` URETILMEZ (uydurma kalite
+        vermektense ham byte'i backend'e birakiyoruz).
+
+    Bkz. docs/BACKEND_TODO.md#B1 ve `DNP3_PUBLISH_QUALITY_FLAGS` env bayragi.
     """
-    if flags is None:
+    if object_group == _OBJECT_GROUP_STRING:
+        # G110 hicbir kosulda kalite byte'i tasimaz.
         return "good"
+    if flags is None:
+        return "invalid" if object_group in _KALITE_TASIYAN_GRUPLAR else "good"
     if flags & _FLAG_COMM_LOST:
         return "comm_lost"
     if flags & _FLAG_RESTART:
         return "restart"
     if not (flags & _FLAG_ONLINE):
         return "invalid"
-    if flags & (_FLAG_CHATTER_OR_OVERRANGE | _FLAG_REFERENCE_ERR):
+    if flags & _DEGER_BUTUNLUGU_BITLERI.get(object_group, 0):
         return "invalid"
-    if flags & (_FLAG_LOCAL_FORCED | _FLAG_REMOTE_FORCED):
+    if flags & _FLAG_FORCED:
         return "forced"
     return "good"
 
@@ -1887,6 +1967,10 @@ class Yadnp3TelemetryReader(TelemetryReader):
         # nokta her cycle yeniden okunur; uyariyi bir kez basiyoruz.
         self._nan_lock = threading.Lock()
         self._nan_uyarilan: set[tuple[int, int]] = set()
+        # Kalite bayragi TASIMASI GEREKIRKEN bayraksiz gelen noktalar.
+        # Ayni gerekce (log spam onlemi); NaN kumesinden ayri tutuluyor ki
+        # iki farkli anomali birbirinin uyarisini bastirmasin.
+        self._bayrak_uyarilan: set[tuple[int, int]] = set()
         # Kopuk cihaz yoklamasi: cihaz kodu -> {"son": monotonic, "deneme": int}.
         # Master nesnesinde DEGIL burada tutuluyor, cunku zorla relink master'i
         # yok edip yeniden kuruyor; sayac master ile birlikte silinirse esik
@@ -2550,11 +2634,29 @@ class Yadnp3TelemetryReader(TelemetryReader):
             cihaz_zamani, damga_kalitesi = dogrula_cihaz_zamani(cihaz_zamani, damga_kalitesi, time.time())
             scaled = raw * s.scale + s.offset
             # Kalite: cihazin bildirdigi DNP3 bayraklarindan turetilir.
+            # Bayrak byte'i TIPE GORE okunur — `s.dnp3_object_group` sart
+            # (G3'te 0x40/0x80 kesici pozisyonu, G30'da REFERENCE_ERR).
             # `publish_dnp3_quality` KAPALIYKEN (varsayilan) geriye uyum icin
-            # "good" yayinlanir — backend tag-engine'i `invalid`/`restart`/
-            # `forced` degerlerini tanidiktan sonra acilacak.
-            # Bkz. docs/BACKEND_TODO.md#B1
-            mapped_quality = map_dnp3_quality(dnp3_flags)
+            # "good" yayinlanir. Backend sozlugu v2.28.0'dan beri taniyor;
+            # bayrak kapali cunku acilis KADEMELI olacak (once tek test
+            # gateway'i + gercek cihaz dogrulamasi). Bkz. docs/BACKEND_TODO.md#B1
+            mapped_quality = map_dnp3_quality(dnp3_flags, s.dnp3_object_group)
+            # FAIL-SAFE gorunur olsun: kalite tasimasi GEREKEN bir gruptan
+            # bayraksiz olcum geldiyse deger `invalid` yayinlanir. Sessiz
+            # kalmasi, bir binding regresyonunun sahada aylarca fark
+            # edilmemesi demek olurdu. Nokta basina TEK satir (log spam yok).
+            if dnp3_flags is None and s.dnp3_object_group in _KALITE_TASIYAN_GRUPLAR:
+                if self._bayrak_uyarisi_ver(s.dnp3_object_group, s.dnp3_index):
+                    logger.warning(
+                        "dnp3_missing_quality_flags device=%s signal=%s group=%s index=%s — "
+                        "bu tip kalite bayragi TASIMALI ama okunamadi; fail-safe olarak "
+                        "quality=invalid degerlendiriliyor (yayin ancak "
+                        "DNP3_PUBLISH_QUALITY_FLAGS=true iken etkilenir)",
+                        device.code,
+                        s.key,
+                        s.dnp3_object_group,
+                        s.dnp3_index,
+                    )
 
             # ---- NaN / Inf KORUMASI ------------------------------------------
             # G30v5/v6 (float/double) noktalarda outstation olculemeyen bir
@@ -2639,6 +2741,19 @@ class Yadnp3TelemetryReader(TelemetryReader):
             if anahtar in self._nan_uyarilan:
                 return False
             self._nan_uyarilan.add(anahtar)
+            return True
+
+    def _bayrak_uyarisi_ver(self, group: int, index: int) -> bool:
+        """Bu nokta icin "kalite bayragi eksik" uyarisi DAHA ONCE verilmedi mi?
+
+        `_nan_uyarisi_ver` ile ayni gerekce: arizali nokta her cycle yeniden
+        okunur, uyari her seferinde basilirsa log dolar.
+        """
+        anahtar = (group, index)
+        with self._nan_lock:
+            if anahtar in self._bayrak_uyarilan:
+                return False
+            self._bayrak_uyarilan.add(anahtar)
             return True
 
     @property
