@@ -53,6 +53,28 @@ HEADER_NAME = "X-E1-Gateway-Health"
 #: tavana dayanan bir baslik nginx'te tum istegi reddettirebilir.
 MAX_HEADER_BYTES = 1600
 
+# ---------------------------------------------------------------------------
+# F3C teslim protokolu
+# ---------------------------------------------------------------------------
+#
+# Sozlesme: docs/f3c-command-delivery-protocol.md (enerjione-grid deposu).
+# Backend tarafi: app/services/command_delivery_service.py (30ed9a5).
+
+#: HER `/pending` isteginde gider. Govde: base64url(compact JSON)
+#: `{"v":1,"epoch":"<uuid>"}`. ~60 bayt.
+DELIVERY_HEADER_NAME = "X-E1-Delivery"
+
+#: Teslim protokolu surumu. Backend `v >= 1` ve dolu bir `epoch` gorunce
+#: kira/ACK yoluna gecer.
+DELIVERY_PROTOCOL_VERSION = 1
+
+#: Bu gateway'in ACIKCA bildirdigi yetenek adi.
+#:
+#: SURUM AYRISTIRMASI YOK: backend "1.8.0 ise destekliyordur" gibi bir cikarim
+#: YAPMAZ, yalnizca bu adi arar. Boylece calisma zamani gercekten
+#: desteklemiyorsa yetenek GORUNMEZ ve backend fail-closed davranir.
+CAPABILITY_COMMAND_DELIVERY_ACK_V1 = "command_delivery_ack_v1"
+
 #: `states` icine en fazla kac cihaz konur. Asilirsa kirpilir ve
 #: `states_truncated` isaretlenir.
 MAX_STATE_ENTRIES = 40
@@ -92,6 +114,7 @@ def build_payload(
     uptime_sec: int | None = None,
     gateway_version: str | None = None,
     issues: list[str] | None = None,
+    ledger_epoch: str | None = None,
 ) -> dict[str, Any]:
     """Backend'in bekledigi govdeyi kurar."""
     devices: dict[str, Any] = {}
@@ -124,9 +147,52 @@ def build_payload(
         # (gateway_health_service.record_health) bu anahtari okuyor. Burada
         # `gateway_version` yazmak, alanin sahada hep bos kalmasi demekti.
         govde["version"] = str(gateway_version)[:40]
+    if ledger_epoch:
+        # GOZLEMLENEBILIRLIK — teslim karari BU alandan verilmez.
+        #
+        # Teslim protokolunun otoritesi `X-E1-Delivery` basligidir; o HER
+        # poll'de gider. Buradaki kopya operatorun/rollout dogrulamasinin filoyu
+        # `gateway_health` uzerinden gorebilmesi icin. Saglik ozeti 30 saniyede
+        # bir gittigi icin BAYAT olabilir; guvenlik karari ona dayandirilamaz.
+        #
+        # Yayindaki backend tanimadigi anahtarlari `raw_json`e yaziyor — ek
+        # kolon/migration GEREKMEZ, eski backend KIRILMAZ.
+        govde["capabilities"] = [CAPABILITY_COMMAND_DELIVERY_ACK_V1]
+        govde["ledger_epoch"] = str(ledger_epoch)[:64]
     if issues:
         govde["issues"] = [str(i)[:120] for i in issues[:10]]
     return govde
+
+
+def encode_delivery_header(ledger_epoch: str) -> str | None:
+    """`X-E1-Delivery` basligini uretir. Hata -> None (istisna ATMAZ).
+
+    Govde bilincli olarak MINIMAL: `{"v":1,"epoch":"<uuid>"}` ~60 bayt. Bu
+    baslik saniyede bir gidiyor; buyutmenin bedeli surekli.
+
+    Epoch bos ise None doner — uydurma bir kimlik gondermektense yetenegi hic
+    bildirmemek dogrudur (backend fail-closed davranir).
+    """
+    try:
+        kimlik = str(ledger_epoch).strip()
+        if not kimlik:
+            return None
+        govde = {"v": int(DELIVERY_PROTOCOL_VERSION), "epoch": kimlik}
+        kodlu = _kodla(govde)
+        if len(kodlu) > MAX_HEADER_BYTES:
+            # Gercekce ulasilamaz (UUID sabit boyutlu) ama sozlesme geregi:
+            # tavani asan baslik backend'de YOK SAYILIR, yani sessizce eski
+            # yola duserdik. Bunu gorunur kiliyoruz.
+            logger.error(
+                "delivery_header_too_large bytes=%d limit=%d — teslim yetenegi BILDIRILEMEDI",
+                len(kodlu),
+                MAX_HEADER_BYTES,
+            )
+            return None
+        return kodlu
+    except Exception:  # noqa: BLE001
+        logger.debug("delivery_header_encode_failed", exc_info=True)
+        return None
 
 
 def _kodla(payload: dict[str, Any]) -> str:

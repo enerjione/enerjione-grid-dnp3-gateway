@@ -7,6 +7,7 @@ import logging
 import sqlite3
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -48,10 +49,56 @@ def _migration_002_delivery_failures(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE command_ledger ADD COLUMN delivery_failures INTEGER NOT NULL DEFAULT 0")
 
 
+def _migration_003_delivery_ack(conn: sqlite3.Connection) -> None:
+    """v3 — F3C: teslim jetonu, DAYANIKLI teslim-ACK'i ve defter kimligi.
+
+    KAPATILAN ARIZA
+    Backend `/pending` yanitini uretirken komutu `sent` isaretliyordu. Yanit ag
+    uzerinde kaybolursa (A) ya da gateway onu okuyup `start_dispatch`ten ONCE
+    olurse (B), komut backend'de sonsuza kadar `sent` kalir, cihaza HIC gitmez
+    ve kayip SESSIZ olurdu. Artik teslim, gateway kalici olarak kabul ettigini
+    BILDIRINCE (ACK) tamamlanmis sayilir.
+
+    `ack_state`:
+      none      teslim protokolu disi (eski backend; ACK beklenmiyor)
+      pending   deftere YAZILDI, backend'e henuz bildirilmedi
+      acked     backend bildirimi onayladi
+
+    ACK NEDEN DEFTERDE (RAM'de degil)
+    ACK ancak `start_dispatch` COMMIT'inden SONRA uretilebilir; bellekte
+    tutulsaydi SIGKILL ile kaybolur ve backend komutu hicbir zaman `sent`
+    goremezdi — yani F3C'nin kapattigi pencere ACK tarafindan yeniden acilirdi.
+
+    `ledger_meta.epoch` — DEFTER KIMLIGI
+    Bu defter silinir/sifirlanirsa tekrar-onleme kaniti kaybolur: backend daha
+    once teslim ettigi bir komutu yeniden sunarsa gateway onu YENI sanip CROB'u
+    TEKRARLAR. Epoch bunu gorunur kilar — defter yeniden yaratildiginda deger
+    degisir, backend kiraladigi epoch ile eslesmedigini gorup komutu otomatik
+    teslim ETMEZ.
+
+    Zaman damgasi bu isi yapamazdi: bellekte tutuluyor, restart'ta kayboluyor
+    ve saat geri alinirsa iki farkli defter ayni damgayi tasiyabiliyordu.
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(command_ledger)").fetchall()}
+    if "delivery_token" not in cols:
+        conn.execute("ALTER TABLE command_ledger ADD COLUMN delivery_token TEXT")
+    if "ack_state" not in cols:
+        # Mevcut satirlar 'none': eski backend bu komutlar icin ACK BEKLEMIYOR.
+        # 'pending' vermek, yukseltme aninda gecmisteki TUM komutlar icin
+        # backend'e anlamsiz ACK yagdirirdi.
+        conn.execute("ALTER TABLE command_ledger ADD COLUMN ack_state TEXT NOT NULL DEFAULT 'none'")
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_command_ledger_ack ON command_ledger (ack_state)")
+    conn.execute("CREATE TABLE IF NOT EXISTS ledger_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+
+
 _MIGRATIONS: list[Migration] = [
     (1, "initial command_ledger schema", _migration_001_initial),
     (2, "command_ledger.delivery_failures (kalici teslim hatasi sayaci)", _migration_002_delivery_failures),
+    (3, "command_ledger delivery_token/ack_state + ledger_meta.epoch (F3C)", _migration_003_delivery_ack),
 ]
+
+#: `ledger_meta` icindeki defter kimligi anahtari.
+_EPOCH_KEY = "epoch"
 
 
 class CommandLedger:
@@ -97,6 +144,9 @@ class CommandLedger:
             wal_autocheckpoint=1000,
             on_quarantine=_karantina,
         )
+        # Defter kimligi migration'lardan SONRA yuklenir (tablo o zaman var).
+        self._epoch = self._epoch_yukle()
+
         if self.journal_reset_at is not None:
             logger.error(
                 "command_ledger_reset path=%s karantina=%s — KOMUT DEFTERI BOZUKTU ve "
@@ -115,6 +165,9 @@ class CommandLedger:
             "journal_reset": self.journal_reset_at is not None,
             "journal_reset_at": self.journal_reset_at,
             "journal_reset_path": self.journal_reset_path,
+            # Defter kimligi: bu degerin DEGISMESI, tekrar-onleme kanitinin
+            # kaybolmasi demektir. Operatorun gorebilmesi gerekir.
+            "ledger_epoch": self._epoch,
         }
         try:
             with self._lock:
@@ -130,16 +183,112 @@ class CommandLedger:
             logger.debug("command_ledger_status_failed", exc_info=True)
         return snapshot
 
-    def start_dispatch(self, command_id: int) -> bool:
-        """Dispatch intent'i kalıcı yazılırsa True döner."""
+    def _epoch_yukle(self) -> str:
+        """Defter kimligini okur; yoksa URETIR ve KALICI yazar.
+
+        Ayni dosya yasadigi surece (proses restart, container restart,
+        container recreate + ayni named volume) DEGISMEZ. Dosya silinir ya da
+        karantinaya alinirsa yeni bir defterle birlikte YENI kimlik dogar —
+        tam olarak backend'in ogrenmesi gereken sey budur.
+
+        `INSERT OR IGNORE` + geri okuma: iki surec ayni anda acsa bile tek bir
+        deger kazanir ve ikisi de ayni degeri okur.
+        """
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO ledger_meta (key, value) VALUES (?, ?)",
+                (_EPOCH_KEY, str(uuid.uuid4())),
+            )
+            self._conn.commit()
+            row = self._conn.execute("SELECT value FROM ledger_meta WHERE key = ?", (_EPOCH_KEY,)).fetchone()
+        return str(row[0])
+
+    @property
+    def epoch(self) -> str:
+        """Bu defterin DAYANIKLI kimligi (UUID)."""
+        return self._epoch
+
+    def start_dispatch(self, command_id: int, delivery_token: str | None = None) -> bool:
+        """Dispatch intent'i kalıcı yazılırsa True döner.
+
+        `delivery_token` verilirse (F3C teslim protokolu) kayit ACK BEKLIYOR
+        durumunda acilir. ACK ancak bu COMMIT tamamlandiktan SONRA uretilebilir;
+        sozlesmenin can alici noktasi budur.
+
+        JETON OPAKTIR: cozulmez, normalize edilmez, loglanmaz. Yalnizca komutla
+        iliskilendirilip backend'e aynen geri verilir.
+        """
+        jeton = None if delivery_token is None else str(delivery_token)
+        ack = "pending" if jeton else "none"
         with self._lock:
             cur = self._conn.execute(
                 "INSERT OR IGNORE INTO command_ledger "
-                "(command_id, state, received_at, dispatch_started_at) VALUES (?, 'dispatching', ?, ?)",
-                (int(command_id), time.time(), time.time()),
+                "(command_id, state, received_at, dispatch_started_at, delivery_token, ack_state) "
+                "VALUES (?, 'dispatching', ?, ?, ?, ?)",
+                (int(command_id), time.time(), time.time(), jeton, ack),
             )
             self._conn.commit()
             return cur.rowcount == 1
+
+    def kayitli_jeton(self, command_id: int) -> tuple[bool, str | None]:
+        """(kayit_var_mi, kayitli_jeton) doner.
+
+        Cagiran taraf mukerrer teslimi bununla ayirt eder: kayit VARSA fiziksel
+        komut TEKRARLANMAZ, yalnizca ACK/sonuc kurtarmasi yapilir.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT delivery_token FROM command_ledger WHERE command_id = ?",
+                (int(command_id),),
+            ).fetchone()
+        if row is None:
+            return (False, None)
+        return (True, None if row[0] is None else str(row[0]))
+
+    def ack_yeniden_kuyrukla(self, command_id: int) -> bool:
+        """Mukerrer teslimde ACK'i yeniden kuyruga alir. True = kuyruklandi.
+
+        NEDEN GEREKLI: backend komutu yeniden sundugu icin ACK'in ona ULASMADIGI
+        anlasilir. Kayit zaten defterde oldugundan `start_dispatch` False doner
+        ve eski kodda komut sessizce ATLANIRDI — yani backend hicbir zaman
+        `sent` goremez ve komut kira/deneme tukenene kadar yeniden sunulurdu.
+
+        `acked` durumunu geri almaz: backend zaten onaylamissa yeniden bildirmek
+        gereksiz trafik olurdu. Yalnizca jetonu OLAN kayitlar icin anlamlidir.
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE command_ledger SET ack_state = 'pending' "
+                "WHERE command_id = ? AND delivery_token IS NOT NULL AND ack_state != 'pending'",
+                (int(command_id),),
+            )
+            self._conn.commit()
+            return int(cur.rowcount or 0) == 1
+
+    def pending_acks(self) -> list[dict[str, Any]]:
+        """Backend'e bildirilmeyi bekleyen teslim onaylari (FIFO)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT command_id, delivery_token FROM command_ledger "
+                "WHERE ack_state = 'pending' AND delivery_token IS NOT NULL "
+                "ORDER BY received_at, command_id"
+            ).fetchall()
+        return [{"command_id": int(r[0]), "delivery_token": str(r[1])} for r in rows]
+
+    def mark_ack_delivered(self, command_id: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE command_ledger SET ack_state = 'acked' WHERE command_id = ?",
+                (int(command_id),),
+            )
+            self._conn.commit()
+
+    def pending_ack_count(self) -> int:
+        with self._lock:
+            (n,) = self._conn.execute(
+                "SELECT COUNT(*) FROM command_ledger WHERE ack_state = 'pending'"
+            ).fetchone()
+        return int(n)
 
     def record_result(self, result: dict[str, Any]) -> None:
         """Terminal sonucu kalıcı kaydeder; result delivery ayrıca yürür."""

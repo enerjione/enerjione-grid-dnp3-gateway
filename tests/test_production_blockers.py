@@ -340,12 +340,12 @@ def test_basarili_teslim_delivered_isaretler(tmp_path: Path) -> None:
         led.close()
 
 
-def test_ledger_v2_semasi(tmp_path: Path) -> None:
+def test_ledger_v3_semasi(tmp_path: Path) -> None:
     led = CommandLedger(tmp_path / "l.db")
     led.close()
     conn = sqlite3.connect(str(tmp_path / "l.db"))
     (v,) = conn.execute("PRAGMA user_version").fetchone()
-    assert int(v) == 2
+    assert int(v) == 3
     conn.close()
 
 

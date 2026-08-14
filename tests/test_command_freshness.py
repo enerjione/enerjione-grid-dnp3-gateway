@@ -122,20 +122,47 @@ def test_bayrak_acikken_de_kapaliyken_de_ayni_ttl() -> None:
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("ileri", [1, 5, 30, 59.9])
+@pytest.mark.parametrize("ileri", [0.067, 1, 4.9])
 def test_kucuk_gelecek_sapmasi_kabul(ileri: float) -> None:
-    """H/I: makul saat sapmasi mesru komutu kesmemeli; yas 0 sayilir."""
+    """H/I: makul saat sapmasi mesru komutu kesmemeli; yas 0 sayilir.
+
+    0.067 sn = sahada OLCULEN backend-gateway saat farki (~67 ms). Tolerans
+    F3C ile 60 -> 5 sn dusuruldu; olculen sapmanin hala ~75 kati.
+    """
     sonuc = validate_command_freshness(_iso(-ileri), now=_NOW, max_age_sec=_TTL, require_timestamp=False)
     assert sonuc.fresh
     assert sonuc.age_sec == 0.0
 
 
-def test_tolerans_siniri_60_saniye() -> None:
-    assert _sebep(_iso(-60)) is FreshnessReason.FRESH
-    assert _sebep(_iso(-60.001)) is FreshnessReason.TIMESTAMP_FUTURE
+def test_tolerans_siniri_5_saniye() -> None:
+    """SINIR DETERMINISTIK: `created_at <= now + tolerans` KABUL.
+
+    F3C ile 60 sn -> 5 sn. Eski deger sahada olculen ~67 ms sapmanin ~900
+    katiydi ve saati ileri kaymis / damgasi bozulmus bir komutun gercek yasini
+    gizleyebilirdi.
+    """
+    assert _sebep(_iso(-5)) is FreshnessReason.FRESH
+    assert _sebep(_iso(-5.001)) is FreshnessReason.TIMESTAMP_FUTURE
 
 
-@pytest.mark.parametrize("ileri", [61, 3600, 365 * 24 * 3600])
+def test_tolerans_cagiran_tarafindan_ezilebilir() -> None:
+    """Tolerans yapilandirilabilir; sinir her degerde ayni sekilde davranir."""
+    from dnp3_gateway.command_freshness import validate_command_freshness as _v
+
+    for tol in (1.0, 5.0, 30.0):
+        assert _v(
+            _iso(-tol), now=_NOW, max_age_sec=_TTL, require_timestamp=False, clock_skew_tolerance_sec=tol
+        ).fresh
+        assert not _v(
+            _iso(-(tol + 0.001)),
+            now=_NOW,
+            max_age_sec=_TTL,
+            require_timestamp=False,
+            clock_skew_tolerance_sec=tol,
+        ).fresh
+
+
+@pytest.mark.parametrize("ileri", [5.5, 61, 3600, 365 * 24 * 3600])
 def test_absurt_gelecek_damga_fail_closed(ileri: float) -> None:
     """J: kabul edilseydi komut OLUMSUZ olurdu — yasi hicbir zaman TTL'yi asmaz."""
     assert _sebep(_iso(-ileri)) is FreshnessReason.TIMESTAMP_FUTURE
