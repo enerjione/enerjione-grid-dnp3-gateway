@@ -1,4 +1,4 @@
-"""F3A — komut tazeligi (TTL) ve rolling-upgrade uyumu.
+"""Komut tazeligi (TTL) ve strict timestamp sozlesmesi.
 
 Kapatilan uretim riski
 ----------------------
@@ -11,12 +11,16 @@ kaliyor (bakim/deploy/elektrik), acildiginda komut hala `pending` ve OLDUGU
 GIBI calisiyor. Kuyrukta bekleyen `master.firmware_update` ya da
 `master.software_reset` icin bu kabul edilemez.
 
-GECIS DURUMU
-------------
-Backend `created_at`'i HENUZ gondermiyor. Bu yuzden `COMMAND_REQUIRE_TIMESTAMP`
-varsayilani `false` ve damgasiz komut eski davranisla calisir. Asagidaki
-testler HEM bugunku davranisin bozulmadigini HEM de damga geldiginde TTL'nin
-bypass edilemedigini kilitler.
+SOZLESME
+--------
+Backend F3B ve sonrasi `/pending` komutlarinda timezone-aware UTC `created_at`
+tasir ve bayat komutu zaten teslim etmez. Gateway ayni kontrolu BAGIMSIZ
+yapar; damgasiz komut VARSAYILAN OLARAK reddedilir
+(`COMMAND_REQUIRE_TIMESTAMP=true`).
+
+`false` override'i yalnizca `created_at` gondermeyen eski bir backend'e
+kontrollu rollback icindir ve F1/F2 ile TTL'yi bypass ETMEZ — asagida
+ayrica kilitlendi.
 """
 
 from __future__ import annotations
@@ -53,21 +57,21 @@ def _sebep(created_at: str | None, *, require: bool = False) -> FreshnessReason:
 
 
 # --------------------------------------------------------------------------
-# A/B. damga YOK — rolling upgrade
+# B/C. damga YOK — strict varsayilan ve rollback override'i
 # --------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("bos", [None, "", "   "])
-def test_damga_yoksa_gecis_bayragi_ile_izin(bos) -> None:
-    """A: bugunku backend `created_at` gondermiyor -> komut CALISMALI."""
+def test_damga_yoksa_rollback_overridei_ile_izin(bos) -> None:
+    """C: `require_timestamp=False` -> eski backend'e kontrollu rollback."""
     sonuc = validate_command_freshness(bos, now=_NOW, max_age_sec=_TTL, require_timestamp=False)
     assert sonuc.fresh
     assert sonuc.legacy_allowed is True, "gecis izni gorunur olmali (cagiran taraf loglar)"
 
 
 @pytest.mark.parametrize("bos", [None, "", "   "])
-def test_damga_yoksa_require_acikken_reddedilir(bos) -> None:
-    """B: bayrak acikken damgasiz komut fail-closed."""
+def test_damga_yoksa_varsayilan_olarak_reddedilir(bos) -> None:
+    """B: STRICT VARSAYILAN — damgasiz komut fail-closed."""
     sonuc = validate_command_freshness(bos, now=_NOW, max_age_sec=_TTL, require_timestamp=True)
     assert sonuc.reason is FreshnessReason.TIMESTAMP_MISSING
     assert sonuc.legacy_allowed is False
@@ -158,8 +162,8 @@ def test_bozuk_damga_fail_closed_ve_patlamaz(bozuk: str) -> None:
     assert _sebep(bozuk) is FreshnessReason.TIMESTAMP_INVALID
 
 
-def test_bozuk_damga_gecis_bayragindan_etkilenmez() -> None:
-    """Deger GONDERILDI ama okunamadi — bu gecis durumu degil, bozuk veridir."""
+def test_bozuk_damga_overrideden_etkilenmez() -> None:
+    """Deger GONDERILDI ama okunamadi — bu rollback durumu degil, bozuk veridir."""
     assert _sebep("dun", require=False) is FreshnessReason.TIMESTAMP_INVALID
     assert _sebep("dun", require=True) is FreshnessReason.TIMESTAMP_INVALID
 
@@ -216,18 +220,46 @@ def _calistir(cmd: PendingCommand, **kw: Any):
     return reader, sonuclar
 
 
-def test_pull_damgasiz_komut_bugunku_gibi_calisir() -> None:
-    """A (entegrasyon): MEVCUT BACKEND DAVRANISI DEGISMEDI."""
-    reader, sonuclar = _calistir(_komut())
+def test_pull_damgasiz_komut_varsayilan_olarak_reddedilir() -> None:
+    """B: STRICT VARSAYILAN — damgasiz fiziksel komut CROB uretmez.
+
+    `_execute_pending_commands` fonksiyon varsayilani da `True`: cagiran
+    taraf ayari gecirmeyi unutursa fail-OPEN degil fail-CLOSED olur.
+    """
+    reader, sonuclar = _calistir(_komut(id=2))
+    assert reader.calls == [], "damgasiz komut icin CROB GONDERILDI"
+    assert sonuclar[0]["status"] == "command_timestamp_missing"
+    assert sonuclar[0]["ok"] is False
+
+
+def test_pull_damgasiz_komut_rollback_override_ile_calisir() -> None:
+    """C: `COMMAND_REQUIRE_TIMESTAMP=false` kontrollu rollback yolu.
+
+    `created_at` gondermeyen bir backend'e donuldugunde komut kanali
+    kapanmasin diye acik birakildi; F1/F2 bu yolda da AYNEN uygulanir
+    (bkz. `test_rollback_override_f1_f2_yi_bypass_etmez`).
+    """
+    reader, sonuclar = _calistir(_komut(id=3), require_timestamp=False)
     assert len(reader.calls) == 1
     assert sonuclar[0]["ok"] is True
 
 
-def test_pull_damgasiz_komut_require_acikken_calismaz() -> None:
-    reader, sonuclar = _calistir(_komut(id=2), require_timestamp=True)
+def test_rollback_override_f1_f2_yi_bypass_etmez() -> None:
+    """N: override YALNIZCA damga zorunlulugunu gevsetir, yetkilendirmeyi DEGIL.
+
+    index 2 = firmware_update; komut `reset_all_fcis` -> niyet uyusmuyor.
+    """
+    reader, sonuclar = _calistir(_komut(id=4, dnp3_index=2), require_timestamp=False)
+    assert reader.calls == [], "rollback override'i F1/F2'yi bypass etmis"
+    assert sonuclar[0]["status"] == "command_index_mismatch"
+
+
+def test_rollback_override_ttl_yi_bypass_etmez() -> None:
+    """Damga GELDIGINDE azami yas her kosulda uygulanir — bayrak bunu ezmez."""
+    ts = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+    reader, sonuclar = _calistir(_komut(id=5, created_at=ts), require_timestamp=False)
     assert reader.calls == []
-    assert sonuclar[0]["status"] == "command_timestamp_missing"
-    assert sonuclar[0]["ok"] is False
+    assert sonuclar[0]["status"] == "expired"
 
 
 def test_pull_taze_damga_calisir() -> None:
@@ -311,3 +343,55 @@ def test_pending_parser_created_at_i_tasir() -> None:
     assert _optional_command_timestamp("   ") is None
     # Bozuk deger BURADA reddedilmez; ham tasinir ki terminal sonuc uretilebilsin
     assert _optional_command_timestamp("dun") == "dun"
+
+
+# --------------------------------------------------------------------------
+# F3C — strict varsayilan sozlesmesi
+# --------------------------------------------------------------------------
+
+
+def test_settings_varsayilani_strict() -> None:
+    """A: yeni/temiz kurulum damgasiz fiziksel komutu VARSAYILAN OLARAK reddeder.
+
+    Backend F3B ve sonrasi `/pending` komutlarinda `created_at` tasidigi icin
+    damgasiz komut artik normal sozlesmenin disindadir.
+    """
+    import os
+
+    from dnp3_gateway.config import Settings
+
+    onceki = os.environ.pop("COMMAND_REQUIRE_TIMESTAMP", None)
+    try:
+        s = Settings(_env_file=None)  # type: ignore[call-arg]
+        assert s.command_require_timestamp is True
+        # TTL varsayilani F3A'dan degismedi — backend ile birebir ayni.
+        assert s.command_max_age_sec == 120.0
+    finally:
+        if onceki is not None:
+            os.environ["COMMAND_REQUIRE_TIMESTAMP"] = onceki
+
+
+def test_rollback_override_env_ile_verilebilir() -> None:
+    """Override KALDIRILMADI: gecici rollback hala mumkun olmali."""
+    import os
+
+    from dnp3_gateway.config import Settings
+
+    onceki = os.environ.get("COMMAND_REQUIRE_TIMESTAMP")
+    os.environ["COMMAND_REQUIRE_TIMESTAMP"] = "false"
+    try:
+        assert Settings(_env_file=None).command_require_timestamp is False  # type: ignore[call-arg]
+    finally:
+        if onceki is None:
+            os.environ.pop("COMMAND_REQUIRE_TIMESTAMP", None)
+        else:
+            os.environ["COMMAND_REQUIRE_TIMESTAMP"] = onceki
+
+
+def test_env_example_strict_varsayilani_yansitir() -> None:
+    """`.env.example` operatorun okudugu sozlesmedir; yanlis olmamali."""
+    from pathlib import Path
+
+    metin = (Path(__file__).resolve().parents[1] / ".env.example").read_text(encoding="utf-8")
+    assert "# COMMAND_REQUIRE_TIMESTAMP=true" in metin
+    assert "COMMAND_REQUIRE_TIMESTAMP=false" not in metin, "eski gecis ifadesi kalmis"

@@ -21,6 +21,7 @@ runtime katalogundan alinmistir (SN 2.0 ve Pole Master Kit profilleri).
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 import pytest
@@ -219,11 +220,19 @@ def _state_ile(katalog) -> tuple[GatewayState, DeviceConfig]:
 
 
 def _komut(**kw: Any) -> PendingCommand:
+    """F1/F2 testleri icin komut.
+
+    `created_at` VARSAYILAN OLARAK DOLU ve taze: uretim sozlesmesinde backend
+    (F3B ve sonrasi) her komutta timezone-aware `created_at` gonderiyor ve
+    gateway damgasiz komutu varsayilan olarak reddediyor. Damgasiz birakmak,
+    bu testleri F1/F2 yerine tazelik kontrolunu olcer hale getirirdi.
+    """
     varsayilan = {
         "id": 1,
         "device_code": "SN2_0",
         "command": "reset_all_fcis",
         "dnp3_index": 7,
+        "created_at": datetime.now(timezone.utc).isoformat(),
     }
     varsayilan.update(kw)
     return PendingCommand(**varsayilan)  # type: ignore[arg-type]
