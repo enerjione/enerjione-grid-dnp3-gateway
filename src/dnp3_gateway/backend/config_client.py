@@ -132,8 +132,10 @@ class PendingCommand:
     # hicbir zaman ogrenemezdi. Dogrulama `command_freshness` icinde yapilir
     # ve reddedilen komut terminal bir sonuc uretir.
     #
-    # None = backend bu alani GONDERMIYOR (bugunku durum). Bkz.
-    # `COMMAND_REQUIRE_TIMESTAMP` gecis bayragi.
+    # Backend F3B ve sonrasi bu alani HER taze komutta gonderir. None =
+    # alan gelmedi (yalnizca F3B oncesi bir backend'e rollback halinde);
+    # bu durumda komut varsayilan olarak REDDEDILIR — bkz.
+    # `COMMAND_REQUIRE_TIMESTAMP`.
     created_at: str | None = None
 
 

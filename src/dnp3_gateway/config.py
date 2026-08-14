@@ -206,17 +206,22 @@ class Settings(BaseSettings):
         ),
     )
     command_require_timestamp: bool = Field(
-        default=False,
+        default=True,
         description=(
-            "Zaman damgasi TASIMAYAN komut reddedilsin mi. VARSAYILAN KAPALI "
-            "cunku backend `created_at` alanini pending payload'ina HENUZ "
-            "koymuyor; acik olsaydi bugun TUM komutlar reddedilirdi.\n"
+            "Zaman damgasi TASIMAYAN komut reddedilsin mi. VARSAYILAN ACIK.\n"
             "\n"
-            "Bu bir GECIS bayragidir, TTL'yi kapatan bir feature flag DEGILDIR: "
-            "`created_at` GELDIGI anda azami yas her kosulda uygulanir, bayrak "
-            "bunu bypass ETMEZ. Backend alani gondermeye basladiktan sonra "
-            "`true` yapilacak; damgasiz komutu kalici olarak kabul etmek bir "
-            "cozum degildir."
+            "Backend F3B ve sonrasi `/pending` komutlarinda timezone-aware UTC "
+            "`created_at` tasir. Damgasiz bir fiziksel komut artik normal "
+            "calisma sozlesmesinin DISINDADIR ve fail-closed reddedilir "
+            "(`command_timestamp_missing`); yasini bilemedigimiz bir komutu "
+            "cihaza gondermek, tam da bu kontrolun onlemek icin var oldugu sey.\n"
+            "\n"
+            "TTL'yi kapatan bir feature flag DEGILDIR: `created_at` geldiginde "
+            "azami yas her kosulda uygulanir ve bu bayrak bunu bypass ETMEZ.\n"
+            "\n"
+            "`false` YALNIZCA gecici rollback / `created_at` gondermeyen eski "
+            "bir backend'e karsi kontrollu uyumluluk icindir. Normal "
+            "production/development dagitiminda KULLANILMAMALIDIR."
         ),
     )
     config_timeout_sec: int = Field(default=5, ge=1, le=60)

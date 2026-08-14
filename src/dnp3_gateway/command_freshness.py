@@ -1,4 +1,4 @@
-"""Fiziksel DNP3 komutlari icin TAZELIK dogrulamasi (F3A — gateway yarisi).
+"""Fiziksel DNP3 komutlari icin TAZELIK dogrulamasi.
 
 NEDEN VAR
 ---------
@@ -12,29 +12,30 @@ kapali kaliyor (bakim, deploy, elektrik). Gateway acildiginda o komut hala
 cok once vazgecilmis sayiyor olabilir; kuyrukta bekleyen `master.firmware_update`
 ya da `master.software_reset` gibi bir nokta icin bu kabul edilemez.
 
-BU MODUL YALNIZCA GATEWAY YARISIDIR
------------------------------------
-Backend `created_at`'i pending payload'ina HENUZ KOYMUYOR. Bu modul o alan
-geldiginde hazir olmak icin yazildi:
+SOZLESME
+--------
+Backend F3B ve sonrasi `/pending` komutlarinda timezone-aware UTC
+`created_at` tasir; bayat komutu zaten teslim ETMEZ (`failed` +
+`result_status='expired'`). Gateway ayni kontrolu BAGIMSIZ yapar: teslimat
+ile fiziksel gonderim arasinda gecen sure yalnizca burada bilinir.
 
   * `created_at` VARSA  -> TTL her zaman uygulanir, bypass edilemez.
   * `created_at` YOKSA  -> `require_timestamp` bayragi karar verir.
-      false (bugunun varsayilani) -> legacy izin + gorunur uyari
-      true                        -> fail-closed
+      true (VARSAYILAN) -> fail-closed
+      false             -> legacy izin + gorunur uyari
 
-`require_timestamp` bir GECIS bayragidir, TTL'yi kapatan bir feature flag
-DEGILDIR. Backend alani gondermeye basladiktan sonra `true` yapilacak ve
-sonraki surumde bayrak tamamen kaldirilacaktir. Zaman damgasiz komutu
-KALICI olarak kabul etmek bir cozum degildir.
+`require_timestamp` TTL'yi kapatan bir feature flag DEGILDIR. `false`
+YALNIZCA gecici rollback / `created_at` gondermeyen eski bir backend'e
+karsi kontrollu uyumluluk icindir; normal dagitimda kullanilmaz.
 
 SAAT
 ----
 Karsilastirma gateway'in kendi UTC saatiyle yapilir. Bilincli olarak kucuk
 tutuldu: backend'in HTTP `Date` basligindan skew-bagisik yas hesabi (iki
 degerin de backend saatinden gelmesi) daha dogru olurdu ama config client'in
-yanit yolunu degistirmeyi gerektirir. O F3B'de yeniden degerlendirilecek.
+yanit yolunu degistirmeyi gerektirir; ayri bir madde olarak duruyor.
 Buradaki gelecek-toleransi (bkz. `_FUTURE_TOLERANCE_SEC`) makul bir skew'i
-zaten sogurur.
+zaten sogurur. Dagitim kabulunde backend<->gateway sapmasi OLCULMELIDIR.
 
 Gateway KENDI alis zamanini "uretim zamani" olarak KULLANAMAZ — alis zamani
 her zaman "simdi"dir ve tam da yakalanmak istenen bayat komutu gorunmez
@@ -81,9 +82,9 @@ class FreshnessResult:
     detail: str
     #: Hesaplanabildiyse komutun yasi (saniye). Log/denetim icin.
     age_sec: float | None = None
-    #: Damga YOKTU ve gecis bayragi sayesinde izin verildi. Cagiran taraf
-    #: bunu gorunur bicimde loglar; sessiz kalmasi gecisin hic bitmemesi
-    #: demek olurdu.
+    #: Damga YOKTU ve rollback override'i (`require_timestamp=False`) ile
+    #: izin verildi. Cagiran taraf bunu gorunur bicimde loglar; sessiz
+    #: kalmasi, gecici olmasi gereken override'in kalicilasmasi demek olurdu.
     legacy_allowed: bool = False
 
     @property
@@ -138,7 +139,8 @@ def validate_command_freshness(
     `created_at`: backend'in bildirdigi olusturma damgasi (ham ISO metin).
     `now`: karsilastirma ani (timezone-aware).
     `max_age_sec`: TTL.
-    `require_timestamp`: damga yoksa reddedilsin mi (gecis bayragi).
+    `require_timestamp`: damga yoksa reddedilsin mi (varsayilan True;
+        False yalnizca gecici rollback icindir).
 
     Yan etkisi yoktur.
     """
@@ -159,11 +161,12 @@ def validate_command_freshness(
                 FreshnessReason.TIMESTAMP_MISSING,
                 "komut zaman damgasi yok ve COMMAND_REQUIRE_TIMESTAMP acik",
             )
-        # GECIS: backend alani henuz gondermiyor. Komut eski davranisla
-        # calisir ama bu sessiz kalmaz (cagiran taraf loglar).
+        # ROLLBACK OVERRIDE: operator bilincli olarak `false` vermis
+        # (orn. `created_at` gondermeyen eski bir backend'e donuldu).
+        # Komut eski davranisla calisir ama bu sessiz kalmaz.
         return FreshnessResult(
             FreshnessReason.FRESH,
-            "komut zaman damgasi yok; gecis bayragi ile izin verildi",
+            "komut zaman damgasi yok; COMMAND_REQUIRE_TIMESTAMP=false override'i ile izin verildi",
             legacy_allowed=True,
         )
 

@@ -2,6 +2,60 @@
 
 Semver'a gore tutulur. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.8.0] - 2026-08-14
+
+Zaman damgasi TASIMAYAN fiziksel komut artik VARSAYILAN OLARAK reddediliyor
+(F3 cutover). Minor surum: varsayilan davranis degisiyor — yukseltmeden once
+backend'inizin `created_at` gonderdigini dogrulayin.
+
+### Changed
+
+- **`COMMAND_REQUIRE_TIMESTAMP` varsayilani `false` -> `true`.**
+
+  1.7.3'te bu bayrak gecici olarak kapaliydi cunku backend `created_at`
+  alanini `/pending` payload'ina henuz koymuyordu. Backend F3B ile bunu
+  gonderiyor; damgasiz bir fiziksel komut artik normal calisma
+  sozlesmesinin DISINDADIR ve fail-closed reddedilir
+  (`command_timestamp_missing`).
+
+  Yasini bilemedigimiz bir komutu cihaza gondermek, tam da bu kontrolun
+  onlemek icin var oldugu sey: gateway 30 dakika kapali kalip acildiginda
+  kuyrukta bekleyen `master.firmware_update` / `master.software_reset`
+  oldugu gibi calisiyordu.
+
+  Canli backend (2.96.0) ile sozlesme dogrulandi — calisan imajin dosya
+  sisteminden, git checkout'a guvenilmeden:
+
+  | | backend 2.96.0 | gateway 1.8.0 |
+  |---|---|---|
+  | `COMMAND_MAX_AGE_SEC` | 120 | 120 |
+  | `created_at` payload | gonderiliyor (timezone-aware UTC) | okunuyor + dogrulaniyor |
+  | bayat komut | `failed` + `result_status='expired'`, gateway'e GONDERILMEZ | `expired`, `operate_device` CAGRILMAZ |
+  | sinir | `age <= TTL` taze | `age <= TTL` taze |
+
+  Saat sapmasi olculdu: backend<->gateway ~67 ms, NTP senkron. Dagitim
+  kabulunde bu kontrol listede kalmalidir.
+
+- `_execute_pending_commands` / `_run_command_poll` fonksiyon varsayilanlari
+  da `True` yapildi: cagiran taraf ayari gecirmeyi unutursa fail-OPEN degil
+  fail-CLOSED olsun. Uretim yolu ayari her zaman `Settings`ten gecirdigi
+  icin davranis degismez; latent bir acik kapatildi.
+
+### Notes
+
+- **Rollback yolu KORUNDU.** `COMMAND_REQUIRE_TIMESTAMP=false` hala
+  gecerlidir ve `created_at` gondermeyen bir backend'e donuldugunde komut
+  kanalini acik tutar. Bu override GECICIDIR; normal
+  production/development dagitiminda kullanilmamalidir. Override devredeyken
+  de F1/F2 yetkilendirmesi ve (damga geldiyse) azami yas AYNEN uygulanir —
+  testlerle kilitli.
+- **Algoritma DEGISMEDI**: TTL 120 sn, gelecek toleransi 60 sn,
+  `age <= TTL` siniri, malformed/timezone'suz/gelecek damga kararlari,
+  tazelik onceligi, ledger yerlesimi, F1/F2, `operate_device`, sonuc
+  teslimi, `/operate`. Yalnizca varsayilan ve dokumantasyon degisti.
+- Testler 576 -> 581. Gercek Horstmann cihazina komut gonderilmedi; canli
+  `/pending` cagirilmadi (yan etkili: `pending -> sent`).
+
 ## [1.7.3] - 2026-08-14
 
 Gateway, bekleyen komutlarin YASINI dogrulayabilecek hale getirildi (F3A —

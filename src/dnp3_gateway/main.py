@@ -112,7 +112,7 @@ def _execute_pending_commands(
     *,
     gateway_code: str = "",
     max_age_sec: float = 120.0,
-    require_timestamp: bool = False,
+    require_timestamp: bool = True,
 ) -> list[dict]:
     """Bekleyen komutlari operate_device (CROB) ile calistirir, sonuc listesi doner.
 
@@ -289,7 +289,7 @@ def _run_command_poll(
     poll_sec: int,
     config_wake: Event,
     max_age_sec: float = 120.0,
-    require_timestamp: bool = False,
+    require_timestamp: bool = True,
 ) -> None:
     """Hafif komut-poll thread'i (config'ten AYRI, ~1sn).
 
