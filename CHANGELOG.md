@@ -2,6 +2,79 @@
 
 Semver'a gore tutulur. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.7.2] - 2026-08-14
+
+Fiziksel DNP3 cikis komutlari artik cihazin KENDI sinyal katalogu ile
+yetkilendiriliyor. Telemetri, kalite ve komut yurutme akislari DEGISMEDI.
+
+### Security
+
+- **Backend'den gelen `dnp3_index` hicbir yerde dogrulanmiyordu (F1).**
+  Cihazlarin konfigure `binary_output` listesi elde OLDUGU HALDE
+  yetkilendirmede kullanilmiyordu; gelen index oldugu gibi CROB'a
+  ceviriliyordu. Reddi yalnizca outstation verebiliyordu.
+
+- **`PendingCommand.command` parse edilip ATILIYORDU (F2)** — repoda tek bir
+  okuyucusu yoktu, yani komut NIYETI ile index'in ayni noktayi gosterdigi
+  hicbir yerde kontrol edilmiyordu.
+
+  Ikisinin birlikte neyi mumkun kildigi somuttur; saha katalogundan:
+
+  ```
+  index  7 -> master.reset_all_fcis      (rutin, sahada kullanilan komut)
+  index  2 -> master.firmware_update
+  index 22 -> master.modem_firmware_ota
+  index 23 -> master.software_reset
+  ```
+
+  "FCI sifirla" niyetiyle gonderilmis ama index'i 2 olan tek bir komut, saha
+  cihazinda FIRMWARE GUNCELLEMESI baslatiyordu. Cihaz hata dondurmez;
+  istenmeyen seyi YAPAR. Yalnizca index allowlist'i (F1) bunu DURDURMAZ —
+  index 2 katalogda gecerli bir output'tur; durduran sey niyet
+  dogrulamasidir (F2).
+
+  Yeni `command_authorization.authorize_output_command()` her iki kontrolu
+  tek, saf, yan etkisiz bir fonksiyonda yapar. Fail-closed sonuclar:
+  `command_missing`, `catalog_unavailable`, `index_not_authorized`,
+  `command_index_mismatch`. Hepsinde `operate_device` CAGRILMAZ.
+
+  **Sozlesme uydurulmadi.** Backend ham index kabul etmiyor; index'i kendi
+  katalogundan `SignalCatalog.key == f"master.{slug}"` ile turetiyor.
+  Gateway artik ayni cozumlemeyi BAGIMSIZ dogruluyor (defense-in-depth).
+  Karsilastirma literal — case-fold / trim / alias / fuzzy YOK, cunku gevsek
+  eslestirme fail-OPEN yonunde calisir.
+
+  **Model izolasyonu:** yetkilendirme cihazin KENDI setine karsi yapilir
+  (`state.signals_for`), global index listesine karsi DEGIL. Olculdu:
+  `master.boost_mode` SN 2.0'da index 26, Pole Master Kit'te 30 — global
+  liste ikisini de kabul eder ve komutu yanlis noktaya gonderirdi.
+
+  **Enforcement tek noktada:** `/pending` ve `config.pending_commands` ayni
+  `_pending_commands` kuyrugundan gectigi icin tek cagri ikisini de kapsar.
+  `POST /operate` de ayni fonksiyonu uygular.
+
+  Reddedilen komut SESSIZCE DUSMEZ: kalici sonuc uretir, ledger'a yazilir,
+  backend'e bildirilir ve `start_dispatch` tuketildigi icin sonraki
+  poll'larda tekrar islenmez.
+
+### Changed
+
+- **`POST /operate` govdesinde `command` alani ZORUNLU.** Slug olmadan komut
+  niyeti dogrulanamaz; bos birakilirsa `command_missing` ile reddedilir.
+  Sozlesme kirilma riski olculdu: filodaki hicbir gateway'de
+  `command_token` tanimli degil (endpoint her yerde 503) ve backend'de bu
+  endpoint'i cagiran kod yok — canli cagiran olmadigi icin siki sozlesme
+  ilk kullanicisi olmadan once konuldu.
+
+### Notes
+
+- Kapsam disi birakilanlar (ayri ele alinacak): komut TTL/`expires_at`,
+  HMAC imzasinin zorunlu kilinmasi, `/pending` icin ayri credential,
+  parametre bounds, Direct/SBO politikasi.
+- Geriye uyum: uretimdeki komut gecmisine karsi dry-run yapildi;
+  cozumlenebilen 8/8 komut AUTHORIZED kaldi, sifir regresyon. Testler
+  503 -> 538.
+
 ## [1.7.1] - 2026-08-14
 
 DNP3 kalite bayragi eslemesi **tip-kordu** ve bu haliyle yayina acilsaydi
