@@ -287,7 +287,7 @@ def test_dnp3_flags_govdeye_giriyor() -> None:
         dnp3_flags is None     -> cihaz seviyesi (legacy)
 
     Adapter bayragi okuyup `SignalReading`de tasiyordu ama govde onu
-    dusuruyordu. Bu haliyle `GATEWAY_PUBLISH_DNP3_QUALITY` acilsaydi TEK bir
+    dusuruyordu. Bu haliyle `DNP3_PUBLISH_QUALITY_FLAGS` acilsaydi TEK bir
     noktanin REFERENCE_ERR'i TUM CIHAZI OFFLINE yapardi.
     """
     device = make_device("DEV-1")

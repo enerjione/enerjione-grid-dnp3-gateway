@@ -2,6 +2,61 @@
 
 Semver'a gore tutulur. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.7.1] - 2026-08-14
+
+DNP3 kalite bayragi eslemesi **tip-kordu** ve bu haliyle yayina acilsaydi
+sahayi bozacakti. Yayinlanan kalite sozlugu ve telemetri govdesi DEGISMEDI;
+`DNP3_PUBLISH_QUALITY_FLAGS` varsayilani hala `false`.
+
+### Fixed
+
+- **Her ACIK kesici `quality=invalid` yayinlanacakti.** `map_dnp3_quality`
+  bayrak byte'ini tek bir tabloyla okuyordu, oysa 5/6/7. bitler object
+  group'a gore TAMAMEN farkli anlam tasir. Kutuphaneyle dogrulandi:
+  G3 double-bit'te `0x40`=STATE1, `0x80`=STATE2 KESICI POZISYONUDUR —
+  `DETERMINED_OFF -> 0x41`, `DETERMINED_ON -> 0x81`,
+  `INDETERMINATE -> 0xC1`. Eski esleme `0x41`'i "REFERENCE_ERR" sanip
+  acik kesiciyi gecersiz olcum ilan ediyordu. G3 bu depoda tam olarak
+  kesici pozisyonu icin okunuyor.
+
+  Ayni kok neden diger gruplarda da vardi: G1'de `0x20` OVER_RANGE degil
+  CHATTER_FILTER, `0x40` RESERVED; G10'da ikisi de RESERVED; G20/G21'de
+  ROLLOVER / DISCONTINUITY. Hicbiri "bu deger guvenilmez" demez — bunlar
+  ham `dnp3_flags` byte'inda korunur, kalite token'ini bozmaz.
+  `OVER_RANGE`/`REFERENCE_ERR` yorumu artik YALNIZCA analog gruplarda
+  (G30/G40) yapiliyor.
+
+  Imza `map_dnp3_quality(flags, object_group)` oldu; `object_group`
+  ZORUNLU — varsayilan verilseydi tip-kor cagri sessizce geri gelirdi.
+  Bit tablosu gercek opendnp3 enum'larina karsi pinlendi
+  (`test_bayrak_tablosu_kutuphaneyle_uyumlu`), yani bir yadnp3
+  yukseltmesi anlam degistirirse CI kirilir.
+
+- **Bayrak okunamadiginda olcum sessizce `good` sayiliyordu.** Artik tipe
+  gore degerlendiriliyor: kalite tasimasi GEREKEN gruplarda bayrak yoksa
+  fail-safe `invalid` + nokta basina tek WARNING (`dnp3_missing_quality_flags`).
+  G110 OctetString ise kalite byte'i TASIMAZ (SOE handler onu bayraksiz
+  yazar) — bu tip icin bayrak yoklugu NORMALDIR ve `good` kalir. Kor bir
+  "flags yoksa invalid" kurali, bayrak yayina acildigi anda seri no / IMEI /
+  firmware / IP noktalarinin tamamini gecersiz yapardi.
+
+- **Env degiskeni adi tekillestirildi.** Dokumanlar ve kod yorumlari
+  var olmayan bir `GATEWAY_PUBLISH_DNP3_QUALITY` adini kullaniyordu;
+  `Settings` prefix kullanmadigi icin gercek ad `DNP3_PUBLISH_QUALITY_FLAGS`.
+  Dokumani takip eden operator etkisi olmayan bir degisken set ediyor,
+  tek ipucu acilistaki `quality_flags_published=False` log satiri oluyordu.
+  Tum referanslar canonical ada cekildi; **legacy alias EKLENMEDI** (iki ad
+  tasimak ayni karisikligi geri getirirdi).
+
+### Notes
+
+- Telemetri **degeri** ve govde sozlesmesi degismedi: `dnp3_flags` ham byte'i
+  aynen gonderiliyor, kalite sozlugu hala `good | invalid | restart | forced |
+  comm_lost`. Yeni token EKLENMEDI.
+- `DNP3_PUBLISH_QUALITY_FLAGS` varsayilani bilincli olarak `false` birakildi.
+  Once tek bir test gateway'inde gercek cihaz verisiyle dogrulanacak, sonra
+  kademeli yayilim (bkz. `docs/BACKEND_TODO.md#B1`).
+
 ## [1.7.0] - 2026-08-13
 
 Sahadaki SN2.0 cihazlari "haberlesme koptu" veriyordu, alarmlar gec geliyordu

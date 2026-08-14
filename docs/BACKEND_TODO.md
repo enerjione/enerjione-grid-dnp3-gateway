@@ -16,6 +16,25 @@ diger tum production riskleri kapatildi (bkz. `CHANGELOG.md` 0.5.0).
 
 ## B1. DNP3 kalite bayraklari yayina eklenecek — ⚙️ TEK ENV BAYRAGI KALDI
 
+> **2026-08-14 guncellemesi — bayragi acmadan once kapatilan IKINCI blocker.**
+> Esleme fonksiyonu **tip-kordu**: bayrak byte'inin 5/6/7. bitleri object
+> group'a gore farkli anlam tasidigi halde tek bir tabloyla okunuyordu.
+> Kutuphaneyle dogrulandi — G3 double-bit'te `0x40/0x80` KESICI POZISYONUDUR
+> (DETERMINED_OFF -> `0x41`), ama esleme onu `REFERENCE_ERR` sanip **her ACIK
+> kesiciyi** `quality=invalid` yayinlayacakti. Ayni sekilde G1'de `0x20`
+> CHATTER_FILTER, G20/G21'de ROLLOVER/DISCONTINUITY'dir; hicbiri OVER_RANGE
+> degildir.
+>
+> `map_dnp3_quality(flags, object_group)` artik tipe gore okuyor ve bit
+> tablosu gercek opendnp3 enum'larina karsi pinlendi. Ayrica bayrak
+> yoklugu tipe gore degerlendiriliyor: G110 (OctetString) kalite byte'i
+> TASIMAZ -> `good`; kalite tasimasi gereken bir gruptan bayraksiz olcum
+> gelirse fail-safe `invalid` + WARNING log.
+>
+> **Yayinlanan sozluk DEGISMEDI** (`good | invalid | restart | forced |
+> comm_lost`) ve `dnp3_flags` ham byte'i aynen gonderilmeye devam ediyor —
+> backend sozlesmesi etkilenmedi.
+
 **Backend durumu:** ✅ HAZIR — ve dusunuldugunden cok once. `invalid`,
 `restart`, `forced` token'lari **v2.28.0**'dan beri taniniyor; dahasi
 backend NOKTA/CIHAZ kapsam ayrimini da yapiyor
@@ -44,8 +63,22 @@ Iki depo birlikte kosturularak dogrulandi:
 Dordunde de alarm degerlendirmesi BLOKE — olcume guvenilmiyor, alarm durumu
 donuyor. `comm_lost` her iki kapsamda da cihaz seviyesi kaliyor (dogru).
 
-**KALAN TEK IS:** `GATEWAY_PUBLISH_DNP3_QUALITY=true`. Saha genelinde ya da
-gateway bazinda acilabilir; backend yillardir hazir, govde artik dogru.
+**KALAN TEK IS:** `DNP3_PUBLISH_QUALITY_FLAGS=true`. Backend yillardir hazir,
+govde dogru, esleme artik tipe gore okuyor.
+
+**Ama saha genelinde HEMEN acilmayacak.** Karar (2026-08-14): once TEK bir
+test gateway'inde acilip gercek Horstmann verisiyle su tablo dogrulanacak,
+sonra kademeli yayilim yapilacak.
+
+| senaryo | beklenen `quality` |
+|---|---|
+| normal analog | `good` |
+| kesici ACIK (G3 DETERMINED_OFF) | `good` |
+| kesici KAPALI (G3 DETERMINED_ON) | `good` |
+| cihaz reboot | `restart` |
+| operator zorlamis nokta | `forced` |
+| CT / referans hatasi | `invalid` |
+| haberlesme kopmasi | `comm_lost` |
 
 <details><summary>Ozgun kayit</summary>
 
@@ -73,12 +106,12 @@ yanlis manevra karari.
 
 **Gateway'de yapilacak (backend hazir olunca):**
 - `dnp3_yadnp3_master.read_device` icinde `_map_dnp3_quality()` cagrisini aktif et
-  (fonksiyon yazildi, su an `GATEWAY_PUBLISH_DNP3_QUALITY=false` ile kapali)
+  (fonksiyon yazildi, su an `DNP3_PUBLISH_QUALITY_FLAGS=false` ile kapali)
 
 **Deploy sirasi:** ONCE BACKEND. Gateway yeni kalite degerlerini gonderdiginde
 backend bunlari tanimiyorsa olcumleri reddedebilir veya yanlis isleyebilir.
 
-**Gecis kolayligi:** `GATEWAY_PUBLISH_DNP3_QUALITY` env bayragi eklendi
+**Gecis kolayligi:** `DNP3_PUBLISH_QUALITY_FLAGS` env bayragi eklendi
 (default `false`). Backend hazir olunca saha genelinde tek tek acilabilir.
 
 </details>
@@ -257,7 +290,7 @@ Gateway tarafi 404/400'e toleransli yazilacak (eski backend'de sessizce atlar).
 
 | # | Konu | Gateway hazir mi | Deploy sirasi | Onceligi |
 |---|---|---|---|---|
-| B1 | Kalite bayraklari | ⚙️ **tek env bayragi kaldi** | — (backend v2.28.0'dan hazir) | Yuksek — olcum dogrulugu |
+| B1 | Kalite bayraklari | ⚙️ **kod hazir; kademeli acilis bekliyor** | — (backend v2.28.0'dan hazir) | Yuksek — olcum dogrulugu |
 | B2 | Cihaz zaman damgasi | ⚙️ **gateway gonderiyor, backend yok sayiyor** | serbest (kirilma yok) | Yuksek — SOE/ariza analizi |
 | B3 | Per-device katalog | ✅ **GATEWAY TARAFI KAPANDI** | serbest | Dusuk — yalnizca esneklik kaldi |
 | B4 | Saglik heartbeat + filo uyarisi | ✅ **TAMAMLANDI** | — | ~~Yuksek — kor nokta~~ |
@@ -269,7 +302,7 @@ gerekli veriyi zaten gonderiyor, backend hazir oldugunda anlam kazaniyor:
 
 1. **B2** — `device_event_at` + `timestamp_quality` alanlarini kabul et.
    SOE/ariza analizi icin en degerli kazanim.
-2. **B1** — saha genelinde `GATEWAY_PUBLISH_DNP3_QUALITY=true`. Backend
+2. **B1** — saha genelinde `DNP3_PUBLISH_QUALITY_FLAGS=true`. Backend
    v2.28.0'dan beri hazir; bu yalnizca bir `.env` degisikligi.
 
 B3'un backend yarisi (`signals_by_profile`) istege bagli bir esneklik

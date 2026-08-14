@@ -96,7 +96,7 @@ SignalReading(key, source, raw, scaled, quality, dnp3_flags, value_string?)
 `dnp3_flags` alani **kalitenin kapsamini** belirler: dolu ise kalite NOKTA
 seviyesindedir (tek bir noktanin `invalid` bayragi cihazi offline yapmaz),
 `null` ise CIHAZ seviyesidir (0.4.x davranisi). Alan susturulursa
-`GATEWAY_PUBLISH_DNP3_QUALITY` acildigi anda tek bir hatali nokta tum cihazi
+`DNP3_PUBLISH_QUALITY_FLAGS` acildigi anda tek bir hatali nokta tum cihazi
 offline gosterirdi.
 
 ## Veri akisi (backend down — outbox at-least-once)

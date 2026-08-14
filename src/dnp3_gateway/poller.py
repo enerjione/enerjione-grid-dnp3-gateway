@@ -158,7 +158,7 @@ def build_telemetry_payload(
         #                              `forced` gelse bile CIHAZ ONLINE kalir
         #   dnp3_flags is None      -> cihaz seviyesi (0.4.x / legacy davranis)
         #
-        # Alan gonderilmezse `GATEWAY_PUBLISH_DNP3_QUALITY` acildigi anda tek
+        # Alan gonderilmezse `DNP3_PUBLISH_QUALITY_FLAGS` acildigi anda tek
         # bir noktanin REFERENCE_ERR'i TUM CIHAZI OFFLINE yapardi: adapter
         # bayragi okuyup tasiyordu ama govde onu dusuruyordu. Backend bu ayrimi
         # v2.28.0'dan beri bekliyor.

@@ -43,35 +43,293 @@ _G = 30
 
 
 # --------------------------------------------------------------------------
-# kalite bayraklari
+# kalite bayraklari — TIPE GORE (object group)
 # --------------------------------------------------------------------------
+#
+# DNP3'te bayrak byte'inin 5/6/7. bitleri object group'a gore FARKLI anlam
+# tasir. Esleme bunu yapmadiginda iki somut saha hatasi uretiyordu:
+#
+#   * G3 double-bit'te 0x40/0x80 KESICI POZISYONUDUR. Tip-kor esleme
+#     DETERMINED_OFF'u (flags=0x41) "REFERENCE_ERR" sanip her ACIK kesiciyi
+#     `invalid` yayinlardi.
+#   * G1/G10/G20/G21'de 0x20-0x40 sirasiyla CHATTER_FILTER / RESERVED /
+#     ROLLOVER / DISCONTINUITY'dir; hicbiri "bu deger guvenilmez" demez.
+#
+# Asagidaki grup sabitleri ve bit degerleri `test_bayrak_tablosu_*` ile
+# GERCEK opendnp3 enum'larina karsi pinlenmistir.
+
+_G1_BINARY = 1
+_G3_DOUBLE_BIT = 3
+_G10_BINARY_OUT = 10
+_G20_COUNTER = 20
+_G21_FROZEN_COUNTER = 21
+_G30_ANALOG = 30
+_G40_ANALOG_OUT = 40
+_G110_STRING = 110
+
+_ONLINE = 0x01
+_RESTART = 0x02
+_COMM_LOST = 0x04
+_REMOTE_FORCED = 0x08
+_LOCAL_FORCED = 0x10
+_BIT5 = 0x20  # CHATTER_FILTER | RESERVED1 | ROLLOVER | OVERRANGE
+_BIT6 = 0x40  # RESERVED | STATE1 | DISCONTINUITY | REFERENCE_ERR
+_BIT7 = 0x80  # STATE | STATE2 | RESERVED
+
+#: Kalite bayragi TASIYAN tum gruplar — ortak bitler hepsinde ayni anlamda.
+_KALITE_GRUPLARI = (
+    _G1_BINARY,
+    _G3_DOUBLE_BIT,
+    _G10_BINARY_OUT,
+    _G20_COUNTER,
+    _G21_FROZEN_COUNTER,
+    _G30_ANALOG,
+    _G40_ANALOG_OUT,
+)
 
 
+# ---- ortak bitler: TUM gruplarda ayni sonucu vermeli ----------------------
+
+
+@pytest.mark.parametrize("group", _KALITE_GRUPLARI)
 @pytest.mark.parametrize(
     ("flags", "beklenen"),
     [
-        (0x01, "good"),  # ONLINE
-        (None, "good"),  # bayrak yok -> geriye uyum
+        (_ONLINE, "good"),
         (0x00, "invalid"),  # ONLINE YOK -> deger gecersiz
-        (0x03, "restart"),  # ONLINE|RESTART
-        (0x05, "comm_lost"),  # ONLINE|COMM_LOST
-        (0x11, "forced"),  # ONLINE|LOCAL_FORCED
-        (0x09, "forced"),  # ONLINE|REMOTE_FORCED
-        (0x21, "invalid"),  # ONLINE|OVER_RANGE
-        (0x41, "invalid"),  # ONLINE|REFERENCE_ERR
+        (_ONLINE | _RESTART, "restart"),
+        (_ONLINE | _COMM_LOST, "comm_lost"),
+        (_ONLINE | _LOCAL_FORCED, "forced"),
+        (_ONLINE | _REMOTE_FORCED, "forced"),
     ],
 )
-def test_kalite_bayragi_eslemesi(flags: int | None, beklenen: str) -> None:
-    assert map_dnp3_quality(flags) == beklenen
+def test_ortak_bitler_tum_gruplarda_ayni(group: int, flags: int, beklenen: str) -> None:
+    assert map_dnp3_quality(flags, group) == beklenen
+
+
+# ---- analog gruplar: bit5/bit6 GERCEKTEN deger butunlugu ------------------
+
+
+@pytest.mark.parametrize("group", [_G30_ANALOG, _G40_ANALOG_OUT])
+@pytest.mark.parametrize("bit", [_BIT5, _BIT6])
+def test_analog_overrange_ve_reference_err_invalid(group: int, bit: int) -> None:
+    """G30/G40'ta 0x20=OVERRANGE, 0x40=REFERENCE_ERR — olcume guvenilmez."""
+    assert map_dnp3_quality(_ONLINE | bit, group) == "invalid"
 
 
 def test_referans_hatasi_good_olarak_gecmez() -> None:
     """REGRESYON: CT referansi kayipken 0.0 degeri 'good' yayinlaniyordu."""
-    assert map_dnp3_quality(0x01 | 0x40) != "good"
+    assert map_dnp3_quality(_ONLINE | _BIT6, _G30_ANALOG) != "good"
+
+
+def test_analog_reserved_biti_kaliteyi_bozmaz() -> None:
+    """G30'da 0x80 RESERVED — set gelse bile kaliteyi etkilememeli."""
+    assert map_dnp3_quality(_ONLINE | _BIT7, _G30_ANALOG) == "good"
+
+
+# ---- G3 double-bit: 0x40/0x80 POZISYON, kalite DEGIL ---------------------
+
+
+@pytest.mark.parametrize(
+    ("flags", "aciklama"),
+    [
+        (_ONLINE | _BIT6, "DETERMINED_OFF (kesici ACIK)"),
+        (_ONLINE | _BIT7, "DETERMINED_ON (kesici KAPALI)"),
+        (_ONLINE | _BIT6 | _BIT7, "INDETERMINATE (pozisyon belirsiz)"),
+    ],
+)
+def test_double_bit_durum_bitleri_invalid_uretmez(flags: int, aciklama: str) -> None:
+    """REGRESYON: tip-kor esleme her ACIK kesiciyi `invalid` yayinlardi.
+
+    G3'te 0x40=STATE1, 0x80=STATE2 kesici pozisyonudur. Kutuphane ile
+    dogrulandi: DETERMINED_OFF -> 0x41, DETERMINED_ON -> 0x81,
+    INDETERMINATE -> 0xC1. Bunlar REFERENCE_ERR/RESERVED DEGILDIR.
+    """
+    assert map_dnp3_quality(flags, _G3_DOUBLE_BIT) == "good", aciklama
+
+
+def test_double_bit_indeterminate_kalite_degil_deger_tasir() -> None:
+    """INDETERMINATE bir KALITE sorunu degil, bir POZISYON bilgisidir.
+
+    Kesici "acik mi kapali mi bilinmiyor" durumunu bildiriyor; nokta online ve
+    dogru rapor veriyor. `invalid` yapmak olcumu alarm degerlendirmesinden
+    dusurur ve operator tam da gormesi gereken "pozisyon belirsiz" isaretini
+    KAYBEDER. Anlam `value` alaninda tasinir (3.0 = INDETERMINATE).
+    """
+    assert map_dnp3_quality(_ONLINE | _BIT6 | _BIT7, _G3_DOUBLE_BIT) == "good"
+
+    class _E:
+        def __init__(self, v: int) -> None:
+            self.value = v
+
+    assert _double_bit_to_float(_E(0)) == 0.0  # INTERMEDIATE
+    assert _double_bit_to_float(_E(1)) == 1.0  # DETERMINED_OFF
+    assert _double_bit_to_float(_E(2)) == 2.0  # DETERMINED_ON
+    assert _double_bit_to_float(_E(3)) == 3.0  # INDETERMINATE
+
+
+def test_double_bit_chatter_filter_invalid_uretmez() -> None:
+    """G3'te 0x20 CHATTER_FILTER — nokta titriyor ama deger gecersiz degil."""
+    assert map_dnp3_quality(_ONLINE | _BIT5, _G3_DOUBLE_BIT) == "good"
+
+
+# ---- G1 binary: 0x20 CHATTER_FILTER, 0x40 RESERVED, 0x80 STATE -----------
+
+
+def test_binary_chatter_filter_reference_err_sanilmaz() -> None:
+    """G1'de 0x20 OVERRANGE DEGIL, CHATTER_FILTER'dir."""
+    assert map_dnp3_quality(_ONLINE | _BIT5, _G1_BINARY) == "good"
+
+
+def test_binary_durum_biti_kaliteyi_bozmaz() -> None:
+    """G1'de 0x80 STATE — kapali bir kontak (deger=1) `good` kalmali."""
+    assert map_dnp3_quality(_ONLINE | _BIT7, _G1_BINARY) == "good"
+
+
+def test_binary_reserved_biti_reference_err_sanilmaz() -> None:
+    """G1'de 0x40 RESERVED'dir; REFERENCE_ERR olarak decode EDILMEMELI."""
+    assert map_dnp3_quality(_ONLINE | _BIT6, _G1_BINARY) == "good"
+
+
+# ---- G10 binary output status: 0x20/0x40 RESERVED, 0x80 STATE ------------
+
+
+@pytest.mark.parametrize("bit", [_BIT5, _BIT6, _BIT7])
+def test_binary_output_reserved_ve_state_bitleri_kaliteyi_bozmaz(bit: int) -> None:
+    """G10'da 0x20/0x40 RESERVED1/RESERVED2, 0x80 STATE — analog gibi okunmamali."""
+    assert map_dnp3_quality(_ONLINE | bit, _G10_BINARY_OUT) == "good"
+
+
+# ---- G20/G21 counter: 0x20 ROLLOVER, 0x40 DISCONTINUITY ------------------
+
+
+@pytest.mark.parametrize("group", [_G20_COUNTER, _G21_FROZEN_COUNTER])
+@pytest.mark.parametrize("bit", [_BIT5, _BIT6])
+def test_counter_rollover_ve_discontinuity_analog_gibi_decode_edilmez(group: int, bit: int) -> None:
+    """G20/G21'de 0x20=ROLLOVER, 0x40=DISCONTINUITY.
+
+    Ikisi de sayacin O ANKI degerinin yanlis oldugunu SOYLEMEZ; yalnizca
+    onceki degerle FARK almanin gecersiz oldugunu bildirir. `invalid`
+    yapmak, 32-bit bir sayacin her normal rollover'inda olcumu alarm
+    degerlendirmesinden dusururdu. Bilgi ham `dnp3_flags` byte'inda korunur.
+    """
+    assert map_dnp3_quality(_ONLINE | bit, group) == "good"
+
+
+# ---- oncelik sirasi ------------------------------------------------------
 
 
 def test_comm_lost_restart_ten_oncelikli() -> None:
-    assert map_dnp3_quality(0x07) == "comm_lost"
+    assert map_dnp3_quality(_ONLINE | _RESTART | _COMM_LOST, _G30_ANALOG) == "comm_lost"
+
+
+def test_comm_lost_overrange_dan_oncelikli() -> None:
+    """`comm_lost` backend'de CIHAZ seviyesine kilitli TEK kalitedir.
+
+    Altina cekilirse (orn. `invalid` one alinsa) gercekten olu bir cihaz
+    "online ama bir noktasi bozuk" gorunur — en kritik sinyal kaybolur.
+    """
+    assert map_dnp3_quality(_ONLINE | _COMM_LOST | _BIT5, _G30_ANALOG) == "comm_lost"
+
+
+# ---- bayrak YOKKEN: tipe gore fail-safe ----------------------------------
+
+
+@pytest.mark.parametrize("group", _KALITE_GRUPLARI)
+def test_kalite_tasiyan_grupta_bayrak_yoksa_fail_safe_invalid(group: int) -> None:
+    """Bayragi okunamamis bir olcum `good` SAYILMAZ.
+
+    Bu tipler kalite byte'i TASIMAK ZORUNDA; bayrak yoksa bu bir binding
+    anomalisidir. `good` demek, tam da kapatmaya calistigimiz desteksiz
+    "bu deger saglam" iddiasi olurdu.
+    """
+    assert map_dnp3_quality(None, group) == "invalid"
+
+
+def test_g110_string_bayraksiz_normaldir() -> None:
+    """REGRESYON RISKI: G110 OctetString kalite byte'i TASIMAZ.
+
+    `cache.set(_OBJECT_GROUP_STRING, ...)` bayrak vermeden yazar. Kor bir
+    "flags is None -> invalid" kurali, bayrak yayina acildigi anda seri no /
+    IMEI / firmware / IP noktalarinin TAMAMINI `invalid` yapardi.
+    """
+    assert map_dnp3_quality(None, _G110_STRING) == "good"
+
+
+def test_g110_bayrak_gelse_bile_kalite_uretmez() -> None:
+    """G110 icin bayrak yorumlanmaz — tip kalite byte'i tanimlamaz."""
+    assert map_dnp3_quality(0x00, _G110_STRING) == "good"
+    assert map_dnp3_quality(_ONLINE | _BIT6, _G110_STRING) == "good"
+
+
+def test_bilinmeyen_grupta_bit5_bit6_invalid_uretmez() -> None:
+    """Bilinmeyen grupta 5/6. bitlerin anlami bilinmez — kalite UYDURULMAZ.
+
+    Ortak bitler yine degerlendirilir.
+    """
+    bilinmeyen = 99
+    assert map_dnp3_quality(_ONLINE | _BIT5 | _BIT6, bilinmeyen) == "good"
+    assert map_dnp3_quality(_ONLINE | _COMM_LOST, bilinmeyen) == "comm_lost"
+    assert map_dnp3_quality(0x00, bilinmeyen) == "invalid"
+
+
+def test_object_group_zorunlu_parametredir() -> None:
+    """Tip-kor cagri SESSIZCE yanlis kalite uretirdi; imza bunu engellemeli."""
+    with pytest.raises(TypeError):
+        map_dnp3_quality(0x41)  # type: ignore[call-arg]
+
+
+# ---- bit tablosu gercek kutuphaneye karsi pinlenir ------------------------
+
+
+def test_bayrak_tablosu_kutuphaneyle_uyumlu() -> None:
+    """Yukaridaki bit anlamlari GERCEK opendnp3 enum'lariyla dogrulanir.
+
+    Bu test olmadan tablo bir yorum satirindan ibaret kalirdi; yadnp3
+    yukseltmesi bit anlamlarini degistirirse burada kirilir.
+    """
+    opendnp3 = pytest.importorskip("opendnp3", reason="yadnp3 kurulu degil")
+
+    beklenen = {
+        "BinaryQuality": ("CHATTER_FILTER", "RESERVED", "STATE"),
+        "DoubleBitBinaryQuality": ("CHATTER_FILTER", "STATE1", "STATE2"),
+        "BinaryOutputStatusQuality": ("RESERVED1", "RESERVED2", "STATE"),
+        "CounterQuality": ("ROLLOVER", "DISCONTINUITY", "RESERVED"),
+        "FrozenCounterQuality": ("ROLLOVER", "DISCONTINUITY", "RESERVED"),
+        "AnalogQuality": ("OVERRANGE", "REFERENCE_ERR", "RESERVED"),
+        "AnalogOutputStatusQuality": ("OVERRANGE", "REFERENCE_ERR", "RESERVED"),
+    }
+    for enum_adi, (b5, b6, b7) in beklenen.items():
+        enum = getattr(opendnp3, enum_adi)
+        uyeler = enum.__members__
+        # Ortak bitler her tipte AYNI olmali.
+        assert uyeler["ONLINE"].value == _ONLINE
+        assert uyeler["RESTART"].value == _RESTART
+        assert uyeler["COMM_LOST"].value == _COMM_LOST
+        assert uyeler["REMOTE_FORCED"].value == _REMOTE_FORCED
+        assert uyeler["LOCAL_FORCED"].value == _LOCAL_FORCED
+        # Tipe gore degisen bitler.
+        assert uyeler[b5].value == _BIT5, f"{enum_adi}.{b5}"
+        assert uyeler[b6].value == _BIT6, f"{enum_adi}.{b6}"
+        assert uyeler[b7].value == _BIT7, f"{enum_adi}.{b7}"
+
+
+def test_double_bit_durum_bitleri_kutuphaneyle_dogrulanir() -> None:
+    """G3 pozisyonlarinin GERCEK bayrak byte'lari — testin dayanagi budur."""
+    opendnp3 = pytest.importorskip("opendnp3", reason="yadnp3 kurulu degil")
+
+    beklenen = {
+        "INTERMEDIATE": _ONLINE,
+        "DETERMINED_OFF": _ONLINE | _BIT6,
+        "DETERMINED_ON": _ONLINE | _BIT7,
+        "INDETERMINATE": _ONLINE | _BIT6 | _BIT7,
+    }
+    for ad, bayrak in beklenen.items():
+        olcum = opendnp3.DoubleBitBinary(opendnp3.DoubleBit.__members__[ad])
+        gercek = int(getattr(olcum.flags, "value", olcum.flags))
+        assert gercek == bayrak, f"DoubleBit.{ad} bayragi degismis: {gercek:#04x}"
+        # Ve hicbiri `invalid` uretmemeli.
+        assert map_dnp3_quality(gercek, _G3_DOUBLE_BIT) == "good", ad
 
 
 def test_cache_bayraklari_tasir() -> None:
