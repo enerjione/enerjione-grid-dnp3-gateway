@@ -21,6 +21,7 @@ from __future__ import annotations
 import logging
 import signal
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event, Thread
 from typing import Any
@@ -37,6 +38,7 @@ from dnp3_gateway.backend import (
     parse_device_ip_allowlist,
 )
 from dnp3_gateway.command_authorization import authorize_output_command
+from dnp3_gateway.command_freshness import validate_command_freshness
 from dnp3_gateway.config import Settings, get_settings
 from dnp3_gateway.health_server import (
     ThreadLiveness,
@@ -103,7 +105,15 @@ def _mask_secret(value: str, *, keep: int = 2) -> str:
     return f"{v[:keep]}...{v[-keep:]}"
 
 
-def _execute_pending_commands(reader, state: GatewayState, pending, *, gateway_code: str = "") -> list[dict]:
+def _execute_pending_commands(
+    reader,
+    state: GatewayState,
+    pending,
+    *,
+    gateway_code: str = "",
+    max_age_sec: float = 120.0,
+    require_timestamp: bool = False,
+) -> list[dict]:
     """Bekleyen komutlari operate_device (CROB) ile calistirir, sonuc listesi doner.
 
     Her sonuc: {id, ok, status, error?} — backend command-results endpoint'inin
@@ -136,6 +146,62 @@ def _execute_pending_commands(reader, state: GatewayState, pending, *, gateway_c
                     "ok": False,
                     "status": "device_not_found",
                     "error": f"cihaz config'te yok: {cmd.device_code}",
+                }
+            )
+            continue
+
+        # ---- F3: TAZELIK -----------------------------------------------
+        # Yetkilendirmeden ONCE: tazelik, istegin ICERIGINDEN bagimsiz bir
+        # ozelliktir. "Bu istegi hic degerlendirmeli miyiz" sorusu, "dogru
+        # noktayi mi gosteriyor" sorusundan once gelir; suresi gecmis bir
+        # komut katalog cozumleme yoluna hic girmemeli.
+        #
+        # `start_dispatch`ten SONRA oldugu icin red de terminal bir sonuc
+        # uretir, ledger'a yazilir ve backend'e teslim edilir; ayni komut
+        # sonraki poll'larda YENIDEN degerlendirilmez.
+        tazelik = validate_command_freshness(
+            cmd.created_at,
+            now=datetime.now(timezone.utc),
+            max_age_sec=max_age_sec,
+            require_timestamp=require_timestamp,
+        )
+        if tazelik.legacy_allowed:
+            # Backend `created_at` gondermiyor. Gecisin sessizce kalicilasmasini
+            # onlemek icin GORUNUR uyari; yalnizca GERCEK komut geldiginde
+            # basilir, komut-poll bos donduginde degil (log storm yok).
+            logger.warning(
+                "command_timestamp_missing_legacy_allowed gateway=%s device=%s "
+                "command_id=%s command=%s dnp3_index=%s — backend `created_at` "
+                "gondermiyor; COMMAND_REQUIRE_TIMESTAMP kapali oldugu icin komut "
+                "calistiriliyor",
+                gateway_code,
+                cmd.device_code,
+                cmd.id,
+                cmd.command,
+                cmd.dnp3_index,
+            )
+        elif not tazelik.fresh:
+            logger.warning(
+                "command_freshness_rejected gateway=%s device=%s command_id=%s "
+                "command=%s dnp3_index=%s created_at=%s age_sec=%s ttl_sec=%s "
+                "reason=%s detail=%s — CROB GONDERILMEDI",
+                gateway_code,
+                cmd.device_code,
+                cmd.id,
+                cmd.command,
+                cmd.dnp3_index,
+                cmd.created_at,
+                None if tazelik.age_sec is None else round(tazelik.age_sec, 1),
+                max_age_sec,
+                tazelik.status,
+                tazelik.detail,
+            )
+            results.append(
+                {
+                    "id": cmd.id,
+                    "ok": False,
+                    "status": tazelik.status,
+                    "error": tazelik.detail,
                 }
             )
             continue
@@ -222,6 +288,8 @@ def _run_command_poll(
     stop_event: Event,
     poll_sec: int,
     config_wake: Event,
+    max_age_sec: float = 120.0,
+    require_timestamp: bool = False,
 ) -> None:
     """Hafif komut-poll thread'i (config'ten AYRI, ~1sn).
 
@@ -268,7 +336,14 @@ def _run_command_poll(
                     fresh.append(cmd)  # yeni -> calistir
                 # False -> zaten dispatch edilmis (restart/duplicate), atla
             if fresh:
-                results = _execute_pending_commands(reader, state, fresh, gateway_code=client.gateway_code)
+                results = _execute_pending_commands(
+                    reader,
+                    state,
+                    fresh,
+                    gateway_code=client.gateway_code,
+                    max_age_sec=max_age_sec,
+                    require_timestamp=require_timestamp,
+                )
                 for res in results:
                     ledger.record_result(res)
 
@@ -1128,6 +1203,8 @@ def run(current_settings: Settings | None = None) -> int:
                 "stop_event": stop_event,
                 "poll_sec": cfg.command_poll_sec,
                 "config_wake": config_wake,
+                "max_age_sec": cfg.command_max_age_sec,
+                "require_timestamp": cfg.command_require_timestamp,
             },
             name="command-poll",
             daemon=True,

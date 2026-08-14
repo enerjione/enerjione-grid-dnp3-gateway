@@ -2,6 +2,73 @@
 
 Semver'a gore tutulur. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.7.3] - 2026-08-14
+
+Gateway, bekleyen komutlarin YASINI dogrulayabilecek hale getirildi (F3A —
+gateway yarisi). **Mevcut backend ile davranis DEGISMEDI**; backend
+`created_at` alanini pending payload'ina henuz koymuyor.
+
+### Security
+
+- **Komut zincirinde YAS kavrami yoktu.** `PendingCommand` zaman alani
+  tasimiyordu, backend'in `/pending` sorgusunda yas filtresi yok (yalnizca
+  `status='pending'`) ve gateway gelen komutu kac saat once uretildigine
+  bakmadan calistiriyordu.
+
+  Somut senaryo: backend'de komut olusturuluyor, gateway 30 dakika kapali
+  kaliyor (bakim/deploy/elektrik), acildiginda komut hala `pending` ve OLDUGU
+  GIBI calisiyor. Kuyrukta bekleyen `master.firmware_update` ya da
+  `master.software_reset` icin bu kabul edilemez.
+
+  Yeni `command_freshness.validate_command_freshness()` saf, yan etkisiz bir
+  fonksiyon olarak tazeligi dogrular. Red sonuclari: `expired`,
+  `command_timestamp_missing`, `command_timestamp_invalid`,
+  `command_timestamp_future` — hepsinde `operate_device` CAGRILMAZ.
+
+  Enforcement `_execute_pending_commands` icinde, `start_dispatch`ten SONRA
+  ve F1/F2'den ONCE: tazelik istegin ICERIGINDEN bagimsiz bir ozelliktir,
+  "bu istegi hic degerlendirmeli miyiz" sorusu "dogru noktayi mi gosteriyor"
+  sorusundan once gelir. Red terminal sonuc uretir, ledger'a yazilir,
+  backend'e teslim edilir ve ayni komut sonraki poll'larda YENIDEN
+  degerlendirilmez.
+
+### Added
+
+- `PendingCommand.created_at` (opsiyonel). **Ham metin olarak tasinir**,
+  parse EDILMEDEN: parser'da ayristirilsaydi bozuk bir damga komutu sessizce
+  dusururdu ve backend sonucu hicbir zaman ogrenemezdi.
+- `COMMAND_MAX_AGE_SEC` (varsayilan **120**). Sahada olculerek secildi:
+  komutun kuyruktan gateway'e teslimi p95=0.92 sn, uctan uca en kotu gozlem
+  10.1 sn (adapter CROB timeout'u). 120 sn bir deploy/restart penceresini de
+  (30-60 sn) kapsar; daha kisa degerler deploy sirasinda mesru komutlari
+  sahte `expired` yapardi.
+- `COMMAND_REQUIRE_TIMESTAMP` (varsayilan **false**). Damgasiz komut
+  reddedilsin mi. Bu bir **GECIS** bayragidir, TTL'yi kapatan bir feature
+  flag DEGILDIR: `created_at` geldigi anda azami yas her kosulda uygulanir
+  ve bayrak bunu bypass ETMEZ. Backend alani gondermeye basladiktan sonra
+  `true` yapilacak; damgasiz komutu kalici olarak kabul etmek bir cozum
+  degildir.
+
+### Notes
+
+- **Mevcut backend ile davranis degisikligi YOK.** `created_at` gelmedigi ve
+  bayrak kapali oldugu icin komutlar bugunku gibi calisir; tek gozlemlenebilir
+  fark, gercek bir komut geldiginde basilan
+  `command_timestamp_missing_legacy_allowed` uyarisidir (bos poll'de
+  basilmaz — log storm yok). Gecisin sessizce kalicilasmamasi icin kasitli.
+- Damga GONDERILMIS ama bozuk/timezone'suz ise bu bir gecis durumu degil,
+  bozuk veridir: bayraktan bagimsiz fail-closed.
+- Tolerans disinda GELECEKTEKI damga reddedilir; kabul edilseydi komut
+  olumsuz olurdu (yasi hicbir zaman TTL'yi asmazdi). Tolerans 60 sn.
+- Saat karsilastirmasi gateway'in kendi UTC saatiyle yapiliyor. Backend'in
+  HTTP `Date` basligindan skew-bagisik yas hesabi F3B'de degerlendirilecek;
+  bu surumde config client'in yanit yolu DEGISTIRILMEDI.
+- `POST /operate` TTL kapsam DISI (payload zaman damgasi tasimiyor);
+  F1/F2 korumasi aynen yerinde.
+- Backend deposunda hicbir degisiklik yok; DB migration gerekmez
+  (`result_status` serbest `String(40)`, enum/CHECK kisiti yok).
+- Testler 538 -> 576.
+
 ## [1.7.2] - 2026-08-14
 
 Fiziksel DNP3 cikis komutlari artik cihazin KENDI sinyal katalogu ile

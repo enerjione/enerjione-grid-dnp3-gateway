@@ -125,6 +125,16 @@ class PendingCommand:
     count: int = 1
     on_time_ms: int = 0
     off_time_ms: int = 0
+    # Backend'in bildirdigi OLUSTURMA damgasi (timezone-aware ISO-8601).
+    #
+    # HAM METIN olarak tasinir, BILINCLI: burada parse edilseydi bozuk bir
+    # damga komutu parse dongusunde SESSIZCE dusururdu ve backend sonucu
+    # hicbir zaman ogrenemezdi. Dogrulama `command_freshness` icinde yapilir
+    # ve reddedilen komut terminal bir sonuc uretir.
+    #
+    # None = backend bu alani GONDERMIYOR (bugunku durum). Bkz.
+    # `COMMAND_REQUIRE_TIMESTAMP` gecis bayragi.
+    created_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -690,6 +700,7 @@ class BackendConfigClient:
                             count=int(item.get("count", 1) or 1),
                             on_time_ms=int(item.get("on_time_ms", 0) or 0),
                             off_time_ms=int(item.get("off_time_ms", 0) or 0),
+                            created_at=_optional_command_timestamp(item.get("created_at")),
                         )
                     )
                 except (KeyError, TypeError, ValueError) as exc:
@@ -763,6 +774,20 @@ _MAX_SIGNALS_HARD_LIMIT = 5000
 _MAX_CODE_LENGTH = 64
 _MAX_LABEL_LENGTH = 256
 _MAX_UNIT_LENGTH = 32
+
+
+def _optional_command_timestamp(raw: Any) -> str | None:
+    """Komut olusturma damgasini HAM METIN olarak alir; yoksa None.
+
+    Burada AYRISTIRILMAZ (bkz. PendingCommand.created_at): bozuk bir damga
+    parse dongusunde komutu sessizce dusururdu ve backend sonucu hicbir zaman
+    ogrenemezdi. Dogrulama `command_freshness` icinde yapilir; orada red
+    terminal bir sonuc uretir. Burada yalnizca "gonderildi mi" ayrimi yapilir.
+    """
+    if raw is None:
+        return None
+    metin = str(raw).strip()
+    return metin or None
 
 
 def _truncate(value: str, max_len: int) -> str:
@@ -1147,6 +1172,7 @@ def _parse_gateway_config(
                         count=int(item.get("count", 1) or 1),
                         on_time_ms=int(item.get("on_time_ms", 0) or 0),
                         off_time_ms=int(item.get("off_time_ms", 0) or 0),
+                        created_at=_optional_command_timestamp(item.get("created_at")),
                     )
                 )
             except (KeyError, TypeError, ValueError) as exc:
