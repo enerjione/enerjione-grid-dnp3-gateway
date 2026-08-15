@@ -2,6 +2,111 @@
 
 Semver'a gore tutulur. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.9.0] - 2026-08-15
+
+Komut teslimi artik GARANTILI: gateway komutu DAYANIKLI olarak kabul ettigini
+backend'e bildirir (`command_delivery_ack_v1`). Minor surum: yeni protokol
+yetenegi ve teslim semantigi; eski backend ile CALISMAYA DEVAM EDER.
+
+**Yayin sirasi onemli:** once bu surum sahaya kurulur, capability
+`gateway_health` uzerinden dogrulanir, SONRA backend F3C surumu cikar.
+
+### Kapatilan ariza
+
+Backend `/pending` yanitini uretirken komutu `sent` isaretliyordu. Iki pencere
+acikti ve ikisi de SESSIZ komut kaybina cikiyordu:
+
+* backend `sent` COMMIT etti, HTTP yaniti gateway'e ULASMADI (ag/timeout)
+* gateway yaniti okudu, DAYANIKLI deftere yazmadan oldu
+
+Her ikisinde de backend `sent`, gateway defteri bos, cihaz komutu hic almadi.
+Operator "gonderildi" goruyor; kesici surulmemis.
+
+### FIZIKSEL KOMUT TEKRARLANMAZ
+
+    Backend -> Gateway TESLIM     : yeniden denenebilir
+    Gateway -> Cihaz   CALISTIRMA : ASLA otomatik yeniden denenmez
+    Gateway -> Backend SONUC      : yeniden denenebilir
+
+Ayni backend `command_id` icin `operate_device` EN FAZLA 1. Proses cokmesi,
+container restart, kira yeniden sunumu ve mukerrer HTTP teslimi bunu
+DEGISTIRMEZ.
+
+### Added
+
+- **Dayanikli teslim ACK'i.** Komut defterine yazildiktan (SQLite COMMIT)
+  SONRA bir ACK kaydi acilir ve backend'e bildirilir. ACK RAM'de DEGIL
+  defterdedir: SIGKILL'de kaybolsaydi backend komutu hicbir zaman `sent`
+  goremez ve kapatilan pencere ACK tarafindan yeniden acilirdi. Teslim
+  edilemezse kuyrukta kalir, proses/container restart'indan sonra yeniden
+  denenir. Dead-letter YOK.
+
+- **`sent` = gateway'in DAYANIKLI kabulu.** Artik "backend yanita koydu"
+  demek degil.
+
+- **Teslim jetonu (`delivery_token`).** Backend'in urettigi opak kimlik;
+  gateway onu cozmez, normalize etmez, LOGLAMAZ. Ayni `command_id` FARKLI
+  jetonla gelirse mevcut dayanikli kayda guvenilir ve fiziksel komut
+  TEKRARLANMAZ.
+
+- **Defter kimligi (`ledger_epoch`, UUID).** `ledger_meta` tablosunda,
+  defterle ayni omurde. Proses restart, container restart ve ayni named
+  volume ile container recreate'te DEGISMEZ; defter silinir ya da karantinaya
+  alinirsa DEGISIR. Backend bu farki gorup komutu otomatik teslim etmez —
+  aksi halde bos defterli gateway komutu YENI sanip CROB'u tekrarlardi.
+
+- **`X-E1-Delivery` basligi HER komut-poll'unde.** Govde
+  `{"v":1,"epoch":"<uuid>"}`, ~60 bayt. Epoch'un TAZE olmasi bir performans
+  tercihi degil, cift-calistirma korumasinin kendisidir: 30 saniyede bir
+  giden saglik ozetine birakilsaydi, defter sifirlandiktan sonraki pencerede
+  backend eski epoch'a guvenirdi.
+
+- **Yetenek acikca bildirilir:** `command_delivery_ack_v1`. Surum ayristirmasi
+  YOK; calisma zamani desteklemiyorsa yetenek gorunmez.
+
+- **Mutlak teslim son kullanma ani (`delivery_not_after`).** Backend'in
+  turettigi DEGISMEZ deger; kira yenilense bile OTELENMEZ. Yerel
+  `COMMAND_MAX_AGE_SEC` yapilandirilabilir oldugu icin tek basina yeterli
+  degil — savunma derinligi.
+
+### Changed
+
+- **`COMMAND_CLOCK_SKEW_TOLERANCE_SEC` eklendi, varsayilan 5 sn** (onceki
+  sabit deger 60 sn). Sahada olculen backend-gateway saat farki ~67 ms; 60 sn
+  olcumun ~900 katiydi ve saati kaymis ya da damgasi bozulmus bir komutun
+  gercek yasini gizleyebilirdi. Sinir deterministik:
+  `created_at <= now + tolerans` KABUL, uzeri `command_timestamp_future` ile
+  RED. Saat GERI adiminda fail-closed — mesru bir komutu yanlislikla
+  reddetmek, bayat bir fiziksel komutu calistirmaktan iyidir.
+
+- **Mukerrer teslimde ACK yeniden kuyruklanir.** Eskiden komut sessizce
+  atlaniyordu; backend komutu yeniden sunduysa ACK'in ULASMADIGI anlasilir ve
+  yeniden gonderilir. Fiziksel komut yine calistirilmaz.
+
+- **Komut defteri semasi v2 -> v3**: `delivery_token`, `ack_state`,
+  `ledger_meta`. Mevcut defterler yerinde yukseltilir; kayit KAYBOLMAZ.
+  Yukseltme aninda var olan satirlar `ack_state='none'` alir (eski backend o
+  komutlar icin ACK beklemiyor).
+
+- **Bozuk teslim ustverisi fail-closed.** `delivery_not_after`
+  ayristirilamazsa fiziksel komut CALISTIRILMAZ ve TERMINAL bir sonuc uretilir
+  (sessiz drop yok).
+
+### Notes
+
+- **Backend v2.96.0 ile uyumlu.** Teslim alanlari gelmezse ACK kuyrugu HIC
+  olusmaz ve davranis 1.8.0 ile ayni kalir.
+- Mevcut dayaniklilik degismedi: SQLite + WAL + `synchronous=FULL`,
+  `command_id` PRIMARY KEY, `INSERT OR IGNORE`, defter yazimi CROB'dan ONCE,
+  restart'ta `dispatching -> unknown`, dayanikli sonuc tekrari.
+- Testler 582 -> 635. 43 F3C birim testi + 10 GERCEK PROSES cokme testi
+  (`Popen.kill()`, gercek SQLite dosyasi, fiziksel komut sayaci ayri dosyada).
+  Mutasyon sinamasi: alti korumanin (tekrar-onleme, defter-once-execute
+  sirasi, mutlak son kullanma, epoch kaliciligi, ACK dayanikliligi, saat
+  sapmasi) her biri kaldirildiginda ilgili test kirmiziya donuyor.
+- Capraz-repo kabul: gercek backend + gercek gateway sureci + PostgreSQL 16 /
+  TimescaleDB 2.17.2 ile 19/19 senaryo PASS.
+
 ## [1.8.0] - 2026-08-14
 
 Zaman damgasi TASIMAYAN fiziksel komut artik VARSAYILAN OLARAK reddediliyor
