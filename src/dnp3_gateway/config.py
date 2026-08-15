@@ -205,6 +205,37 @@ class Settings(BaseSettings):
             "deploy sirasinda mesru komutlari sahte `expired` yapar."
         ),
     )
+    command_clock_skew_tolerance_sec: float = Field(
+        default=5.0,
+        gt=0.0,
+        le=3600.0,
+        description=(
+            "Backend saatinin gateway saatinden ne kadar ILERIDE olmasina izin "
+            "verilir (sn). Bu kadar gelecekteki `created_at` normal saat "
+            "sapmasi sayilir ve yas 0 kabul edilir; DAHA fazlasi "
+            "`command_timestamp_future` ile REDDEDILIR, fiziksel komut "
+            "CALISTIRILMAZ.\n"
+            "\n"
+            "5 sn olculerek secildi: sahada backend-gateway saat farki ~67 ms. "
+            "Onceki deger 60 sn idi — olculen sapmanin ~900 kati. O kadar genis "
+            "bir pencere, saati ileri kaymis ya da damgasi bozulmus bir komutun "
+            "gercek yasini gizleyebilirdi.\n"
+            "\n"
+            "SINIR DETERMINISTIK: `created_at <= now + tolerans` KABUL, "
+            "`created_at > now + tolerans` RED.\n"
+            "\n"
+            "SAAT GERI ADIMI: NTP duzeltmesi sistem saatini geri alirsa komut "
+            "gateway'e gore GELECEKTE gorunur ve fail-closed reddedilir. Bu "
+            "BILINCLI bir takas: mesru bir komutu yanlislikla reddetmek, bayat "
+            "bir fiziksel komutu calistirmaktan iyidir — operator durumu "
+            "kontrol edip yeni komut verebilir.\n"
+            "\n"
+            "KAPATILAMAZ: 0/negatif deger acilista reddedilir (gt=0). Sifir "
+            "tolerans mikrosaniyelik sapmada bile mesru komutlari keserdi; "
+            "'0 = kapali' gibi bir kacis yolu ise gelecek damgali komutlari "
+            "sinirsiz kabul etmek olurdu."
+        ),
+    )
     command_require_timestamp: bool = Field(
         default=True,
         description=(

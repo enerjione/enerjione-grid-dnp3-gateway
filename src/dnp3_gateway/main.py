@@ -113,6 +113,7 @@ def _execute_pending_commands(
     gateway_code: str = "",
     max_age_sec: float = 120.0,
     require_timestamp: bool = True,
+    clock_skew_tolerance_sec: float = 5.0,
 ) -> list[dict]:
     """Bekleyen komutlari operate_device (CROB) ile calistirir, sonuc listesi doner.
 
@@ -164,6 +165,12 @@ def _execute_pending_commands(
             now=datetime.now(timezone.utc),
             max_age_sec=max_age_sec,
             require_timestamp=require_timestamp,
+            clock_skew_tolerance_sec=clock_skew_tolerance_sec,
+            # F3C: backend'in turettigi DEGISMEZ son kullanma ani. Yerel
+            # `max_age_sec` gateway tarafinda yapilandirilabilir oldugu icin
+            # tek basina yeterli degil — daha genis ayarlanirsa backend'in
+            # kapattigi pencere burada acik kalirdi. Savunma derinligi.
+            delivery_not_after=getattr(cmd, "delivery_not_after", None),
         )
         if tazelik.legacy_allowed:
             # Backend `created_at` gondermiyor. Gecisin sessizce kalicilasmasini
@@ -290,6 +297,7 @@ def _run_command_poll(
     config_wake: Event,
     max_age_sec: float = 120.0,
     require_timestamp: bool = True,
+    clock_skew_tolerance_sec: float = 5.0,
 ) -> None:
     """Hafif komut-poll thread'i (config'ten AYRI, ~1sn).
 
@@ -310,6 +318,18 @@ def _run_command_poll(
     consecutive_errors = 0
     while not stop_event.is_set():
         try:
+            # BEKLEYEN ACK'LERI ONCE GONDER — sira onemli.
+            #
+            # Poll once yapilsaydi, gateway'in kabul ettigi ama ACK'i henuz
+            # gitmemis bir komut backend tarafinda hala `pending` gorunur ve
+            # ayni istekte mutlak TTL doldugunda sonlandirilabilirdi. ACK'i one
+            # almak, kabul edilmis bir komutun teslim onayinin o degerlendirmeden
+            # ONCE ulasmasini saglar.
+            #
+            # Ayrica restart sonrasi kurtarma yolu da budur: defterdeki
+            # `ack_state='pending'` kayitlar ilk turda gider.
+            _deliver_delivery_acks(client, ledger)
+
             poll = client.fetch_pending_commands()
             state.apply_pending_poll(poll)
             # SCADA komut yolunun sagligi /health'e yansisin (bkz.
@@ -332,9 +352,40 @@ def _run_command_poll(
             pending = state.take_pending_commands()
             fresh = []
             for cmd in pending:
-                if ledger.start_dispatch(cmd.id):
-                    fresh.append(cmd)  # yeni -> calistir
-                # False -> zaten dispatch edilmis (restart/duplicate), atla
+                # ---- MUKERRER TESLIM MI? -------------------------------
+                #
+                # ONCE deftere bakilir. Kayit VARSA komut daha once DAYANIKLI
+                # olarak kabul edilmistir: fiziksel komut TEKRARLANMAZ ve
+                # yeniden bir calistirma karari URETILMEZ (tazelik/TTL/F1/F2
+                # yeniden degerlendirilmez — o kararlar ilk kabulde verildi).
+                #
+                # Eskiden bu durumda komut sessizce ATLANIYORDU. F3C ile bu
+                # yetmiyor: backend komutu yeniden sunduysa ACK'in ona
+                # ULASMADIGI anlasilir; ACK yeniden kuyruklanmazsa backend
+                # komutu hicbir zaman `sent` goremez ve kira/deneme tukenene
+                # kadar bosuna yeniden sunar.
+                kayitli, _jeton = ledger.kayitli_jeton(cmd.id)
+                if kayitli:
+                    if getattr(cmd, "delivery_token", None) and ledger.ack_yeniden_kuyrukla(cmd.id):
+                        logger.info(
+                            "command_delivery_ack_requeued gateway=%s command_id=%s "
+                            "— komut zaten dayanikli kabul edilmisti; ACK yeniden "
+                            "kuyruklandi (FIZIKSEL KOMUT TEKRARLANMADI)",
+                            client.gateway_code,
+                            cmd.id,
+                        )
+                    continue
+
+                # ---- YENI KOMUT ----------------------------------------
+                #
+                # DAYANIKLI YAZIM FIZIKSEL KOMUTTAN ONCE. `start_dispatch`
+                # COMMIT edilmeden CROB gonderilmez; bu sira, prosesin tam o
+                # anda olmesi halinde bile komutun tekrarlanmamasini saglar.
+                #
+                # Jeton varsa kayit ACK BEKLIYOR durumunda acilir — yani ACK
+                # ancak COMMIT'ten SONRA uretilebilir.
+                if ledger.start_dispatch(cmd.id, getattr(cmd, "delivery_token", None)):
+                    fresh.append(cmd)
             if fresh:
                 results = _execute_pending_commands(
                     reader,
@@ -343,9 +394,14 @@ def _run_command_poll(
                     gateway_code=client.gateway_code,
                     max_age_sec=max_age_sec,
                     require_timestamp=require_timestamp,
+                    clock_skew_tolerance_sec=clock_skew_tolerance_sec,
                 )
                 for res in results:
                     ledger.record_result(res)
+
+            # Bu turda dogan ACK'ler hemen gitsin (dongu basindaki gonderim
+            # onlari henuz gormemisti). Aksi halde her ACK bir poll gecikirdi.
+            _deliver_delivery_acks(client, ledger)
 
             # At-least-once sonuc teslimi (bu turdaki + onceki turlardan kalanlar)
             _deliver_ledger_results(client, ledger)
@@ -381,6 +437,64 @@ _COMMAND_RESULT_MAX_PERMANENT_FAILURES = 3
 #: Tek POST'ta gonderilecek azami sonuc sayisi. Kuyruk birikirse govde
 #: buyuyup `command_poll_timeout_sec`'i asiyordu — kendi kendini besleyen ariza.
 _COMMAND_RESULT_BATCH = 50
+
+
+#: Tek istekte gonderilecek azami teslim onayi. Backend tavani 500; buradaki
+#: sinir onun altinda kalir ve govdeyi kucuk tutar.
+_COMMAND_ACK_BATCH = 100
+
+
+def _deliver_delivery_acks(client: BackendConfigClient, ledger) -> None:
+    """Bekleyen teslim onaylarini backend'e gonderir (F3C).
+
+    SONUC KUYRUGUNDAN AYRI BIR YASAM DONGUSU. Ikisini karistirmak yanlis
+    olurdu: ACK "komutu dayanikli olarak kabul ettim" der ve komut cihazda
+    calismadan ONCE uretilir; sonuc ise "cihaz sunu yapti" der. Bir komutun
+    ACK'i teslim edilmisken sonucu hala kuyrukta olabilir.
+
+    HATA POLITIKASI: ACK teslim edilemezse kayit defterde `pending` KALIR ve
+    bir sonraki turda (ve proses/container restart'indan sonra) yeniden
+    denenir. Dead-letter YOK — ACK'ten vazgecmek, backend'in komutu hicbir
+    zaman `sent` gormemesi ve kira/deneme tukenince `delivery_failed`
+    isaretlemesi demektir. Yani vazgecmenin bedeli sessiz degil, gorunur bir
+    teslim basarisizligidir; sonsuz yeniden deneme bu yuzden dogru davranis.
+
+    Bu fonksiyon ISTISNA SIZDIRMAZ: cagiran taraf komut poll dongusudur ve
+    ACK teslimindeki bir hata komut kanalini dusurmemelidir.
+    """
+    try:
+        bekleyen = ledger.pending_acks()
+    except Exception:  # noqa: BLE001
+        logger.debug("pending_acks okunamadi", exc_info=True)
+        return
+    if not bekleyen:
+        return
+
+    parca = bekleyen[:_COMMAND_ACK_BATCH]
+    try:
+        islenen = client.report_delivery_acks(parca)
+    except Exception as exc:  # noqa: BLE001
+        gecici = is_transient(exc)
+        # JETON LOGLANMAZ — yalnizca sayi ve komut id'leri.
+        logger.warning(
+            "command_delivery_ack_failed count=%d gecici=%s error=%s — ACK defterde kaldi, yeniden denenecek",
+            len(parca),
+            gecici,
+            str(exc)[:200],
+        )
+        return
+
+    for cid in islenen:
+        try:
+            ledger.mark_ack_delivered(int(cid))
+        except Exception:  # noqa: BLE001
+            logger.debug("mark_ack_delivered basarisiz id=%s", cid, exc_info=True)
+    if islenen:
+        logger.info(
+            "command_delivery_ack_sent gateway=%s count=%d",
+            client.gateway_code,
+            len(islenen),
+        )
 
 
 def _deliver_ledger_results(client: BackendConfigClient, ledger) -> None:
@@ -1141,6 +1255,11 @@ def run(current_settings: Settings | None = None) -> int:
             uptime_sec=(govde.get("metrics") or {}).get("uptime_sec"),
             gateway_version=__version__,
             issues=govde.get("issues"),
+            # F3C: yetenek + defter kimligi. Teslim KARARI bu alandan
+            # verilmez (saglik 30sn'de bir gider, bayat olabilir); burasi
+            # yalnizca operatorun/rollout dogrulamasinin filoyu
+            # `gateway_health` uzerinden gorebilmesi icin.
+            ledger_epoch=command_ledger.epoch,
         )
         saglik_onbellek["ts"] = simdi
         saglik_onbellek["govde"] = sonuc
@@ -1171,6 +1290,10 @@ def run(current_settings: Settings | None = None) -> int:
         # komut-poll saniyede bir. Cihaz kaybini 5 dakika gec ogrenmek, "double
         # check" olmasi gereken mekanizmanin amacini bosa cikarirdi.
         health_provider=_saglik_govdesi,
+        # HER poll'de TAZE defter kimligi. Callable: defter yeniden
+        # yaratilirsa yeni kimlik aninda yansisin (kopya tutmak bayat bir
+        # kimlik gondermek olurdu - tam da onlemek istedigimiz sey).
+        delivery_provider=lambda: command_ledger.epoch,
     )
 
     refresh_thread = Thread(
@@ -1205,6 +1328,7 @@ def run(current_settings: Settings | None = None) -> int:
                 "config_wake": config_wake,
                 "max_age_sec": cfg.command_max_age_sec,
                 "require_timestamp": cfg.command_require_timestamp,
+                "clock_skew_tolerance_sec": cfg.command_clock_skew_tolerance_sec,
             },
             name="command-poll",
             daemon=True,

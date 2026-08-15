@@ -49,9 +49,13 @@ from datetime import datetime, timezone
 from enum import Enum
 
 #: Bu kadar GELECEKTEKI damga normal saat sapmasi sayilir ve yas 0 kabul
-#: edilir. Gateway ile backend saatleri arasinda birkac saniyelik fark
-#: olagandir; bunu "gecersiz" saymak mesru komutlari keserdi.
-_FUTURE_TOLERANCE_SEC = 60.0
+#: edilir; DAHA fazlasi reddedilir. Cagiran taraf `clock_skew_tolerance_sec`
+#: ile ezer (bkz. `COMMAND_CLOCK_SKEW_TOLERANCE_SEC`).
+#:
+#: 60 -> 5 DUSURULDU (F3C): sahada olculen backend-gateway saat farki ~67 ms
+#: iken 60 sn, olcumun ~900 kati bir pencereydi ve saati ileri kaymis ya da
+#: damgasi bozulmus bir komutun gercek yasini gizleyebilirdi.
+_FUTURE_TOLERANCE_SEC = 5.0
 
 
 class FreshnessReason(str, Enum):
@@ -71,6 +75,12 @@ class FreshnessReason(str, Enum):
     TIMESTAMP_INVALID = "command_timestamp_invalid"
     #: Damga tolerans disinda GELECEKTE — bozuk/supheli deger.
     TIMESTAMP_FUTURE = "command_timestamp_future"
+    #: Backend'in bildirdigi MUTLAK son kullanma ani (`delivery_not_after`)
+    #: gecmis. Kira yenilenmis olsa bile bu ani asan komut CALISTIRILMAZ.
+    DELIVERY_DEADLINE_PASSED = "delivery_deadline_passed"
+    #: Teslim ustverisi bozuk (ornegin `delivery_not_after` ayristirilamiyor).
+    #: Fail-closed: ustverisini anlamadigimiz komutu cihaza gondermeyiz.
+    DELIVERY_METADATA_INVALID = "delivery_metadata_invalid"
 
 
 @dataclass(frozen=True)
@@ -133,6 +143,8 @@ def validate_command_freshness(
     now: datetime,
     max_age_sec: float,
     require_timestamp: bool,
+    clock_skew_tolerance_sec: float = _FUTURE_TOLERANCE_SEC,
+    delivery_not_after: str | None = None,
 ) -> FreshnessResult:
     """Komutun hala calistirilacak kadar TAZE olup olmadigini soyler.
 
@@ -176,19 +188,27 @@ def validate_command_freshness(
 
     if yas < 0:
         gelecek = -yas
-        if gelecek > _FUTURE_TOLERANCE_SEC:
+        # SINIR DETERMINISTIK: `created_at <= now + tolerans` KABUL.
+        # Karsilastirma `gelecek > tolerans` seklinde, yani TAM toleransta olan
+        # damga hala kabul edilir.
+        if gelecek > clock_skew_tolerance_sec:
             # Tolerans disinda gelecek bir damga saat sapmasiyla aciklanamaz.
             # Kabul etmek komutu OLUMSUZ kilardi: yasi hicbir zaman TTL'yi
             # asmaz ve sonsuza kadar "taze" gorunur.
+            #
+            # SAAT GERI ADIMI da buraya duser: NTP sistem saatini geri alirsa
+            # mesru bir komut GELECEKTE gorunur ve reddedilir. BILINCLI TAKAS —
+            # yanlislikla reddetmek, bayat bir fiziksel komutu calistirmaktan
+            # iyidir; operator durumu kontrol edip yeni komut verebilir.
             return FreshnessResult(
                 FreshnessReason.TIMESTAMP_FUTURE,
-                f"created_at {gelecek:.0f}s GELECEKTE (tolerans {_FUTURE_TOLERANCE_SEC:.0f}s)",
+                f"created_at {gelecek:.3f}s GELECEKTE (tolerans {clock_skew_tolerance_sec:.3f}s)",
                 age_sec=yas,
             )
         # Makul saat sapmasi: yas 0 kabul edilir.
         return FreshnessResult(
             FreshnessReason.FRESH,
-            f"created_at {gelecek:.1f}s gelecekte (tolerans icinde)",
+            f"created_at {gelecek:.3f}s gelecekte (tolerans icinde)",
             age_sec=0.0,
         )
 
@@ -198,5 +218,34 @@ def validate_command_freshness(
             f"komut {yas:.0f}s once olusturuldu; azami yas {max_age_sec:.0f}s",
             age_sec=yas,
         )
+
+    # --- MUTLAK SON KULLANMA ANI (F3C) -----------------------------------
+    #
+    # Backend'in turettigi `delivery_not_after` DEGISMEZDIR ve kira yenilense
+    # bile OTELENMEZ. Yerel TTL'den AYRI olarak uygulanir cunku `max_age_sec`
+    # gateway tarafinda YAPILANDIRILABILIR: daha genis ayarlanirsa backend'in
+    # kapattigi pencere burada acik kalirdi. Savunma derinligi.
+    #
+    # Yerel TTL'DEN SONRA degerlendiriliyor: ikisi de gecmisse "cok eski" demek
+    # `expired`dir ve o daha anlasilir bir sonuctur.
+    if delivery_not_after is not None:
+        ham_sinir = str(delivery_not_after).strip()
+        if ham_sinir:
+            sinir = parse_command_timestamp(ham_sinir)
+            if sinir is None:
+                # Ustverisini ANLAMADIGIMIZ komutu cihaza gondermeyiz.
+                return FreshnessResult(
+                    FreshnessReason.DELIVERY_METADATA_INVALID,
+                    "delivery_not_after ayristirilamadi ya da timezone tasimiyor",
+                    age_sec=yas,
+                )
+            # SINIR: `now <= delivery_not_after` KABUL.
+            if now > sinir:
+                return FreshnessResult(
+                    FreshnessReason.DELIVERY_DEADLINE_PASSED,
+                    f"teslim son kullanma ani gecti ({sinir.isoformat()}); "
+                    "kira yenilense bile fiziksel komut calistirilmaz",
+                    age_sec=yas,
+                )
 
     return FreshnessResult(FreshnessReason.FRESH, "taze", age_sec=yas)

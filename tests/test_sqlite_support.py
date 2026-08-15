@@ -256,11 +256,18 @@ def test_command_ledger_semasi_surumlenir(tmp_path: Path) -> None:
     led = CommandLedger(tmp_path / "ledger.db")
     led.close()
     conn = sqlite3.connect(str(tmp_path / "ledger.db"))
-    # v2: kalici teslim hatasi sayaci (delivery_failures). Kalici bir 4xx
-    # kuyrugu sonsuza kadar bloke etmesin diye eklendi.
-    assert _v(conn) == 2
+    # v3: F3C teslim jetonu + dayanikli ACK durumu + defter kimligi.
+    # (v2: kalici teslim hatasi sayaci; kalici bir 4xx kuyrugu sonsuza
+    # kadar bloke etmesin diye eklenmisti.)
+    assert _v(conn) == 3
     cols = {r[1] for r in conn.execute("PRAGMA table_info(command_ledger)")}
     assert "delivery_failures" in cols
+    # F3C: teslim jetonu + dayanikli ACK durumu
+    assert "delivery_token" in cols
+    assert "ack_state" in cols
+    # Defter kimligi ayri tabloda; defterle AYNI omru paylasir.
+    tablolar = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "ledger_meta" in tablolar
     conn.close()
 
 

@@ -138,6 +138,28 @@ class PendingCommand:
     # `COMMAND_REQUIRE_TIMESTAMP`.
     created_at: str | None = None
 
+    # ----- F3C teslim protokolu (command_delivery_ack_v1) -----------------
+    #
+    # Yalnizca kira/ACK protokolunu konusan backend doldurur. Backend v2.96.0
+    # bu alanlari GONDERMEZ; ikisi de None kalir ve gateway eski davranisla
+    # calisir (bkz. main.py teslim dali). Sessiz bir uyumsuzluk YOK: alanlarin
+    # varligi protokolun hangi yolda oldugunu belirler.
+
+    #: Bu teslimin kimligi. Gateway komutu DAYANIKLI deftere yazdiktan SONRA
+    #: `POST /gateways/{code}/command-delivery-acks` ile aynen geri gonderir;
+    #: backend komutu ancak o zaman `sent` sayar.
+    #:
+    #: OPAKTIR: cozulmez, normalize edilmez, LOGLANMAZ.
+    delivery_token: str | None = None
+
+    #: Backend'in turettigi DEGISMEZ son kullanma ani (tz-aware ISO-8601).
+    #: Kira yenilense bile OTELENMEZ.
+    #:
+    #: HAM METIN — `created_at` ile ayni gerekce: burada parse edilseydi bozuk
+    #: bir deger komutu parse dongusunde SESSIZCE dusururdu ve backend sonucu
+    #: hicbir zaman ogrenemezdi. Dogrulama `command_freshness` icinde.
+    delivery_not_after: str | None = None
+
 
 @dataclass(frozen=True)
 class PendingPoll:
@@ -370,6 +392,14 @@ class BackendConfigClient:
         # Callable secildi cunku saglik anlik bir durum; client'in icinde
         # kopya tutmak bayat veri gondermek olurdu.
         health_provider: Any = None,
+        # F3C teslim protokolu: cagirildiginda DEFTER KIMLIGINI (epoch, str)
+        # dondurur. None ise `X-E1-Delivery` basligi HIC eklenmez ve gateway
+        # yetenegini bildirmemis olur — backend fail-closed davranir.
+        #
+        # Callable secildi cunku epoch defterin omruyle baglidir; client'in
+        # icinde kopya tutmak, defter yeniden yaratildiginda BAYAT bir kimlik
+        # gondermek olurdu — tam da onlemek istedigimiz sey.
+        delivery_provider: Any = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.identity = identity
@@ -379,6 +409,7 @@ class BackendConfigClient:
         self._device_ip_allowlist = device_ip_allowlist
         self._clock_guard = clock_guard
         self._health_provider = health_provider
+        self._delivery_provider = delivery_provider
         # Saglik basligi backend'i patlatiyorsa gecici olarak birakilir.
         # 0.0 = acik. Bkz. `_saglik_basligini_devre_disi_birak`.
         self._saglik_baslik_kapali_until: float = 0.0
@@ -592,6 +623,100 @@ class BackendConfigClient:
             return None
         return health_header.encode_header(govde)
 
+    def _build_delivery_header(self) -> str | None:
+        """F3C teslim basligini uretir; HER hata sessizce yutulur.
+
+        SAGLIK BASLIGINDAN AYRI TUTULDU ve onun devre-disi birakma
+        mekanizmasina BAGLANMADI: saglik bir teshis kolayligidir, bu baslik ise
+        teslim protokolunun kendisidir. Saglik basligi backend'i bozdugu icin
+        birakildiginda teslim protokolu de birakilsaydi, gateway sessizce eski
+        yola duser ve F3C'nin kapattigi pencere geri acilirdi.
+
+        Baslik uretilemezse gateway yetenegini bildirmemis olur; backend
+        varsayilan olarak FAIL-CLOSED davranir (komut teslim etmez). Sessiz bir
+        guvenlik kaybi degil, gorunur bir teslim durusu.
+        """
+        saglayici = self._delivery_provider
+        if saglayici is None:
+            return None
+        try:
+            epoch = saglayici()
+        except Exception:  # noqa: BLE001
+            logger.debug("teslim epoch saglayicisi patladi", exc_info=True)
+            return None
+        if not epoch or not isinstance(epoch, str):
+            return None
+        return health_header.encode_delivery_header(epoch)
+
+    def report_delivery_acks(self, acks: list[dict]) -> set[int]:
+        """Teslim onaylarini backend'e bildirir (batch POST).
+
+        Doner: backend'in KABUL ettigi `command_id` kumesi. Yalnizca bunlar
+        defterde `acked` isaretlenir; gerisi kuyrukta kalip yeniden denenir.
+
+        `acks`: [{"command_id": int, "delivery_token": str}]
+
+        Backend mukerrer ACK'i idempotent kabul eder (`accepted` sayar), yani
+        yeniden gonderim zararsizdir. Hata `CommandResultDeliveryError` ile
+        raise edilir; cagiran taraf gecici/kalici ayrimini yapar.
+
+        JETON LOGLANMAZ.
+        """
+        if not acks:
+            return set()
+        url = f"{self.base_url}/gateways/{self.gateway_code}/command-delivery-acks"
+        headers = build_config_request_headers(self.identity)
+        headers["Content-Type"] = "application/json"
+        try:
+            response = self._session.post(
+                url,
+                headers=headers,
+                json={"acks": acks},
+                timeout=self.timeout_sec,
+            )
+        except requests.RequestException as exc:
+            # Ag hatasi -> GECICI. HTTP status yok; caller yeniden dener.
+            raise CommandResultDeliveryError(
+                _scrub_token_from_text(f"command-delivery-acks POST failed: {exc}", self.identity.token),
+                http_status=None,
+            ) from exc
+        if response.status_code >= 400:
+            # HTTP STATUS'U TASI: caller kalici (401/404/413/422) ile geciciyi
+            # (502/503) ayirt edebilsin. `command-results` ile ayni sozlesme.
+            preview = _scrub_token_from_text((response.text or "")[:200], self.identity.token)
+            raise CommandResultDeliveryError(
+                f"command-delivery-acks POST rejected: HTTP {response.status_code}: {preview}",
+                http_status=response.status_code,
+            )
+
+        # KABUL EDILENI GOVDEDEN OKUMUYORUZ — backend yalnizca SAYI donuyor
+        # (`{"accepted": N, "rejected": M}`), hangi id'lerin kabul edildigini
+        # DEGIL. Reddedilen varsa hepsini kuyrukta tutmak yanlis olurdu
+        # (sonsuz tekrar); hepsini silmek de yanlis (kabul edilmeyen kaybolur).
+        #
+        # Cozum: 2xx alindiysa parti ISLENMIS sayilir. Reddedilen bir ACK
+        # backend tarafinda ya jeton uyusmazligidir ya da komut terminaldir;
+        # her iki durumda da yeniden gondermek DURUMU DEGISTIRMEZ ve komut
+        # backend'in kira/deneme mekanizmasiyla zaten sonlandirilir.
+        kabul = 0
+        try:
+            govde = response.json()
+            if isinstance(govde, dict):
+                kabul = int(govde.get("accepted", 0) or 0)
+                ret = int(govde.get("rejected", 0) or 0)
+                if ret:
+                    logger.warning(
+                        "command_delivery_ack_rejected gateway=%s reddedilen=%d kabul=%d "
+                        "— backend jetonu ya da komut durumunu kabul etmedi",
+                        self.gateway_code,
+                        ret,
+                        kabul,
+                    )
+        except ValueError:
+            logger.debug("command-delivery-acks yaniti JSON degil", exc_info=True)
+
+        return {int(a["command_id"]) for a in acks}
+
     def _saglik_basligini_devre_disi_birak(self, sebep: str) -> None:
         """Saglik basligini gecici olarak birak — KOMUT KANALINI KURTARMAK ICIN.
 
@@ -632,6 +757,18 @@ class BackendConfigClient:
         saglik = self._build_health_header()
         if saglik:
             headers[health_header.HEADER_NAME] = saglik
+        # F3C TESLIM PROTOKOLU — HER poll'de, cache'siz.
+        #
+        # Bu baslik hem yetenegi (`command_delivery_ack_v1`) hem de DEFTER
+        # KIMLIGINI (epoch) tasir. Epoch'un TAZE olmasi bir performans tercihi
+        # degil, cift-calistirma korumasinin kendisidir: defter T aninda
+        # sifirlanip epoch yalnizca 30 saniyede bir giden saglik ozetiyle
+        # tasinsaydi, aradaki pencerede backend ESKI epoch'a guvenerek komutu
+        # yeniden sunar, bos defterli gateway onu YENI sanip CROB'u
+        # TEKRARLARDI.
+        teslim = self._build_delivery_header()
+        if teslim:
+            headers[health_header.DELIVERY_HEADER_NAME] = teslim
         try:
             response = self._session.get(url, headers=headers, timeout=self.timeout_sec)
         except requests.RequestException as exc:
@@ -703,6 +840,12 @@ class BackendConfigClient:
                             on_time_ms=int(item.get("on_time_ms", 0) or 0),
                             off_time_ms=int(item.get("off_time_ms", 0) or 0),
                             created_at=_optional_command_timestamp(item.get("created_at")),
+                            # F3C: HAM METIN tasinir, burada dogrulanmaz.
+                            # Bozuk bir deger komutu parse dongusunde SESSIZCE
+                            # dusurmemeli — `command_freshness` onu reddedip
+                            # TERMINAL bir sonuc uretir ve backend ogrenir.
+                            delivery_token=_opsiyonel_metin(item.get("delivery_token")),
+                            delivery_not_after=_opsiyonel_metin(item.get("delivery_not_after")),
                         )
                     )
                 except (KeyError, TypeError, ValueError) as exc:
@@ -785,6 +928,22 @@ def _optional_command_timestamp(raw: Any) -> str | None:
     parse dongusunde komutu sessizce dusururdu ve backend sonucu hicbir zaman
     ogrenemezdi. Dogrulama `command_freshness` icinde yapilir; orada red
     terminal bir sonuc uretir. Burada yalnizca "gonderildi mi" ayrimi yapilir.
+    """
+    if raw is None:
+        return None
+    metin = str(raw).strip()
+    return metin or None
+
+
+def _opsiyonel_metin(raw: Any) -> str | None:
+    """F3C teslim ustverisini HAM METIN olarak alir; yoksa None.
+
+    `_optional_command_timestamp` ile ayni sozlesme ama farkli anlam: buradaki
+    degerler damga DEGIL (jeton opak, son kullanma ani ISO metin). Ayri isim,
+    jetonun bir zaman damgasi sanilmasini onler.
+
+    AYRISTIRMA YOK: bozuk bir deger komutu parse dongusunde SESSIZCE
+    dusurmemeli; `command_freshness` onu reddedip TERMINAL sonuc uretir.
     """
     if raw is None:
         return None
