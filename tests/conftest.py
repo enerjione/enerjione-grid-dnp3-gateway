@@ -2,7 +2,20 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+
 from dnp3_gateway.backend import DeviceConfig, GatewayConfig, SignalConfig
+
+
+def imzala(body: bytes, token: str = "tok") -> str:
+    """Backend'in urettigi `X-Config-Signature` degeri.
+
+    F4B ile 200 yanitlarda imza ZORUNLU. Sahte yanitlar da uretim
+    sozlesmesini tasimali; aksi halde testler gercekte olmayan bir
+    (imzasiz-kabul) davranisi olcerdi.
+    """
+    return hmac.new(token.encode("utf-8"), body, hashlib.sha256).hexdigest()
 
 
 def make_signal(

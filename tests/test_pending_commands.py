@@ -19,6 +19,8 @@ from dnp3_gateway.auth import GatewayIdentity
 from dnp3_gateway.backend import BackendConfigClient
 from dnp3_gateway.backend.config_client import GatewayConfigError
 
+from .conftest import imzala
+
 
 def _identity() -> GatewayIdentity:
     return GatewayIdentity(
@@ -40,6 +42,8 @@ class _Resp:
             "Content-Type": "application/json",
             "Content-Length": str(len(self.content)),
         }
+        if status_code == 200:
+            self.headers["X-Config-Signature"] = imzala(self.content)
 
     def json(self) -> Any:
         return json.loads(self.content.decode("utf-8"))

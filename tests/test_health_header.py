@@ -25,6 +25,8 @@ from typing import Any
 from dnp3_gateway.auth import GatewayIdentity
 from dnp3_gateway.backend import BackendConfigClient, health_header
 
+from .conftest import imzala
+
 
 def _coz(baslik: str) -> dict[str, Any]:
     """Baslgi geri acar — testler URETIMI degil SONUCU dogrulasin."""
@@ -153,6 +155,8 @@ class _Resp:
             "Content-Type": "application/json",
             "Content-Length": str(len(self.content)),
         }
+        if status_code == 200:
+            self.headers["X-Config-Signature"] = imzala(self.content)
 
     def json(self) -> Any:
         return json.loads(self.content.decode("utf-8"))
