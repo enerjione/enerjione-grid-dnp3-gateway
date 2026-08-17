@@ -2,6 +2,54 @@
 
 Semver'a gore tutulur. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.11.1] - 2026-08-17
+
+Fiziksel DNP3 komut parametreleri artik cihaza gitmeden once dogrulaniyor
+(F6-G).
+
+**VARSAYILAN URETIM AKISINDA DAVRANIS 1.11.0 ILE BIREBIR AYNIDIR.** Sahadaki
+tum komutlar `latch_on / count=1 / on=0 / off=0` sozlesmesini kullaniyor ve bu
+kombinasyon gecerlidir.
+
+### Fixed
+- `count`, `on_time_ms` ve `off_time_ms` fiziksel CROB cagrisina denetlenmeden
+  ulasiyordu. Tek "koruma" `operate_crob` icindeki `int(...)` cagrilariydi;
+  bu kasitli bir dogrulama degildi:
+  - `int("1")`, `int(1.5)` ve `int(True)` SESSIZCE 1 uretiyordu (Python'da
+    `bool` bir `int` alt sinifidir).
+  - Aralik disi degerler yalnizca pybind11'in `TypeError`i sayesinde
+    reddediliyordu — o da CROB kurulumu sirasinda, yani DNP3 oturumu
+    ACILDIKTAN SONRA, sebebi gorunmeyen genel bir hatayla.
+- **`POST /operate` govdesinde `"count": 0` cihaza gidiyordu.** DNP3'te
+  `count=0` "islemi SIFIR kez uygula" demektir: cihaz SUCCESS doner ve HICBIR
+  SEY YAPMAZ. Operator komutu basarili gorur, saha degismez — sessiz
+  basarisizlik. Artik reddediliyor. (Kuyruk yolu bundan etkilenmiyordu;
+  `config_client` parse'i `or 1` ile 0'i zaten 1'e ceviriyor.)
+
+### Added
+- `dnp3_gateway.command_parameters`: saf, yan etkisiz merkezi validator.
+  `command_authorization` (F1/F2) ve `command_freshness` (F3) ile ayni desen —
+  exception atmaz, terminal bir karar doner.
+- Sinirlar UYDURULMADI; `opendnp3.ControlRelayOutputBlock` alan tiplerinden
+  olculerek turetildi (yadnp3 3.2.1.1): `count` uint8 -> 1..255,
+  `onTimeMS`/`offTimeMS` uint32 -> 0..4294967295.
+- Dogrulama `operate_device` icinde, `_ensure_master`'DAN ONCE calisir:
+  gecersiz parametre DNP3 yiginina HIC dokunmaz, CROB olusturulmaz, oturum
+  acilmaz. Sonuc terminaldir (`invalid_op_type` / `invalid_count` /
+  `invalid_timing`), retry uretmez.
+- Kuyruk yolu ve `POST /operate` AYNI `operate_device` primitive'inden gectigi
+  icin ikisi de kapsam altindadir. `/operate` kimlik ve TTL sertlestirmesi F7
+  kapsamindadir ve bu surumde DEGISTIRILMEDI.
+- Choke-point regresyon testi: `operate_crob` adapter disindan cagrilirsa
+  (validator atlanirsa) test kirilir.
+
+### Unchanged
+- `op_type` allowlist'i (`latch_on`/`latch_off`/`pulse_on`/`pulse_off`) ve
+  mevcut `.lower()` normalizasyonu korundu; yeni alias EKLENMEDI.
+- LATCH'te anlamsiz olan sifir disi zamanlama degerleri REDDEDILMEZ —
+  `/operate` varsayilanlari 100/100 ve bunu kirmak F6 kapsami disidir.
+- Yeni ayar/env degiskeni yok.
+
 ## [1.11.0] - 2026-08-17
 
 Kuyruklanmis komut duzlemi icin AYRI credential destegi eklendi (F5B).
