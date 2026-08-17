@@ -1,0 +1,111 @@
+{
+  "contract_version": 1,
+  "gateway_release": "1.10.0",
+  "gateway_source_sha": "842bfd321993e4199b77aa56873ae2a7ed63b665",
+  "owner": "enerjione/enerjione-grid-dnp3-gateway",
+  "description": "Bir uretim DNP3 gateway kurulumunun TASIMASI GEREKEN deployment sozlesmesi. Gateway repo'su sahibidir; Grid repo'su tam kopyasini vendor eder ve CI'da karsilastirir. Runtime'da iki repo birbirine baglanmaz.",
+
+  "environment_defaults": {
+    "GATEWAY_MODE": "dnp3",
+    "BACKEND_API_VERIFY_SSL": "true",
+    "TELEMETRY_PUBLISHER": "nats",
+    "NATS_SUBJECT_PREFIX": "e1.telemetry.raw",
+    "WORKER_HEALTH_HOST": "0.0.0.0",
+    "WORKER_HEALTH_PORT": "8020",
+    "CONFIG_REFRESH_SEC": "30",
+    "DEFAULT_POLL_INTERVAL_SEC": "1",
+    "DNP3_LIBRARY": "yadnp3",
+    "DNP3_LOCAL_ADDRESS": "1",
+    "DNP3_TCP_PORT": "20000",
+    "DNP3_EVENT_BASELINE_INTERVAL_SEC": "30",
+    "DNP3_EVENT_SCAN_INTERVAL_SEC": "5",
+    "DNP3_MANAGER_THREADS": "0",
+    "DNP3_TIME_SYNC": "lan",
+    "LOG_LEVEL": "INFO",
+    "LOG_FORMAT": "json",
+    "SHOW_GATEWAY_TOKEN_ON_START": "false"
+  },
+
+  "value_rationale": {
+    "DNP3_LIBRARY": "yadnp3 = opendnp3 tabanli, Group 110 destekli, OpenDNP3 outstation'lariyla uyumlu. dnp3py LEGACY: Group 110 yok, TCP RST/transport segment tutarsizligi var. config.py varsayilani da yadnp3; uretim yolunda dnp3py'ye SESSIZCE dusmek kabul edilemez.",
+    "TELEMETRY_PUBLISHER": "nats = JetStream'e dogrudan yayin (subject e1.telemetry.raw.<code>), backend'e ugramaz. http yalnizca bilincli rollback icindir ve her olcumu backend HTTP + Postgres outbox zincirinden gecirir.",
+    "CONFIG_REFRESH_SEC": "30. Gateway uretim sablonu 2026-08-03'te (073f14f, 'config yedegi hizlansin') bilincli olarak 30 sectl; ayni commit config.py KUTUPHANE varsayilanini 60 yapti. Maliyet ~sifir cunku config istekleri ETag ile sartli (degismediyse 304, govde inmez). Bu deger nonce tetiginin YEDEGIdir: tetik calismazsa yeni cihaz en gec bu surede gorulur.",
+    "DEFAULT_POLL_INTERVAL_SEC": "1. Gateway'in cache'ten okuyup YAYINLAMA turu. 300 cihaz icin tune edilmis kod varsayilani.",
+    "DNP3_EVENT_SCAN_INTERVAL_SEC": "5 ve EXPLICIT olmak ZORUNDA. Ayar verilmezse config.py varsayilani 0'dir ve factory `scan = dnp3_event_scan_interval_sec or default_poll_interval_sec` ile scan'i POLL'a dusurur; poll=1 oldugu icin scan=1s olur. 401 cihazli sahada olculdu (2026-08-04): saniyede 401 DNP3 istegi, gateway CPU'su cihaz sayisiyla dogru orantili. Cihazlar unsolicited modda calisir, scan yalnizca yedek mekanizmadir; seyreltmek veri tazeligini orantili bozmaz.",
+    "DNP3_EVENT_BASELINE_INTERVAL_SEC": "30. Class 0 tam baseline tazeleme araligi. config.py aciklamasi '30-300 sn idealdir' der; 30 iki saha gateway'inde aylardir kosan ve KABUL EDILMIS degerdir. Gateway compose sablonundaki 60, ilk commit'ten (2026-04-30) beri hic gozden gecirilmemis degerdir. Yuksek cihaz sayili sahalarda 60'a cikarmak Class 0 trafigini yariya indirir; bu ayri bir olcumlu karardir, bu sozlesme kanitsiz degistirmez.",
+    "DNP3_MANAGER_THREADS": "0 = otomatik (min 4). Kod varsayilaniyla ayni; sozlesmede EXPLICIT tutulur ki kutuphane varsayilani degisirse uretim davranisi sessizce kaymasin.",
+    "DNP3_TIME_SYNC": "lan. Outstation RTC drift'i ve guc kesintisi sonrasi reset icin. Kod varsayilaniyla ayni; ayni gerekceyle explicit."
+  },
+
+  "required_environment": [
+    "GATEWAY_CODE",
+    "GATEWAY_TOKEN",
+    "GATEWAY_NAME",
+    "APP_ENVIRONMENT",
+    "BACKEND_API_URL",
+    "NATS_URL",
+    "INSTALL_MODE"
+  ],
+
+  "forbidden_environment": {
+    "DNP3_RESPONSE_TIMEOUT_SEC": "YALNIZCA legacy dnp3py dalinda gecerli. Aktif yadnp3 adapter'i yok sayar ve baslangicta `dnp3_settings_ignored_by_yadnp3` uyarisi basar. Uretim ciktisinda bulunmasi operatoru 'ayari degistirdim ama bir sey olmadi' cikmazina sokar.",
+    "DNP3_READ_STRATEGY": "Ayni gerekce: yadnp3 dalinda etkisiz. Legacy dnp3py FALLBACK KODU SILINMEZ; yalnizca uretim deployment ciktisi sahte knob uretmez."
+  },
+
+  "docker_runtime": {
+    "restart": "unless-stopped",
+    "stop_grace_period": "30s",
+    "ulimits": { "nofile": { "soft": 65536, "hard": 65536 } },
+    "logging": { "driver": "json-file", "options": { "max-size": "10m", "max-file": "5" } },
+    "state_volume_mount": "/app/.gateway_state",
+    "health_container_port": 8020,
+    "healthcheck": { "interval": "30s", "timeout": "5s", "retries": 3, "start_period": "20s" }
+  },
+
+  "docker_runtime_rationale": {
+    "stop_grace_period": "30s. `docker stop` varsayilani 10sn ve gateway'in tipik kapanisi (<8sn) buna ANCAK sigar. Pencere yetmezse proses SIGKILL edilir ve in-flight bir CROB'un sonucu komut defterine yazilamaz; o komut sonraki acilista backend'e 'unknown' bildirilir. Komut semantigini DEGISTIRMEZ, yalnizca kapanis butcesidir.",
+    "ulimits": "Her DNP3 cihazi bir TCP soketi tutar; 400 cihazli olcumde 420 fd acikti (2026-08-04). Docker varsayilan soft limiti 1024. Limit dolunca ariza 'cihaz kopuk' gibi gorunur ve hicbir sayacta yazmaz.",
+    "state_volume_mount": "instance_id + komut defteri + outbox burada durur. Volume kaybolursa at-most-once garanti yerine duplicate mesaj gelir ve komut defteri epoch'u sifirlanir."
+  },
+
+  "intentional_mode_differences": {
+    "INSTALL_MODE": {
+      "remote": "remote",
+      "local": "local",
+      "why": "NATS erisilemedigi zamanki davranisi BELIRLER. local: NATS zorunlu, HTTP yedegi YOK (ayni makinede NATS'a erisememek yapilandirma hatasidir; sessizce HTTP'ye dusmek onu gizler ve 500 cihaz hedefi tutmaz). remote: NATS birincil, erisilemezse HTTP'ye duser ve NATS gelince kendiliginden geri doner."
+    },
+    "NATS_URL": {
+      "why": "Mode'a gore farkli adres: local kurulumda ayni makinedeki NATS, remote kurulumda saha sunucusunun LAN/public adresi. Deger render zamani belirlenir."
+    },
+    "BACKEND_API_URL": {
+      "why": "Mode'a gore farkli: local kurulumda host.docker.internal, remote kurulumda backend'in public URL'i."
+    },
+    "MAX_PARALLEL_DEVICES": {
+      "contract_default": "500",
+      "local_override": "cihaz sayisina gore olceklenebilir",
+      "why": "e1-gwd yerel kurulumda cihaz sayisini bildigi icin havuzu ona gore olcekler; sabit deger kucuk kurulumda havuzu bos, buyuk kurulumda dar birakiyordu. Bilincli override."
+    },
+    "GATEWAY_INSECURE_ALLOW_PLAINTEXT": {
+      "why": "Backend URL semasindan TURETILIR (https -> false, http -> true). Sabit deger degildir."
+    },
+    "GATEWAY_PUBLISH_DNP3_QUALITY": {
+      "why": "Operator secimi; kurulum parametresi olarak gelir."
+    },
+    "naming": {
+      "grid": "proje/container/volume oneki `e1-gw-<kod>`, network `e1`",
+      "gateway_repo": "proje/container/volume oneki `eg-gw-<kod>`, network `enerjione`",
+      "why": "Grid tum servislerini `e1-*` ad alaninda tutar (Solar yan yana kurulunca `e1s-*` kullanir). Gateway repo'sunun tek basina kurulum sablonu kendi ad alanini kullanir. Ad alani cakismasi olmadigi surece bu fark zararsizdir ve BILINCLIdir."
+    },
+    "image_and_pull_policy": {
+      "grid": "image `:latest` + `pull_policy: always`",
+      "why": "Mevcut 'Gateway Guncelle' akisi imaj parametresini degistirmeden latest'i cekerek calisir. Bu sozlesme bunu DEGISTIRMEZ; ayrik bir is olarak 'onaylanmis surum/digest + operator tetikli guncelleme' onerilir. Sozlesme yalnizca `pull_policy`nin varligini kayit altina alir.",
+      "risk": "restart / recreate / upgrade ayni kavram degildir; `pull_policy: always` ile basit bir restart sessizce surum yukseltmesine donusebilir."
+    },
+    "initiating_ports": {
+      "why": "Cihaz gateway'e baglaniyorsa (initiating outstation) dinlenecek portlar host'a acilir. Kurulum parametresine baglidir, sabit degildir."
+    },
+    "host_health_port": {
+      "why": "Ayni host'ta N gateway kosabildigi icin host tarafi port her instance'ta farklidir. Container ici sabit 8020."
+    }
+  }
+}
