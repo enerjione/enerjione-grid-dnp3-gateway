@@ -82,9 +82,7 @@ def test_t02_t03_sablonlar_sozlesme_degerini_tasiyor(kaynak: str, anahtar: str):
         f"`{kaynak}` icinde `{anahtar}` yok. Eksik olmasi kod varsayilanina "
         f"dusmek demektir (sozlesme: {beklenen!r})."
     )
-    assert env[anahtar] == beklenen, (
-        f"`{kaynak}`: {anahtar} = {env[anahtar]!r}, sozlesme {beklenen!r} diyor"
-    )
+    assert env[anahtar] == beklenen, f"`{kaynak}`: {anahtar} = {env[anahtar]!r}, sozlesme {beklenen!r} diyor"
 
 
 @pytest.mark.parametrize("kaynak", sorted(KAYNAKLAR))
@@ -115,9 +113,9 @@ def test_docker_runtime_sozlesmeye_uyuyor():
     assert int(nofile["soft"]) == RUNTIME["ulimits"]["nofile"]["soft"]
     assert int(nofile["hard"]) == RUNTIME["ulimits"]["nofile"]["hard"]
     assert svc["logging"]["driver"] == RUNTIME["logging"]["driver"]
-    assert any(
-        str(v).endswith(RUNTIME["state_volume_mount"]) for v in svc.get("volumes", [])
-    ), "state volume yok"
+    assert any(str(v).endswith(RUNTIME["state_volume_mount"]) for v in svc.get("volumes", [])), (
+        "state volume yok"
+    )
 
 
 def test_sozlesme_bu_surumu_tarif_ediyor():
@@ -134,6 +132,4 @@ def test_zorunlu_alanlar_sablonlarda_yer_tutucu_olarak_var():
     env = _env_dosyasi()
     compose = _compose_env()
     for anahtar in SOZLESME["required_environment"]:
-        assert anahtar in env or anahtar in compose, (
-            f"zorunlu `{anahtar}` hicbir sablonda yok"
-        )
+        assert anahtar in env or anahtar in compose, f"zorunlu `{anahtar}` hicbir sablonda yok"
