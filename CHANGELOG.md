@@ -2,6 +2,80 @@
 
 Semver'a gore tutulur. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.10.0] - 2026-08-17
+
+Backend yanitlarinin HMAC imzasi artik ZORUNLU (F4B). Minor surum:
+varsayilan davranis degisiyor — yukseltmeden once backend'inizin `/config` ve
+`/pending` 200 yanitlarinda `X-Config-Signature` gonderdigini dogrulayin.
+
+### Security
+
+- **Imzasiz yanit sorgusuz kabul ediliyordu.** Gateway `X-Config-Signature`'i
+  "baslik VARSA dogrula" seklinde kontrol ediyordu; baslik DUSURULDUGUNDE
+  payload dogrulanmadan isleniyordu. Bu fail-OPEN'di ve iki ucun tasidigi
+  sey onemsiz degil:
+
+  ```
+  /config   -> cihaz listesi ve BINARY OUTPUT KATALOGU
+               (gateway'deki F1/F2 yetkilendirmesinin GIRDISI)
+  /pending  -> FIZIKSEL KOMUT niyeti: command, dnp3_index, created_at,
+               delivery_token
+  ```
+
+  Saha gateway'leri backend'e cogu kurulumda duz HTTP ile baglaniyor
+  (olculdu); yani imza bu iki uc icin TEK authenticity kontrolu. Basligi
+  dusurebilen biri katalogu degistirip F1/F2'yi etkisiz kilabilir ya da
+  dogrudan komut enjekte edebilirdi.
+
+  Artik 200 yanitlar icin tek sonuc var: **gecerli imza ya da red**.
+
+- **Dogrulama JSON'a dokunmadan ONCE yapiliyor.** Reddedilen bir `/pending`
+  yaniti `PendingPoll` bile uretmez: komut kuyruga girmez, nonce uygulanmaz,
+  `ledger.start_dispatch` / delivery ACK / `operate_device` yollarina
+  ULASILAMAZ. Reddedilen bir `/config` yaniti da `_last_config` /
+  `_last_etag` onbellegine GIRMEZ — aksi halde bir kez imzasiz 200 + ETag
+  veren saldirgan, ardindan 304 zinciriyle dogrulanmamis katalogu
+  kalicilastirabilirdi.
+
+- **Bozuk baslik komut kanalini dusuremiyor.** Baslik once
+  `[0-9a-f]{64}` kalibindan geciyor; ancak sonra `compare_digest`e
+  ulasiyor. Onceden non-ASCII bir baslik `TypeError` atip tek bir kotu
+  yanitla TUM komut kanalini dusurebilirdi.
+
+### Added
+
+- `REQUIRE_BACKEND_RESPONSE_SIGNATURE` (varsayilan **true**). `false`
+  YALNIZCA imza GONDERMEYEN eski bir backend'e kontrollu rollback icindir ve
+  GECICIDIR. **Baslik GELDIYSE her kosulda dogrulanir** — bu bayrak gecersiz
+  bir imzayi ASLA bypass etmez. F3'teki `COMMAND_REQUIRE_TIMESTAMP` ile ayni
+  guvenlik modeli: bayrak mevcut kontrolu kapatmaz, yalnizca eksik legacy
+  alana gecici izin verir.
+- `backend/response_signature.py` — saf, yan etkisiz dogrulama. `/config` ve
+  `/pending` icin TEK yol; iki ayri gevsek HMAC implementasyonu birakilmadi.
+  Sonuclar: `valid` · `legacy_allowed` · `signature_missing` ·
+  `signature_malformed` · `signature_mismatch`.
+
+### Notes
+
+- **Tel bicimi DEGISMEDI**: HMAC-SHA256, anahtar gateway token'i, baslik
+  `X-Config-Signature`, 64 karakter kucuk harf hex. Backend 2.97.0 basarili
+  yanitlarda bunu zaten uretiyor.
+- **304 davranisi DEGISMEDI.** 304 body tasimadigi icin imza beklenmez;
+  mevcut sozlesme (yalnizca dogrulanmis bir onbellek varken kosullu istek,
+  onbellek yoksa red + ETag temizleme) aynen korundu.
+- Rollback modunda kabul SESSIZ degil:
+  `backend_response_signature_missing_legacy_allowed` uyarisi basilir —
+  `/pending` 1 Hz kostugu icin baglam basina 600 sn'de bir (log storm yok).
+- P1 teslim protokolu (`delivery_token`, `delivery_not_after`, ACK kuyrugu,
+  ledger epoch, kira) ve F1/F2/F3 kontrolleri DEGISMEDI.
+- Testler 635 -> 677.
+
+### ⚠️ Yukseltme sirasi
+
+Backend `/config` ve `/pending` 200 yanitlarinda imza gondermiyorsa bu surum
+o kanallari **kapatir**. Once backend'i dogrulayin; gecis gerekiyorsa gecici
+olarak `REQUIRE_BACKEND_RESPONSE_SIGNATURE=false` verin.
+
 ## [1.9.0] - 2026-08-15
 
 Komut teslimi artik GARANTILI: gateway komutu DAYANIKLI olarak kabul ettigini

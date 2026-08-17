@@ -168,6 +168,25 @@ class Settings(BaseSettings):
     # ----- Backend API ---------------------------------------------------------
     backend_api_url: str = Field(default="http://127.0.0.1:8000/api/v1")
     backend_api_verify_ssl: bool = Field(default=True, description="False sadece dev/test (MITM riski)")
+    require_backend_response_signature: bool = Field(
+        default=True,
+        description=(
+            "Backend'in `/config` ve `/pending` 200 yanitlarinda "
+            "`X-Config-Signature` (HMAC-SHA256) ZORUNLU olsun mu. "
+            "VARSAYILAN ACIK.\n"
+            "\n"
+            "NEDEN: bu iki uc cihaz katalogunu (F1/F2 yetkilendirmesinin "
+            "girdisi) ve FIZIKSEL KOMUT niyetini tasiyor. Saha gateway'leri "
+            "backend'e duz HTTP ile baglaniyor, yani imza bu iki uc icin TEK "
+            "authenticity kontrolu. Basligi dusurebilen bir saldirgan katalogu "
+            "degistirip F1/F2'yi etkisiz kilabilir ya da komut enjekte "
+            "edebilirdi.\n"
+            "\n"
+            "`false` YALNIZCA imza GONDERMEYEN eski bir backend'e kontrollu "
+            "rollback icindir ve GECICIDIR. Baslik GELDIYSE her kosulda "
+            "dogrulanir — bu bayrak gecersiz bir imzayi ASLA bypass etmez."
+        ),
+    )
     backend_api_ca_path: str | None = Field(
         default=None,
         description="TLS icin ozel CA bundle yolu; bos = sistem varsayilani + verify_ssl",

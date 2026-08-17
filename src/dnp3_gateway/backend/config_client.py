@@ -6,7 +6,8 @@ katalogunu donmekle yukumludur. Bu modulun gorevi:
   - Endpoint'i periyodik olarak cagirmak (her `CONFIG_REFRESH_SEC`)
   - JSON payload'unu tipli dataclass'lara (DeviceConfig / SignalConfig /
     GatewayConfig) cevirmek + defansif sema validasyonu uygulamak
-  - Opsiyonel `X-Config-Signature` HMAC dogrulamasi (MITM koruma)
+  - `X-Config-Signature` HMAC dogrulamasi — ZORUNLU (bkz.
+    `REQUIRE_BACKEND_RESPONSE_SIGNATURE`); dogrulanmamis yanit islenmez
   - Ag / token / 5xx hatalarini `GatewayConfigError` ile raise etmek
 
 Backend'in `config_version` hash'i ayni kaldigi surece state.update() True
@@ -27,6 +28,7 @@ import requests
 from dnp3_gateway.auth import GatewayIdentity, build_config_request_headers
 from dnp3_gateway.backend import health_header
 from dnp3_gateway.backend.http_session import build_http_session
+from dnp3_gateway.backend.response_signature import verify_backend_response_signature
 
 # Modul-seviye logger. ONEMLI: eskiden bazi fonksiyonlar `import logging as
 # _logging` satirini KENDI govdesinde yapiyor, baska fonksiyonlar ise ayni
@@ -44,6 +46,11 @@ logger = logging.getLogger(__name__)
 # kalici degil; ama her saniye yeniden denenip cift istek uretmesin diye de
 # kisa degil.
 _SAGLIK_BASLIK_KAPALI_SEC = 600.0
+
+# Rollback modunda (imza zorunlu degil) uyarinin baglam basina tekrarlanma
+# araligi. `/pending` 1 Hz kosuyor; her yanitta uyarmak log'u bogardi ama
+# tamamen susmak gecici override'in kalicilasmasi demek olurdu.
+_IMZA_UYARI_ARALIK_SEC = 600.0
 
 
 @dataclass(frozen=True)
@@ -374,6 +381,11 @@ class BackendConfigClient:
         session: requests.Session | None = None,
         verify: bool | str = True,
         response_max_bytes: int = DEFAULT_RESPONSE_MAX_BYTES,
+        # `X-Config-Signature` ZORUNLU mu (F4B). Varsayilan fail-closed.
+        # False YALNIZCA imza gondermeyen eski bir backend'e kontrollu
+        # rollback icindir; baslik geldiyse her kosulda dogrulanir.
+        # Bkz. `REQUIRE_BACKEND_RESPONSE_SIGNATURE`.
+        require_response_signature: bool = True,
         # Cihaz IP allowlist'i ARTIK DISARIDAN gecirilir. Eskiden modul-seviye
         # bir cache import-time `settings` singleton'ini okuyordu; bu, `--env-file
         # .env.GW-002` ile baslatilan instance'larda YANLIS dosyadan (kok `.env`)
@@ -406,6 +418,11 @@ class BackendConfigClient:
         self.gateway_code = identity.gateway_code
         self.timeout_sec = timeout_sec
         self._response_max_bytes = max(64 * 1024, int(response_max_bytes))
+        self._require_response_signature = bool(require_response_signature)
+        # Rollback uyarisi icin hafif dedup: `/pending` 1 Hz kosuyor, her
+        # yanitta WARNING basmak log'u bogardi. Baglam ("config"/"pending")
+        # basina en fazla `_IMZA_UYARI_ARALIK_SEC`de bir.
+        self._imza_uyarisi_at: dict[str, float] = {}
         self._device_ip_allowlist = device_ip_allowlist
         self._clock_guard = clock_guard
         self._health_provider = health_provider
@@ -422,6 +439,46 @@ class BackendConfigClient:
         # Connection-pooled session: config-refresh ve (ayri client ornegindeki)
         # command-poll thread'leri kendi session'iyla baglanti yarisi yasamaz.
         self._session = session or build_http_session(pool_maxsize=8, verify=verify)
+
+    def _imza_dogrula(self, response: Any, body_bytes: bytes, *, context: str) -> None:
+        """Yanit imzasini dogrular; kabul edilmezse `GatewayConfigError` atar.
+
+        `/config` ve `/pending` icin TEK yol — iki ayri gevsek HMAC
+        implementasyonu birakilmadi. Karar saf `verify_backend_response_signature`
+        icinde uretilir; burada yalnizca hataya cevrilir ve rollback izni
+        loglanir.
+        """
+        sonuc = verify_backend_response_signature(
+            body=body_bytes,
+            header_value=response.headers.get("X-Config-Signature"),
+            token=self.identity.token,
+            require=self._require_response_signature,
+            context=context,
+        )
+        if not sonuc.accepted:
+            raise GatewayConfigError(sonuc.detail)
+        if sonuc.legacy_allowed:
+            # Sessiz kabul YOK. Ama `/pending` 1 Hz kostugu icin her yanitta
+            # basmak log'u bogardi; baglam basina hiz sinirli uyari.
+            #
+            # "HIC UYARILMADI" SENTINEL'I None, 0.0 DEGIL. `time.monotonic()`
+            # Linux'ta BOOT'tan beri gecen suredir: taze acilmis bir cihazda
+            # deger 600'un altindadir ve `simdi - 0.0 >= 600` YANLIS doner.
+            # Yani ILK uyari — en cok ihtiyac duyulan an — 10 dakikaya kadar
+            # bastirilirdi. (CI'da Ubuntu runner'da yakalandi; Windows'ta
+            # uptime buyuk oldugu icin gorunmuyordu.)
+            simdi = time.monotonic()
+            son = self._imza_uyarisi_at.get(context)
+            if son is None or simdi - son >= _IMZA_UYARI_ARALIK_SEC:
+                self._imza_uyarisi_at[context] = simdi
+                logger.warning(
+                    "backend_response_signature_missing_legacy_allowed gateway=%s "
+                    "context=%s — backend `X-Config-Signature` gondermiyor ve "
+                    "REQUIRE_BACKEND_RESPONSE_SIGNATURE kapali; yanit DOGRULANMADAN "
+                    "kabul edildi. Bu GECICI bir rollback ayaridir.",
+                    self.gateway_code,
+                    context,
+                )
 
     def _observe_clock(self, response: Any) -> None:
         """Yanittaki HTTP `Date` basligindan saat sapmasini gozle (best-effort)."""
@@ -545,29 +602,14 @@ class BackendConfigClient:
             err_text = _scrub_token_from_text(str(exc), self.identity.token)
             raise GatewayConfigError(f"config response read failed: {err_text}") from exc
 
-        # HMAC signature dogrulamasi (opsiyonel, geriye uyumlu).
+        # AUTHENTICITY — JSON'a DOKUNMADAN ONCE (F4B).
         #
-        # Backend response'a `X-Config-Signature: <hex sha256>` header
-        # eklerse: gateway HMAC-SHA256(gateway_token, body_bytes) hesabini
-        # `hmac.compare_digest` ile dogrular. Eslesmezse 403 raise.
-        # Backend bu header'i yollamazsa (eski backend veya feature kapali)
-        # gateway eskisi gibi devam eder — bu best-effort defense-in-depth,
-        # ozellikle HTTPS yokken MITM korumasi saglar.
-        sig_header = (response.headers.get("X-Config-Signature") or "").strip().lower()
-        if sig_header:
-            import hashlib as _hashlib
-            import hmac as _hmac
-
-            expected = _hmac.new(
-                self.identity.token.encode("utf-8"),
-                body_bytes,
-                _hashlib.sha256,
-            ).hexdigest()
-            if not _hmac.compare_digest(sig_header, expected):
-                raise GatewayConfigError(
-                    "config response signature mismatch — "
-                    "backend kompromize veya MITM olabilir, payload reddedildi"
-                )
+        # Bu govde cihaz listesini ve BINARY OUTPUT KATALOGUNU tasiyor; yani
+        # gateway'deki F1/F2 yetkilendirmesinin girdisi. Dogrulanmamis bir
+        # katalog ayristirilirsa `_last_config`/`_last_etag` onbellegine
+        # girip 304 zincirini de zehirlerdi — bu yuzden red BURADA olur ve
+        # asagidaki hicbir satira ulasilmaz.
+        self._imza_dogrula(response, body_bytes, context="config")
 
         try:
             import json as _json
@@ -743,8 +785,6 @@ class BackendConfigClient:
 
         Hata -> GatewayConfigError (caller loglar, bir sonraki poll'de tekrar dener).
         """
-        import hashlib as _hashlib
-        import hmac as _hmac
         import json as _json
 
         url = f"{self.base_url}/gateways/{self.gateway_code}/pending"
@@ -807,12 +847,13 @@ class BackendConfigClient:
         if len(body_bytes) > self._response_max_bytes:
             raise GatewayConfigError("pending response too large")
 
-        # HMAC imza dogrulama (fetch_config ile ayni; best-effort, header varsa).
-        sig_header = (response.headers.get("X-Config-Signature") or "").strip().lower()
-        if sig_header:
-            expected = _hmac.new(self.identity.token.encode("utf-8"), body_bytes, _hashlib.sha256).hexdigest()
-            if not _hmac.compare_digest(sig_header, expected):
-                raise GatewayConfigError("pending response signature mismatch — MITM/kompromize, reddedildi")
+        # AUTHENTICITY — JSON parse'tan ve state/ledger'a dokunmadan ONCE (F4B).
+        #
+        # Bu govde FIZIKSEL KOMUT niyetini tasiyor. Dogrulama burada bittigi
+        # icin reddedilen bir yanit `PendingPoll` bile uretmez: komut kuyruga
+        # girmez, nonce uygulanmaz, `ledger.start_dispatch` ve
+        # `operate_device` cagrilmaz.
+        self._imza_dogrula(response, body_bytes, context="pending")
 
         try:
             data: dict[str, Any] = _json.loads(body_bytes.decode("utf-8"))

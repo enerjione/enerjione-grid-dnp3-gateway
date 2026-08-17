@@ -28,6 +28,8 @@ import pytest
 from dnp3_gateway.auth import GatewayIdentity
 from dnp3_gateway.backend import BackendConfigClient, GatewayConfigError
 
+from .conftest import imzala
+
 
 def _kimlik() -> GatewayIdentity:
     return GatewayIdentity(
@@ -63,6 +65,8 @@ class _Yanit:
         self.content = govde.encode("utf-8")
         self.text = govde
         self.headers: dict[str, str] = {"Content-Length": str(len(self.content))}
+        if status_code == 200:
+            self.headers["X-Config-Signature"] = imzala(self.content)
         if etag:
             self.headers["ETag"] = etag
         self.kapatildi = False
