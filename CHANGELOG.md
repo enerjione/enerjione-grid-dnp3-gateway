@@ -2,6 +2,76 @@
 
 Semver'a gore tutulur. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.11.0] - 2026-08-17
+
+Kuyruklanmis komut duzlemi icin AYRI credential destegi eklendi (F5B).
+
+**VARSAYILAN YAPILANDIRMADA DAVRANIS 1.10.0 ILE BIREBIR AYNIDIR.** Yeni
+credential opsiyoneldir ve tanimlanana kadar hicbir sey degismez.
+
+> ⚠️ **Sozlesme provizyoneldir.** Backend F5A henuz sahaya cikmadi; header
+> adi ve anahtar secimi F5A dogrulandiginda karsilastirilacak. Sahada
+> `GATEWAY_COMMAND_DELIVERY_TOKEN` **backend hazir olmadan TANIMLANMAMALIDIR**
+> — tanimlanirsa `/pending` yanitlari yeni anahtarla dogrulanmaya calisilir ve
+> komut kanali kapanir.
+
+### Added
+
+- `GATEWAY_COMMAND_DELIVERY_TOKEN` (varsayilan **bos**). Kuyruklanmis komut
+  duzlemini kimlik duzleminden ayirir:
+
+  ```
+  /config                -> X-Gateway-Token
+  /pending               -> X-Gateway-Token + X-Gateway-Command-Token
+  /command-delivery-acks -> X-Gateway-Token + X-Gateway-Command-Token
+  /command-results       -> X-Gateway-Token + X-Gateway-Command-Token
+  ```
+
+  **NEDEN:** bugun `/config` ile `/pending` ayni `GATEWAY_TOKEN` ile
+  korunuyor. O token sizarsa yalnizca konfigurasyon degil FIZIKSEL KOMUT
+  duzlemi de ele gecer: saldirgan komut enjekte edebilir ve `/pending`
+  yanitini GECERLI imzayla uretebilir. Yani 1.10.0'da kapatilan authenticity
+  acigi, sir ayni oldugu surece config duzlemi uzerinden hala asilabilirdi.
+
+  Komut token'i kimligin YERINE GECMEZ; iki baslik birlikte gider. Token bos
+  ise baslik HIC eklenmez — bos string, backend'de "credential var ama
+  gecersiz" ile "credential yok" ayrimini bozardi.
+
+### Changed
+
+- **`/pending` yanit imzasinin HMAC anahtari baglama gore secilir:**
+
+  ```
+  config  -> her zaman GATEWAY_TOKEN
+  pending -> komut token'i DOLUYSA yalnizca o; bos ise GATEWAY_TOKEN
+  ```
+
+  **GERI DUSME YOK:** komut token'i tanimliyken dogrulama basarisiz olursa
+  `GATEWAY_TOKEN` ile TEKRAR DENENMEZ. Denenseydi ayrimin guvenlik degeri
+  sifir olurdu — config duzlemini ele geciren biri komut duzlemini de
+  imzalayabilirdi.
+
+- `_scrub_token_from_text` artik birden fazla sir temizliyor: iki token ayni
+  istegin basliklarinda birlikte gidiyor ve `requests` bir istisnada
+  baslik/URL yansitabilir.
+
+- Production dogrulayicilari: komut token'i tanimliysa `GATEWAY_TOKEN` ya da
+  `GATEWAY_COMMAND_TOKEN` ile AYNI olamaz ve placeholder olamaz. Ayni deger
+  verilirse ayrim kagit uzerinde kalirdi. **Bos olmasi hata degildir.**
+
+### Notes
+
+- `/operate` ve `GATEWAY_COMMAND_TOKEN` **degismedi** (F7 kapsami).
+- F4B imza semantigi yalnizca ANAHTAR SECIMI kadar uyarlandi; HMAC-SHA256,
+  `X-Config-Signature`, ham govde byte'lari, 64 hex, malformed
+  on-dogrulama, `compare_digest` ve fail-closed davranis aynen korundu.
+- F1/F2/F3, P1 teslim protokolu, `X-E1-Delivery` wire bicimi ve ETag/304
+  sozlesmesi degismedi.
+- Dogrulanmamis `/pending` yaniti hala JSON parse'tan ONCE reddediliyor:
+  `PendingPoll` uretilmez, nonce uygulanmaz, `ledger.start_dispatch` /
+  delivery ACK / `operate_device` yollarina ulasilmaz.
+- Testler 679 -> 706 (+27); 5'i "token bos = 1.10.0 davranisi" kilidi.
+
 ## [1.10.0] - 2026-08-17
 
 Backend yanitlarinin HMAC imzasi artik ZORUNLU (F4B). Minor surum:

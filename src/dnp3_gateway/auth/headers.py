@@ -26,3 +26,34 @@ def build_config_request_headers(identity: GatewayIdentity) -> dict[str, str]:
     }
     h["X-Gateway-Client"] = f"dnp3-gateway/{identity.app_version}"
     return h
+
+
+#: Kuyruklanmis komut duzlemi (queued-command plane) icin AYRI credential.
+#: `/pending`, `/command-delivery-acks` ve `/command-results` bu basligi da
+#: tasir. Normal kimligin (`X-Gateway-Token`) YERINE GECMEZ — iki baslik
+#: birlikte gonderilir.
+COMMAND_TOKEN_HEADER = "X-Gateway-Command-Token"
+
+
+def build_command_request_headers(
+    identity: GatewayIdentity, command_delivery_token: str | None = None
+) -> dict[str, str]:
+    """Kuyruklanmis komut ucları icin baslik sozlugu.
+
+    Normal kimlik basliklarinin TAMAMINI icerir; uzerine — yalnizca token
+    yapilandirilmissa — `X-Gateway-Command-Token` eklenir.
+
+    NEDEN AYRI CREDENTIAL: bugun `/config` ile `/pending` ayni `GATEWAY_TOKEN`
+    ile korunuyor. O token sizarsa yalnizca konfigurasyon degil, FIZIKSEL
+    KOMUT duzlemi de ele gecer. Ayri bir sir, komut duzlemini config
+    duzleminden ayirir (F5).
+
+    BOS TOKEN ICIN BASLIK HIC EKLENMEZ. Bos string gondermek backend'de
+    "credential var ama gecersiz" ile "credential yok" ayrimini bozardi;
+    gecis doneminde backend'in eski gateway'i tanimasi bu ayrima dayanir.
+    """
+    h = build_config_request_headers(identity)
+    jeton = (command_delivery_token or "").strip()
+    if jeton:
+        h[COMMAND_TOKEN_HEADER] = jeton
+    return h

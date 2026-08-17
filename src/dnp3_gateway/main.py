@@ -1274,6 +1274,7 @@ def run(current_settings: Settings | None = None) -> int:
         device_ip_allowlist=device_ip_allowlist,
         clock_guard=clock_guard,
         require_response_signature=cfg.require_backend_response_signature,
+        command_delivery_token=cfg.gateway_command_delivery_token,
     )
 
     # Command-poll icin AYRI client + session. Config-refresh thread'i 5dk'da
@@ -1288,6 +1289,7 @@ def run(current_settings: Settings | None = None) -> int:
         response_max_bytes=cfg.backend_response_max_bytes,
         device_ip_allowlist=device_ip_allowlist,
         require_response_signature=cfg.require_backend_response_signature,
+        command_delivery_token=cfg.gateway_command_delivery_token,
         # Saglik ozeti komut-poll'e biner: config-refresh 5 dakikada bir kosar,
         # komut-poll saniyede bir. Cihaz kaybini 5 dakika gec ogrenmek, "double
         # check" olmasi gereken mekanizmanin amacini bosa cikarirdi.

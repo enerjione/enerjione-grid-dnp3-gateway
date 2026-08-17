@@ -117,6 +117,30 @@ class Settings(BaseSettings):
             "devre disi kalir (503). GATEWAY_TOKEN'dan FARKLI olmali."
         ),
     )
+    gateway_command_delivery_token: str = Field(
+        default="",
+        description=(
+            "KUYRUKLANMIS KOMUT DUZLEMI icin ayri credential (F5). "
+            "`GET /pending`, `POST /command-delivery-acks` ve "
+            "`POST /command-results` isteklerinde `X-Gateway-Command-Token` "
+            "basligiyla gonderilir ve `/pending` yanit imzasinin HMAC "
+            "ANAHTARI olur.\n"
+            "\n"
+            "NEDEN: bugun `/config` ile `/pending` ayni `GATEWAY_TOKEN` ile "
+            "korunuyor. O token sizarsa yalnizca konfigurasyon degil FIZIKSEL "
+            "KOMUT duzlemi de ele gecer. Ayri sir, komut duzlemini config "
+            "duzleminden ayirir.\n"
+            "\n"
+            "BOS = mevcut (v1.10) davranis: komut uclari da `GATEWAY_TOKEN` "
+            "kullanir. Bu yalnizca backend F5A sahaya cikana kadar gecerli bir "
+            "GECIS durumudur; sonrasinda zorunlu hale gelecek.\n"
+            "\n"
+            "DOLU ise `/pending` yaniti YALNIZCA bu anahtarla dogrulanir — "
+            "`GATEWAY_TOKEN`a geri dusulmez. `GATEWAY_TOKEN` ve "
+            "`GATEWAY_COMMAND_TOKEN` ile AYNI olamaz. `/operate` bu token'i "
+            "KULLANMAZ; o uc `GATEWAY_COMMAND_TOKEN` ile korunmaya devam eder."
+        ),
+    )
     gateway_name: str = Field(default="EnerjiOne DNP3 Gateway", description="Log/health icin insan-okur isim")
 
     # Ornek/destek: bos ise `GATEWAY_STATE_DIR` altinda kalici uuid dosyasina yazilir
@@ -1090,6 +1114,36 @@ class Settings(BaseSettings):
                         "GUVENLIK: APP_ENVIRONMENT=production'da GATEWAY_COMMAND_TOKEN, "
                         "GATEWAY_TOKEN ile AYNI olamaz. Komut endpoint'i (/operate) "
                         "icin farkli, yuksek-entropy bir token kullanin."
+                    )
+                # F5: kuyruklanmis komut duzlemi credential'i.
+                #
+                # BOS OLMASI HATA DEGIL — backend F5A sahaya cikana kadar
+                # gecis durumu bu (bkz. alan aciklamasi). Ama DOLUYSA gercekten
+                # AYRI bir sir olmali: digerleriyle ayni deger verilirse ayrimin
+                # tamami kagit uzerinde kalir, komut duzlemi hala config
+                # duzlemiyle ayni sirla korunuyor olurdu.
+                cdt = (self.gateway_command_delivery_token or "").strip()
+                if cdt and self.gateway_token and cdt == self.gateway_token.strip():
+                    raise ValueError(
+                        "GUVENLIK: APP_ENVIRONMENT=production'da "
+                        "GATEWAY_COMMAND_DELIVERY_TOKEN, GATEWAY_TOKEN ile AYNI "
+                        "olamaz. Ayni deger verilirse komut duzlemi config "
+                        "duzleminden AYRILMAMIS olur; ayri, yuksek-entropy bir "
+                        "token uretin."
+                    )
+                if cdt and self.gateway_command_token and cdt == self.gateway_command_token.strip():
+                    raise ValueError(
+                        "GUVENLIK: APP_ENVIRONMENT=production'da "
+                        "GATEWAY_COMMAND_DELIVERY_TOKEN, GATEWAY_COMMAND_TOKEN "
+                        "(/operate) ile AYNI olamaz. Iki uc farkli yetki "
+                        "duzlemidir; ayri token kullanin."
+                    )
+                if cdt and _is_placeholder_token(cdt):
+                    raise ValueError(
+                        "GUVENLIK: APP_ENVIRONMENT=production'da "
+                        "GATEWAY_COMMAND_DELIVERY_TOKEN placeholder degerle "
+                        "baslayamaz. Yuksek-entropy yeni bir token uretin "
+                        '(`python -c "import secrets;print(secrets.token_urlsafe(32))"`).'
                     )
                 # H-3: token placeholder prefix kontrolu. Auth katmanindaki
                 # `ensure_credentials_allowed` zaten birkac literal placeholder'i
