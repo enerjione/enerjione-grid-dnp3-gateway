@@ -460,9 +460,16 @@ class BackendConfigClient:
         if sonuc.legacy_allowed:
             # Sessiz kabul YOK. Ama `/pending` 1 Hz kostugu icin her yanitta
             # basmak log'u bogardi; baglam basina hiz sinirli uyari.
+            #
+            # "HIC UYARILMADI" SENTINEL'I None, 0.0 DEGIL. `time.monotonic()`
+            # Linux'ta BOOT'tan beri gecen suredir: taze acilmis bir cihazda
+            # deger 600'un altindadir ve `simdi - 0.0 >= 600` YANLIS doner.
+            # Yani ILK uyari — en cok ihtiyac duyulan an — 10 dakikaya kadar
+            # bastirilirdi. (CI'da Ubuntu runner'da yakalandi; Windows'ta
+            # uptime buyuk oldugu icin gorunmuyordu.)
             simdi = time.monotonic()
-            son = self._imza_uyarisi_at.get(context, 0.0)
-            if simdi - son >= _IMZA_UYARI_ARALIK_SEC:
+            son = self._imza_uyarisi_at.get(context)
+            if son is None or simdi - son >= _IMZA_UYARI_ARALIK_SEC:
                 self._imza_uyarisi_at[context] = simdi
                 logger.warning(
                     "backend_response_signature_missing_legacy_allowed gateway=%s "

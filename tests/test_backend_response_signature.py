@@ -392,3 +392,38 @@ def test_dogrulanmamis_pending_state_e_uygulanmaz() -> None:
 
     assert st.take_pending_commands() == []
     assert st.take_config_refresh_request() is False
+
+
+def test_ilk_rollback_uyarisi_taze_makinede_de_basilir(monkeypatch, caplog) -> None:
+    """REGRESYON: `monotonic()` kucukken ILK uyari bastirilmamali.
+
+    Hiz siniri "hic uyarilmadi" durumunu `0.0` ile temsil ediyordu. Ama
+    `time.monotonic()` Linux'ta BOOT'tan beri gecen suredir; taze acilmis bir
+    cihazda deger araligin (600 sn) altinda kalir ve `simdi - 0.0 >= 600`
+    YANLIS doner. Sonuc: en cok ihtiyac duyulan ilk uyari 10 dakikaya kadar
+    bastirilirdi — yani tam da onlenmek istenen sessiz kabul.
+    """
+    monkeypatch.setattr("dnp3_gateway.backend.config_client.time.monotonic", lambda: 3.0)
+    caplog.set_level("WARNING")
+    c = _client(_Session(_Resp(_CONFIG, imza=None)), require=False)
+    c.fetch_config()
+    assert "backend_response_signature_missing_legacy_allowed" in caplog.text
+
+
+def test_rollback_uyarisi_hiz_sinirli(monkeypatch, caplog) -> None:
+    """Ikinci cagri ayni pencerede SUSAR (`/pending` 1 Hz — log storm yok)."""
+    an = [1000.0]
+    monkeypatch.setattr("dnp3_gateway.backend.config_client.time.monotonic", lambda: an[0])
+    caplog.set_level("WARNING")
+    c = _client(_Session(_Resp(_PENDING, imza=None)), require=False)
+
+    c.fetch_pending_commands()
+    assert caplog.text.count("backend_response_signature_missing_legacy_allowed") == 1
+
+    an[0] = 1100.0  # 100 sn sonra — pencere icinde
+    c.fetch_pending_commands()
+    assert caplog.text.count("backend_response_signature_missing_legacy_allowed") == 1
+
+    an[0] = 1700.0  # 700 sn sonra — pencere doldu
+    c.fetch_pending_commands()
+    assert caplog.text.count("backend_response_signature_missing_legacy_allowed") == 2
