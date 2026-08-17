@@ -1,6 +1,6 @@
 {
   "contract_version": 1,
-  "gateway_release": "1.11.0",
+  "gateway_release": "1.11.1",
   "gateway_source_sha": "db833e20d05a07c86f2f5768bc8570954add3a97",
   "owner": "enerjione/enerjione-grid-dnp3-gateway",
   "description": "Bir uretim DNP3 gateway kurulumunun TASIMASI GEREKEN deployment sozlesmesi. Gateway repo'su sahibidir; Grid repo'su tam kopyasini vendor eder ve CI'da karsilastirir. Runtime'da iki repo birbirine baglanmaz.",

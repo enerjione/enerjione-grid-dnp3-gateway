@@ -28,6 +28,7 @@ from typing import Any
 
 from dnp3_gateway.adapters.base import SignalReading, TelemetryReader
 from dnp3_gateway.backend import DeviceConfig, SignalConfig
+from dnp3_gateway.command_parameters import validate_command_parameters
 
 logger = logging.getLogger(__name__)
 
@@ -2864,8 +2865,44 @@ class Yadnp3TelemetryReader(TelemetryReader):
         cihazda SBO SELECT fazinda NOT_SUPPORTED donuyor, DirectOperate calisiyor).
 
         Toplam islem suresi burada olculup sonuca eklenir.
+
+        F6 — PARAMETRE DOGRULAMASI BURADA, `_ensure_master`'DAN ONCE
+        ---------------------------------------------------------
+        Bu metod fiziksel komutun TEK giris noktasidir: hem kuyruk yolu
+        (`main._execute_pending_commands`) hem `POST /operate` buradan gecer.
+        Dogrulama en basta yapilir ki gecersiz bir parametre DNP3 yiginina
+        HIC dokunmasin — `_ensure_master` gerektiginde oturum acar.
         """
         import time as _t
+
+        parametre = validate_command_parameters(
+            op_type=op_type,
+            count=count,
+            on_time_ms=on_time_ms,
+            off_time_ms=off_time_ms,
+        )
+        if not parametre.valid:
+            logger.warning(
+                "dnp3_command_parameters_rejected device=%s index=%s op_type=%r "
+                "count=%r on_time_ms=%r off_time_ms=%r reason=%s detail=%s — "
+                "CROB OLUSTURULMADI, DNP3 oturumuna dokunulmadi",
+                device.code,
+                index,
+                op_type,
+                count,
+                on_time_ms,
+                off_time_ms,
+                parametre.status,
+                parametre.detail,
+            )
+            return {
+                "ok": False,
+                "status": parametre.status,
+                "error": parametre.detail,
+                "device_code": device.code,
+                "index": index,
+                "control": op_type,
+            }
 
         mm = self._ensure_master(device)
         t0 = _t.monotonic()

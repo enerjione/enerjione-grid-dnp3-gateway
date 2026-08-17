@@ -31,6 +31,7 @@ from typing import Any
 
 from dnp3_gateway import __version__
 from dnp3_gateway.command_authorization import authorize_output_command
+from dnp3_gateway.command_parameters import raw_command_parameter
 from dnp3_gateway.state import GatewayState
 
 logger = logging.getLogger(__name__)
@@ -928,9 +929,15 @@ def _make_handler(
                     device=device,
                     index=index,
                     op_type=op_type,
-                    count=int(payload.get("count", 1)),
-                    on_time_ms=int(payload.get("on_time_ms", 100)),
-                    off_time_ms=int(payload.get("off_time_ms", 100)),
+                    # HAM tasinir (F6): `int(...)` burada "1"/1.5/True degerlerini
+                    # sessizce 1'e cevirip validator'in tip kontrollerini
+                    # etkisiz birakiyordu. Alan YOKSA belgelenmis varsayilan
+                    # kullanilir (LATCH'te zamanlama cihazca yok sayilir).
+                    count=raw_command_parameter(payload, "count", 1),
+                    on_time_ms=raw_command_parameter(payload, "on_time_ms", 100),
+                    off_time_ms=raw_command_parameter(payload, "off_time_ms", 100),
+                    # `timeout_sec` bir CROB parametresi DEGIL (cihaza gitmez,
+                    # yalnizca beklenecek sure); F6 kapsami disinda birakildi.
                     timeout_sec=float(payload.get("timeout_sec", 10.0)),
                 )
             except Exception as exc:  # noqa: BLE001
