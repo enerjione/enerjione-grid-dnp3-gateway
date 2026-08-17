@@ -25,7 +25,11 @@ from typing import Any
 
 import requests
 
-from dnp3_gateway.auth import GatewayIdentity, build_config_request_headers
+from dnp3_gateway.auth import (
+    GatewayIdentity,
+    build_command_request_headers,
+    build_config_request_headers,
+)
 from dnp3_gateway.backend import health_header
 from dnp3_gateway.backend.http_session import build_http_session
 from dnp3_gateway.backend.response_signature import verify_backend_response_signature
@@ -357,13 +361,17 @@ def _rewrite_loopback_ip(ip: str, *, enabled: bool) -> str:
 DEFAULT_RESPONSE_MAX_BYTES = 10 * 1024 * 1024
 
 
-def _scrub_token_from_text(text: str, token: str | None) -> str:
-    """Hata mesajinda token tam metin olarak gorunmesin diye redaction."""
-    if not token or len(token) < 6:
-        return text
-    # Tam token varsa ***REDACTED*** ile yer degistir; boylece exception
-    # log'larina yansimaz
-    return text.replace(token, "***REDACTED***")
+def _scrub_token_from_text(text: str, *tokens: str | None) -> str:
+    """Hata mesajinda token tam metin olarak gorunmesin diye redaction.
+
+    BIRDEN FAZLA SIR: gateway kimlik token'i ve (F5) kuyruklanmis komut
+    duzlemi token'i ayni istegin basliklarinda birlikte gider; `requests`
+    bir istisnada baslik/URL yansitabilir. Ikisi de temizlenir.
+    """
+    for token in tokens:
+        if token and len(token) >= 6:
+            text = text.replace(token, "***REDACTED***")
+    return text
 
 
 class BackendConfigClient:
@@ -386,6 +394,10 @@ class BackendConfigClient:
         # rollback icindir; baslik geldiyse her kosulda dogrulanir.
         # Bkz. `REQUIRE_BACKEND_RESPONSE_SIGNATURE`.
         require_response_signature: bool = True,
+        # F5: kuyruklanmis komut duzlemi credential'i. Bos = mevcut (v1.10)
+        # davranis; dolu = `/pending`, ACK ve result uclarinda ayri baslik +
+        # `/pending` yanit imzasinin ANAHTARI. `/config` bunu KULLANMAZ.
+        command_delivery_token: str = "",
         # Cihaz IP allowlist'i ARTIK DISARIDAN gecirilir. Eskiden modul-seviye
         # bir cache import-time `settings` singleton'ini okuyordu; bu, `--env-file
         # .env.GW-002` ile baslatilan instance'larda YANLIS dosyadan (kok `.env`)
@@ -419,6 +431,7 @@ class BackendConfigClient:
         self.timeout_sec = timeout_sec
         self._response_max_bytes = max(64 * 1024, int(response_max_bytes))
         self._require_response_signature = bool(require_response_signature)
+        self._command_delivery_token = (command_delivery_token or "").strip()
         # Rollback uyarisi icin hafif dedup: `/pending` 1 Hz kosuyor, her
         # yanitta WARNING basmak log'u bogardi. Baglam ("config"/"pending")
         # basina en fazla `_IMZA_UYARI_ARALIK_SEC`de bir.
@@ -440,6 +453,17 @@ class BackendConfigClient:
         # command-poll thread'leri kendi session'iyla baglanti yarisi yasamaz.
         self._session = session or build_http_session(pool_maxsize=8, verify=verify)
 
+    def _imza_anahtari(self, context: str) -> str:
+        """Bu baglam icin yanit imzasinin HMAC anahtari.
+
+        `/config` kimlik duzlemine, `/pending` komut duzlemine aittir. Komut
+        duzlemi credential'i yapilandirilmamissa (backend F5A oncesi) komut
+        ucu da kimlik token'ina duser — bu GECICI bir gecis davranisidir.
+        """
+        if context == "pending" and self._command_delivery_token:
+            return self._command_delivery_token
+        return self.identity.token
+
     def _imza_dogrula(self, response: Any, body_bytes: bytes, *, context: str) -> None:
         """Yanit imzasini dogrular; kabul edilmezse `GatewayConfigError` atar.
 
@@ -447,11 +471,22 @@ class BackendConfigClient:
         implementasyonu birakilmadi. Karar saf `verify_backend_response_signature`
         icinde uretilir; burada yalnizca hataya cevrilir ve rollback izni
         loglanir.
+
+        ANAHTAR SECIMI (F5)
+        -------------------
+          config  -> her zaman `identity.token`
+          pending -> komut duzlemi token'i DOLUYSA yalnizca o; bos ise
+                     `identity.token` (backend F5A oncesi gecis durumu)
+
+        GERI DUSME YOK: komut token'i yapilandirilmisken dogrulama
+        basarisiz olursa `identity.token` ile TEKRAR DENENMEZ. Denenseydi
+        ayrimin guvenlik degeri sifirlanirdi — config duzlemini ele geciren
+        biri komut duzlemini de imzalayabilirdi.
         """
         sonuc = verify_backend_response_signature(
             body=body_bytes,
             header_value=response.headers.get("X-Config-Signature"),
-            token=self.identity.token,
+            token=self._imza_anahtari(context),
             require=self._require_response_signature,
             context=context,
         )
@@ -707,7 +742,7 @@ class BackendConfigClient:
         if not acks:
             return set()
         url = f"{self.base_url}/gateways/{self.gateway_code}/command-delivery-acks"
-        headers = build_config_request_headers(self.identity)
+        headers = build_command_request_headers(self.identity, self._command_delivery_token)
         headers["Content-Type"] = "application/json"
         try:
             response = self._session.post(
@@ -719,13 +754,19 @@ class BackendConfigClient:
         except requests.RequestException as exc:
             # Ag hatasi -> GECICI. HTTP status yok; caller yeniden dener.
             raise CommandResultDeliveryError(
-                _scrub_token_from_text(f"command-delivery-acks POST failed: {exc}", self.identity.token),
+                _scrub_token_from_text(
+                    f"command-delivery-acks POST failed: {exc}",
+                    self.identity.token,
+                    self._command_delivery_token,
+                ),
                 http_status=None,
             ) from exc
         if response.status_code >= 400:
             # HTTP STATUS'U TASI: caller kalici (401/404/413/422) ile geciciyi
             # (502/503) ayirt edebilsin. `command-results` ile ayni sozlesme.
-            preview = _scrub_token_from_text((response.text or "")[:200], self.identity.token)
+            preview = _scrub_token_from_text(
+                (response.text or "")[:200], self.identity.token, self._command_delivery_token
+            )
             raise CommandResultDeliveryError(
                 f"command-delivery-acks POST rejected: HTTP {response.status_code}: {preview}",
                 http_status=response.status_code,
@@ -788,7 +829,7 @@ class BackendConfigClient:
         import json as _json
 
         url = f"{self.base_url}/gateways/{self.gateway_code}/pending"
-        headers = build_config_request_headers(self.identity)
+        headers = build_command_request_headers(self.identity, self._command_delivery_token)
         # SAGLIK OZETI — bu istege biner, ek istek yok.
         #
         # KOMUT KANALI KUTSAL: buradaki hicbir sey `/pending` cagrisini
@@ -812,7 +853,7 @@ class BackendConfigClient:
         try:
             response = self._session.get(url, headers=headers, timeout=self.timeout_sec)
         except requests.RequestException as exc:
-            err = _scrub_token_from_text(str(exc), self.identity.token)
+            err = _scrub_token_from_text(str(exc), self.identity.token, self._command_delivery_token)
             raise GatewayConfigError(f"pending request failed: {err}") from exc
 
         # BASLIK KOMUT KANALINI DUSURUYOR MU?
@@ -840,7 +881,9 @@ class BackendConfigClient:
                 response = ikinci
 
         if response.status_code != 200:
-            preview = _scrub_token_from_text((response.text or "")[:200], self.identity.token)
+            preview = _scrub_token_from_text(
+                (response.text or "")[:200], self.identity.token, self._command_delivery_token
+            )
             raise GatewayConfigError(f"pending request returned {response.status_code}: {preview}")
 
         body_bytes = response.content
@@ -915,7 +958,7 @@ class BackendConfigClient:
         if not results:
             return
         url = f"{self.base_url}/gateways/{self.gateway_code}/command-results"
-        headers = build_config_request_headers(self.identity)
+        headers = build_command_request_headers(self.identity, self._command_delivery_token)
         headers["Content-Type"] = "application/json"
         try:
             response = self._session.post(
@@ -927,7 +970,9 @@ class BackendConfigClient:
         except requests.RequestException as exc:
             # Ag hatasi -> GECICI. HTTP status yok; caller yeniden dener.
             raise CommandResultDeliveryError(
-                _scrub_token_from_text(f"command-results POST failed: {exc}", self.identity.token),
+                _scrub_token_from_text(
+                    f"command-results POST failed: {exc}", self.identity.token, self._command_delivery_token
+                ),
                 http_status=None,
             ) from exc
         if response.status_code >= 400:
@@ -938,7 +983,9 @@ class BackendConfigClient:
             # o andan sonraki TUM komut sonuclari backend'e ulasmiyordu —
             # operator panelinde komutlar sonsuza kadar "bekliyor" gorunurken
             # kesiciler fiziksel olarak surulmus oluyordu.
-            preview = _scrub_token_from_text((response.text or "")[:200], self.identity.token)
+            preview = _scrub_token_from_text(
+                (response.text or "")[:200], self.identity.token, self._command_delivery_token
+            )
             raise CommandResultDeliveryError(
                 f"command-results POST rejected: HTTP {response.status_code}: {preview}",
                 http_status=response.status_code,
