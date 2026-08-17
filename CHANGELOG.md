@@ -23,8 +23,19 @@ kombinasyon gecerlidir.
 - **`POST /operate` govdesinde `"count": 0` cihaza gidiyordu.** DNP3'te
   `count=0` "islemi SIFIR kez uygula" demektir: cihaz SUCCESS doner ve HICBIR
   SEY YAPMAZ. Operator komutu basarili gorur, saha degismez — sessiz
-  basarisizlik. Artik reddediliyor. (Kuyruk yolu bundan etkilenmiyordu;
-  `config_client` parse'i `or 1` ile 0'i zaten 1'e ceviriyor.)
+  basarisizlik. Artik reddediliyor.
+- **GIRIS YOLLARI DEGERI VALIDATOR'A GELMEDEN DONUSTURUYORDU** — bu yuzden
+  tip kontrolleri gercek sinirda hic calismiyordu:
+  - Kuyruk yolu: `int(item.get("count", 1) or 1)`. `or 1` yuzunden backend
+    `count: 0` gonderdiginde gateway **1** gonderiyordu. Cagiran taraf
+    "islemi sifir kez uygula" derken gateway kesiciyi BIR KEZ suruyordu.
+  - `POST /operate`: `int(payload.get("count", 1))`. `"1"`, `1.5`, `True` ve
+    ACIK `null` sessizce 1 oluyordu.
+  Artik ham deger korunuyor ve tek daraltma noktasi validator:
+  **alan yok -> belgelenmis varsayilan; alan var -> ham niyet strict
+  dogrulanir; gecersizse fail-closed.** Gecersiz komut parse dongusunde
+  SESSIZCE DUSURULMEZ — terminal sonuc uretir ve backend sebebi ogrenir
+  (`created_at` / F3 ile ayni felsefe).
 
 ### Added
 - `dnp3_gateway.command_parameters`: saf, yan etkisiz merkezi validator.
@@ -42,12 +53,34 @@ kombinasyon gecerlidir.
   kapsamindadir ve bu surumde DEGISTIRILMEDI.
 - Choke-point regresyon testi: `operate_crob` adapter disindan cagrilirsa
   (validator atlanirsa) test kirilir.
+- `command_parameters.raw_command_parameter`: "alan yok" ile "alan var ama
+  gecersiz" ayrimini tek yerde tasiyan yardimci. Uc giris noktasi da bunu
+  kullaniyor (iki kuyruk parse'i + `/operate`).
+- GERCEK SINIR testleri: ham JSON'dan (`/pending` yaniti ve `POST /operate`
+  govdesi) baslayip fiziksel cagri sayisini olcuyor. Gecersiz her ham deger
+  icin fiziksel cagri **0**, gecerli uretim komutu icin **tam 1**.
+
+### Compatibility
+- Canli backend bu davranistan ETKILENMEZ, dogrulandi: giden sema
+  `GatewayConfigCommand` bir Pydantic modeli (`count: int = 1`,
+  `on_time_ms: int = 100`, `off_time_ms: int = 100`), DB kolonlari
+  `nullable=False`, ve UI giris semasi `count`'u `ge=1, le=10` ile
+  sinirliyor. Yani backend her zaman gercek tam sayi gonderiyor; `null`,
+  metin, bool veya `0` gonderemiyor.
+- `count = 0` gibi bir deger yine de gelirse artik SESSIZCE 1'e cevrilmek
+  yerine `invalid_count` ile reddedilir ve sebep backend'e bildirilir.
 
 ### Unchanged
 - `op_type` allowlist'i (`latch_on`/`latch_off`/`pulse_on`/`pulse_off`) ve
-  mevcut `.lower()` normalizasyonu korundu; yeni alias EKLENMEDI.
+  mevcut `.lower()` normalizasyonu korundu; yeni alias EKLENMEDI. `op_type`
+  parse'i (`str(item.get("op_type") or "latch_on")`) de bu surumde
+  DEGISTIRILMEDI.
 - LATCH'te anlamsiz olan sifir disi zamanlama degerleri REDDEDILMEZ —
   `/operate` varsayilanlari 100/100 ve bunu kirmak F6 kapsami disidir.
+- `timeout_sec` bir CROB parametresi DEGIL (cihaza gitmez, yalnizca beklenecek
+  sure); F6 kapsami disinda birakildi ve coercion'i korundu.
+- `/operate` kimlik dogrulama, token, TTL ve replay davranisi (F7) ile
+  F1/F2/F3/P1/F4/F5 davranislari DEGISTIRILMEDI.
 - Yeni ayar/env degiskeni yok.
 
 ## [1.11.0] - 2026-08-17

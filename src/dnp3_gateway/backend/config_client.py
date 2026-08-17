@@ -33,6 +33,7 @@ from dnp3_gateway.auth import (
 from dnp3_gateway.backend import health_header
 from dnp3_gateway.backend.http_session import build_http_session
 from dnp3_gateway.backend.response_signature import verify_backend_response_signature
+from dnp3_gateway.command_parameters import RawParameter, raw_command_parameter
 
 # Modul-seviye logger. ONEMLI: eskiden bazi fonksiyonlar `import logging as
 # _logging` satirini KENDI govdesinde yapiyor, baska fonksiyonlar ise ayni
@@ -133,9 +134,22 @@ class PendingCommand:
     command: str
     dnp3_index: int
     op_type: str = "latch_on"
-    count: int = 1
-    on_time_ms: int = 0
-    off_time_ms: int = 0
+
+    # ----- HAM CROB parametreleri (F6) ------------------------------------
+    #
+    # Tipleri bilincli olarak `int` DEGIL: backend'in GONDERDIGI sey aynen
+    # tasinir. Burada `int(...)` uygulanirsa `"1"`, `1.5` ve `True` sessizce
+    # 1 olur ve fiziksel validator'in tip kontrolleri GERCEK sinirda hic
+    # calismaz. Ayrica ESKI `or 1` kalibi ACIK `count: 0` niyetini 1'e
+    # ceviriyordu — DNP3'te `count=0` "islemi sifir kez uygula" demektir.
+    #
+    # Daraltma TEK yerde yapilir: `operate_device` icinde, DNP3 oturumu
+    # acilmadan once (`command_parameters.validate_command_parameters`).
+    # Gecersiz deger burada DUSURULMEZ; tasinir ve TERMINAL bir sonuc
+    # uretir, boylece backend sebebi ogrenir — `created_at` ile ayni felsefe.
+    count: RawParameter = 1
+    on_time_ms: RawParameter = 0
+    off_time_ms: RawParameter = 0
     # Backend'in bildirdigi OLUSTURMA damgasi (timezone-aware ISO-8601).
     #
     # HAM METIN olarak tasinir, BILINCLI: burada parse edilseydi bozuk bir
@@ -920,9 +934,10 @@ class BackendConfigClient:
                             command=str(item.get("command") or ""),
                             dnp3_index=int(item["dnp3_index"]),
                             op_type=str(item.get("op_type") or "latch_on"),
-                            count=int(item.get("count", 1) or 1),
-                            on_time_ms=int(item.get("on_time_ms", 0) or 0),
-                            off_time_ms=int(item.get("off_time_ms", 0) or 0),
+                            # HAM tasinir; daraltma operate_device icinde (F6).
+                            count=raw_command_parameter(item, "count", 1),
+                            on_time_ms=raw_command_parameter(item, "on_time_ms", 0),
+                            off_time_ms=raw_command_parameter(item, "off_time_ms", 0),
                             created_at=_optional_command_timestamp(item.get("created_at")),
                             # F3C: HAM METIN tasinir, burada dogrulanmaz.
                             # Bozuk bir deger komutu parse dongusunde SESSIZCE
@@ -1418,9 +1433,10 @@ def _parse_gateway_config(
                         command=str(item.get("command") or ""),
                         dnp3_index=int(item["dnp3_index"]),
                         op_type=str(item.get("op_type") or "latch_on"),
-                        count=int(item.get("count", 1) or 1),
-                        on_time_ms=int(item.get("on_time_ms", 0) or 0),
-                        off_time_ms=int(item.get("off_time_ms", 0) or 0),
+                        # HAM tasinir; daraltma operate_device icinde (F6).
+                        count=raw_command_parameter(item, "count", 1),
+                        on_time_ms=raw_command_parameter(item, "on_time_ms", 0),
+                        off_time_ms=raw_command_parameter(item, "off_time_ms", 0),
                         created_at=_optional_command_timestamp(item.get("created_at")),
                     )
                 )

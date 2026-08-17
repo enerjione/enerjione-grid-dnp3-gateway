@@ -59,8 +59,10 @@ araliga uyup uymadigina bakilir.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
+from typing import Any
 
 #: `opendnp3.ControlRelayOutputBlock.count` alani uint8.
 COUNT_MIN = 1
@@ -74,6 +76,41 @@ TIME_MS_MAX = 2**32 - 1
 #: kume. Burada tekrar taniniyor ki dogrulama DNP3 oturumu acilmadan ONCE
 #: yapilabilsin; adapter'daki kontrol savunma derinligi olarak kalir.
 SUPPORTED_OP_TYPES = frozenset({"latch_on", "latch_off", "pulse_on", "pulse_off"})
+
+
+#: HAM (dogrulanmamis) CROB parametresi.
+#:
+#: Tipi bilincli olarak `int` DEGIL: cagiranin GONDERDIGI sey aynen tasinir.
+#: `int(...)` ile normalize edilseydi `"1"`, `1.5` ve `True` sessizce 1 olurdu
+#: ve asagidaki tip kontrolleri GERCEK sinirda hic calismazdi. Daraltma TEK
+#: yerde yapilir: `validate_command_parameters`.
+RawParameter = Any
+
+
+def raw_command_parameter(payload: Mapping[str, Any], key: str, default: int) -> RawParameter:
+    """Ham parametreyi getirir: alan YOKSA belgelenmis varsayilan, VARSA aynen.
+
+    ALAN YOK ile ALAN VAR AMA GECERSIZ ayrimi F6'nin merkezinde:
+
+        alan yok            -> belgelenmis varsayilan (uyumluluk)
+        alan var, gecerli   -> aynen kullanilir
+        alan var, gecersiz  -> AYNEN tasinir ve validator REDDEDER
+
+    Bunun yerine yaygin iki kalip kullanilirsa niyet SESSIZCE degisir:
+
+        int(payload.get(key, default))     # "1"/1.5/True -> 1
+        payload.get(key, default) or default   # ACIK 0 -> default
+
+    Ikincisi somut bir acikti: backend `count: 0` gonderdiginde `or 1` bunu
+    1'e ceviriyordu. DNP3'te `count=0` "islemi SIFIR kez uygula" demektir —
+    yani cagiran taraf "hicbir sey yapma" derken gateway "bir kez surdu".
+
+    `None` da varsayilana DONMEZ: JSON `null` ACIK bir gonderimdir, alanin
+    yoklugu degil. Reddedilmesi gerekir ki cagiran taraf ogrensin.
+    """
+    if key not in payload:
+        return default
+    return payload[key]
 
 
 class ParameterReason(str, Enum):
