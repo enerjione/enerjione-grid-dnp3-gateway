@@ -81,9 +81,16 @@ services:
       CONFIG_REFRESH_SEC: "30"
       DEFAULT_POLL_INTERVAL_SEC: "1"
       MAX_PARALLEL_DEVICES: "500"
+      # Aktif adapter. Kod varsayilani da bu; explicit tutuluyor ki
+      # varsayilan degisirse uretim davranisi sessizce kaymasin.
+      DNP3_LIBRARY: "yadnp3"
       DNP3_LOCAL_ADDRESS: "1"
       DNP3_TCP_PORT: "20000"
-      DNP3_EVENT_BASELINE_INTERVAL_SEC: "60"
+      DNP3_EVENT_BASELINE_INTERVAL_SEC: "30"
+      # EXPLICIT OLMAK ZORUNDA: verilmezse kod varsayilani 0 ve factory
+      # scan'i POLL'a dusurur (poll=1 -> scan=1s). 401 cihazli sahada
+      # olculdu: saniyede 401 DNP3 istegi, CPU cihaz sayisiyla orantili.
+      DNP3_EVENT_SCAN_INTERVAL_SEC: "5"
       # opendnp3 IO thread sayisi: 0 = otomatik (min 4). 300 cihazda 8-12.
       DNP3_MANAGER_THREADS: "0"
       # Outstation saat senkronizasyonu (RTC drift + guc kesintisi sonrasi reset).
