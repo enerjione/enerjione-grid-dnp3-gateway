@@ -1,10 +1,9 @@
 {
   "contract_version": 1,
-  "gateway_release": "1.10.0",
-  "gateway_source_sha": "842bfd321993e4199b77aa56873ae2a7ed63b665",
+  "gateway_release": "1.11.0",
+  "gateway_source_sha": "db833e20d05a07c86f2f5768bc8570954add3a97",
   "owner": "enerjione/enerjione-grid-dnp3-gateway",
   "description": "Bir uretim DNP3 gateway kurulumunun TASIMASI GEREKEN deployment sozlesmesi. Gateway repo'su sahibidir; Grid repo'su tam kopyasini vendor eder ve CI'da karsilastirir. Runtime'da iki repo birbirine baglanmaz.",
-
   "environment_defaults": {
     "GATEWAY_MODE": "dnp3",
     "BACKEND_API_VERIFY_SSL": "true",
@@ -25,7 +24,6 @@
     "LOG_FORMAT": "json",
     "SHOW_GATEWAY_TOKEN_ON_START": "false"
   },
-
   "value_rationale": {
     "DNP3_LIBRARY": "yadnp3 = opendnp3 tabanli, Group 110 destekli, OpenDNP3 outstation'lariyla uyumlu. dnp3py LEGACY: Group 110 yok, TCP RST/transport segment tutarsizligi var. config.py varsayilani da yadnp3; uretim yolunda dnp3py'ye SESSIZCE dusmek kabul edilemez.",
     "TELEMETRY_PUBLISHER": "nats = JetStream'e dogrudan yayin (subject e1.telemetry.raw.<code>), backend'e ugramaz. http yalnizca bilincli rollback icindir ve her olcumu backend HTTP + Postgres outbox zincirinden gecirir.",
@@ -36,7 +34,6 @@
     "DNP3_MANAGER_THREADS": "0 = otomatik (min 4). Kod varsayilaniyla ayni; sozlesmede EXPLICIT tutulur ki kutuphane varsayilani degisirse uretim davranisi sessizce kaymasin.",
     "DNP3_TIME_SYNC": "lan. Outstation RTC drift'i ve guc kesintisi sonrasi reset icin. Kod varsayilaniyla ayni; ayni gerekceyle explicit."
   },
-
   "required_environment": [
     "GATEWAY_CODE",
     "GATEWAY_TOKEN",
@@ -46,28 +43,40 @@
     "NATS_URL",
     "INSTALL_MODE"
   ],
-
   "forbidden_environment": {
     "DNP3_RESPONSE_TIMEOUT_SEC": "YALNIZCA legacy dnp3py dalinda gecerli. Aktif yadnp3 adapter'i yok sayar ve baslangicta `dnp3_settings_ignored_by_yadnp3` uyarisi basar. Uretim ciktisinda bulunmasi operatoru 'ayari degistirdim ama bir sey olmadi' cikmazina sokar.",
     "DNP3_READ_STRATEGY": "Ayni gerekce: yadnp3 dalinda etkisiz. Legacy dnp3py FALLBACK KODU SILINMEZ; yalnizca uretim deployment ciktisi sahte knob uretmez."
   },
-
   "docker_runtime": {
     "restart": "unless-stopped",
     "stop_grace_period": "30s",
-    "ulimits": { "nofile": { "soft": 65536, "hard": 65536 } },
-    "logging": { "driver": "json-file", "options": { "max-size": "10m", "max-file": "5" } },
+    "ulimits": {
+      "nofile": {
+        "soft": 65536,
+        "hard": 65536
+      }
+    },
+    "logging": {
+      "driver": "json-file",
+      "options": {
+        "max-size": "10m",
+        "max-file": "5"
+      }
+    },
     "state_volume_mount": "/app/.gateway_state",
     "health_container_port": 8020,
-    "healthcheck": { "interval": "30s", "timeout": "5s", "retries": 3, "start_period": "20s" }
+    "healthcheck": {
+      "interval": "30s",
+      "timeout": "5s",
+      "retries": 3,
+      "start_period": "20s"
+    }
   },
-
   "docker_runtime_rationale": {
     "stop_grace_period": "30s. `docker stop` varsayilani 10sn ve gateway'in tipik kapanisi (<8sn) buna ANCAK sigar. Pencere yetmezse proses SIGKILL edilir ve in-flight bir CROB'un sonucu komut defterine yazilamaz; o komut sonraki acilista backend'e 'unknown' bildirilir. Komut semantigini DEGISTIRMEZ, yalnizca kapanis butcesidir.",
     "ulimits": "Her DNP3 cihazi bir TCP soketi tutar; 400 cihazli olcumde 420 fd acikti (2026-08-04). Docker varsayilan soft limiti 1024. Limit dolunca ariza 'cihaz kopuk' gibi gorunur ve hicbir sayacta yazmaz.",
     "state_volume_mount": "instance_id + komut defteri + outbox burada durur. Volume kaybolursa at-most-once garanti yerine duplicate mesaj gelir ve komut defteri epoch'u sifirlanir."
   },
-
   "intentional_mode_differences": {
     "INSTALL_MODE": {
       "remote": "remote",
@@ -106,6 +115,15 @@
     },
     "host_health_port": {
       "why": "Ayni host'ta N gateway kosabildigi icin host tarafi port her instance'ta farklidir. Container ici sabit 8020."
+    }
+  },
+  "transition_environment": {
+    "GATEWAY_COMMAND_DELIVERY_TOKEN": {
+      "status": "optional_until_backend_f5a",
+      "default_when_absent": "bos -> komut uclari GATEWAY_TOKEN kullanir (v1.10 davranisi)",
+      "why": "Kuyruklanmis komut duzlemi icin ayri credential (F5B, gateway 1.11.0). Dolu ise `/pending` yaniti YALNIZCA bu anahtarla dogrulanir.",
+      "ordering_constraint": "BACKEND F5A SAHAYA CIKMADAN PROVISION EDILMEZ. Erken verilirse gateway `/pending` yanitini backend'in bilmedigi bir anahtarla dogrular; F4B fail-closed oldugu icin komut duzlemi DURUR. Grid render yollari bu degiskeni F5A tamamlanana kadar URETMEMELIDIR.",
+      "production_guard": "Gateway, production'da bu degerin GATEWAY_TOKEN veya GATEWAY_COMMAND_TOKEN ile ayni olmasini reddeder."
     }
   }
 }
