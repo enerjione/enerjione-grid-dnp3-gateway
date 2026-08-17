@@ -75,7 +75,7 @@ KAYNAKLAR = {"compose.template.yml": _compose_env, ".env.template": _env_dosyasi
 
 @pytest.mark.parametrize("kaynak", sorted(KAYNAKLAR))
 @pytest.mark.parametrize("anahtar", sorted(VARSAYILANLAR))
-def test_T02_T03_sablonlar_sozlesme_degerini_tasiyor(kaynak: str, anahtar: str):
+def test_t02_t03_sablonlar_sozlesme_degerini_tasiyor(kaynak: str, anahtar: str):
     env = KAYNAKLAR[kaynak]()
     beklenen = VARSAYILANLAR[anahtar]
     assert anahtar in env, (
@@ -94,7 +94,7 @@ def test_yasakli_legacy_anahtarlar_yok(kaynak: str):
         assert anahtar not in env, f"`{kaynak}` yasakli `{anahtar}` uretiyor. {neden}"
 
 
-def test_scan_araligi_EXPLICIT():
+def test_scan_araligi_explicit():
     """Sozlesmenin en kolay gozden kacan maddesi.
 
     `dnp3_event_scan_interval_sec` varsayilani 0'dir ve factory
