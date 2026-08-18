@@ -1068,6 +1068,11 @@ def run(current_settings: Settings | None = None) -> int:
         # Backend bu endpoint'leri Bearer token ile cagirir.
         refresh_token=refresh_endpoint_token,
         command_token=command_endpoint_token,
+        # F7: `/operate` de kuyruk yoluyla AYNI TTL sozlesmesini kullanir.
+        # Ayri bir esik verilseydi ayni komut bir kanaldan gecip digerinden
+        # `expired` donebilirdi.
+        command_max_age_sec=cfg.command_max_age_sec,
+        command_clock_skew_tolerance_sec=cfg.command_clock_skew_tolerance_sec,
         # Trusted reverse-proxy CIDR'leri — `X-Forwarded-For` sadece bu
         # subnet'lerden gelen istekler icin okunur. Bos ise XFF yok sayilir
         # (saldirgan rate-limit bypass yapamaz).

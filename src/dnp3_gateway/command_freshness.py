@@ -138,7 +138,9 @@ def parse_command_timestamp(raw: str | None) -> datetime | None:
 
 
 def validate_command_freshness(
-    created_at: str | None,
+    # `object`: `/operate` HAM JSON degerini gecirir (bkz. F6 felsefesi).
+    # `str | None` yazmak, tip kontrolu yapilmis izlenimi verirdi.
+    created_at: object,
     *,
     now: datetime,
     max_age_sec: float,
@@ -159,6 +161,15 @@ def validate_command_freshness(
     damga = parse_command_timestamp(created_at)
 
     if damga is None:
+        # `created_at` METIN OLMAYABILIR: `/operate` govdesi ham JSON tasir,
+        # yani sayi/liste/sozluk gelebilir. Metin olmayan ama None de olmayan
+        # her deger "GONDERILDI ama okunamadi" sayilir -> fail-closed.
+        # (Eskiden asagidaki `.strip()` bu durumda AttributeError atiyordu.)
+        if created_at is not None and not isinstance(created_at, str):
+            return FreshnessResult(
+                FreshnessReason.TIMESTAMP_INVALID,
+                f"created_at metin olmali, {type(created_at).__name__} geldi",
+            )
         ham = (created_at or "").strip()
         if ham:
             # Deger GONDERILDI ama okunamadi (bozuk ya da timezone'suz).

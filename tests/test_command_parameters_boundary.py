@@ -41,6 +41,7 @@ uretir ki backend sebebi ogrenebilsin — `created_at` (F3) ile ayni felsefe.
 
 from __future__ import annotations
 
+import itertools
 import json
 from datetime import datetime, timedelta, timezone
 from http.client import HTTPConnection
@@ -350,9 +351,29 @@ def test_kuyruk_f3_tazelik_hala_once_calisir() -> None:
 # ==========================================================================
 
 
+class _Defter:
+    """F7 sonrasi `/operate` defteri ZORUNLU; testler gercek bir defter ister."""
+
+    def __init__(self) -> None:
+        self.dispatched: set[int] = set()
+        self.results: dict[int, dict[str, Any]] = {}
+
+    def start_dispatch(self, command_id: int) -> bool:
+        if command_id in self.dispatched:
+            return False
+        self.dispatched.add(command_id)
+        return True
+
+    def record_result(self, result: dict[str, Any]) -> None:
+        self.results[int(result["id"])] = result
+
+    def pending_results(self) -> list[dict[str, Any]]:
+        return list(self.results.values())
+
+
 @pytest.fixture
 def sunucu():
-    tutucu: dict[str, Any] = {"reader": None}
+    tutucu: dict[str, Any] = {"reader": None, "ledger": _Defter()}
     st = _state()
     hazir = Event()
     hazir.set()
@@ -366,7 +387,7 @@ def sunucu():
         instance_id="test",
         app_environment="development",
         reader_provider=lambda: tutucu["reader"],
-        ledger_provider=lambda: None,
+        ledger_provider=lambda: tutucu["ledger"],
         command_token=_TOKEN,
     )
     try:
@@ -397,8 +418,23 @@ def _post_operate(port: int, govde: dict[str, Any]) -> tuple[int, dict[str, Any]
         conn.close()
 
 
+_KIMLIK = itertools.count(1000)
+
+
 def _operate_govdesi(**alanlar: Any) -> dict[str, Any]:
-    g: dict[str, Any] = {"device_code": "SN2_0", "command": "reset_all_fcis", "index": 7}
+    """F7 sonrasi `command_id` ve `created_at` ZORUNLU.
+
+    `command_id` her cagri icin benzersiz uretilir: sabit olsaydi ayni
+    parametrize turundeki ikinci istek defter tarafindan duplicate sayilir ve
+    test F6'yi degil idempotency'yi olcmus olurdu.
+    """
+    g: dict[str, Any] = {
+        "device_code": "SN2_0",
+        "command": "reset_all_fcis",
+        "index": 7,
+        "command_id": next(_KIMLIK),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
     g.update(alanlar)
     return g
 
