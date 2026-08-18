@@ -2,6 +2,78 @@
 
 Semver'a gore tutulur. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.11.2] - 2026-08-18
+
+`POST /operate` sertlestirildi (F7-G). Kuyruk yolunda zaten var olan
+korumalar bu uca da getirildi; YENI bir komut-duzlemi katmani EKLENMEDI.
+
+**URETIM ETKISI YOK.** Bu uc varsayilan kurulumda ZATEN KAPALI:
+`GATEWAY_COMMAND_TOKEN` ne `required_environment`'ta ne de uretim
+sablonlarindadir, tanimsiz oldugunda endpoint 503 doner. Backend'de bu ucu
+cagiran kod da yoktur (`enerjione-grid` deposunda dogrulandi). Yani
+sertlestirme ILK KULLANICISI CIKMADAN once konuyor.
+
+### Fixed
+- **TTL YOKTU.** `created_at` okunmuyordu bile: 2020 tarihli damgayla
+  gonderilen istek kabul edilip CROB uretiyordu (sahte reader ile olculdu).
+  Yakalanmis bir istek SURESIZ gecerliydi. Kuyruk yolu ayni anda F3C ile
+  strict TTL uyguluyordu — ayni fiziksel manevra, iki farkli kural.
+- **TEKRAR KORUMASI OPSIYONELDI.** `command_id` zorunlu degildi; ayni istek
+  ard arda uc kez gonderildiginde UC FIZIKSEL CROB uretiliyordu. Kod bunu
+  biliyor ve her seferinde "istek tekrarlanirsa CROB DA TEKRARLANIR" uyarisi
+  basiyordu — ama engellemiyordu.
+- **DEFTER OPSIYONELDI.** `CommandLedger` yapilandirilmamissa komut yine
+  gonderiliyor, yalnizca `operate_ledger_missing` loglaniyordu: tekrar-onleme
+  garantisi olmadan fiziksel manevra.
+- **GOVDE TIPI DOGRULANMIYORDU.** `[1,2,3]` gibi gecerli-JSON ama
+  nesne-olmayan bir govde yakalanmamis `AttributeError` uretiyordu; sunucu
+  istege HIC yanit vermeden baglantiyi kapatiyordu.
+- `validate_command_freshness`, `created_at` metin olmadiginda (JSON sayisi)
+  `AttributeError` atiyordu. Kuyruk yolu bunu hic gormedi cunku parse katmani
+  degeri `str | None`'a indirger; `/operate` ham degeri tasidigi icin ortaya
+  cikti. Artik fail-closed reddediliyor.
+- Erken 401/503 yanitlarinda istek govdesi OKUNMADAN baglanti kapaniyordu;
+  istemci yaniti goremeyip `ConnectionAborted` aliyordu. Guvenlik acisindan
+  en kotu belirsizlik: cagiran taraf "yetkisiz" ile "sunucu coktu, komut
+  gitmis olabilir mi" ayrimini yapamiyordu. Govde artik (64 KiB sinirla)
+  bosaltiliyor.
+
+### Changed
+- `/operate` kontrol sirasi kaynakta kilitlendi ve testle korunuyor:
+
+      auth -> JSON/tip -> zorunlu alanlar -> F1/F2 -> tazelik
+           -> command_id + defter rezervasyonu -> F6 -> fiziksel calistirma
+
+  Rezervasyonun yetkilendirme ve tazelikten SONRA olmasi kritik: reddedilen
+  istek `command_id`yi TUKETMEZ, yoksa operator duzeltilmis komutu ayni id
+  ile gonderdiginde defter onu "zaten islendi" sayip sessizce yutardi.
+- `command_id` STRICT tamsayi (bool degil). `int(...)` ile donusturulmez;
+  defterin MEVCUT tamsayi sozlesmesi kullanildi, aralik kisiti UYDURULMADI.
+- `/operate` tazeligi kuyruk yoluyla AYNI ayarlari kullanir
+  (`COMMAND_MAX_AGE_SEC`, `COMMAND_CLOCK_SKEW_TOLERANCE_SEC`). Ayri bir esik
+  tanimlanmadi: iki kanalin karari ayrisirsa hangi komutun neden reddedildigi
+  sahada aciklanamaz.
+- `/operate` icin `require_timestamp` SABIT `True`. `COMMAND_REQUIRE_TIMESTAMP`
+  bayragi `created_at` gondermeyen ESKI bir backend'e kontrollu rollback
+  icindir ve yalnizca kuyruk yolunu ilgilendirir.
+
+### Unchanged
+- Ayrilmis `/operate` credential'i, F1/F2 yetkilendirmesi, F6 parametre
+  koruması, rate limit, body size limiti, duplicate `pending`/kayitli-sonuc
+  semantigi ve mevcut log/audit davranisi AYNEN korundu.
+- Yeni ayar/env degiskeni yok. Yeni credential, request imzalama, TLS/mTLS,
+  generic command framework, pulse/timing politikasi veya CROB soyutlamasi
+  EKLENMEDI.
+- Kuyruk (`/pending`) yolu ve backend DEGISTIRILMEDI.
+
+### Added
+- `tests/test_operate_hardening.py` — 58 test: nesne-olmayan govde matrisi,
+  `command_id` tip matrisi, defter yok/None/patlayan, ayni istek uc kez ->
+  TEK fiziksel calistirma, damga yok/bozuk/timezone'suz/bayat/asiri-gelecek,
+  F1/F2 ve tazelik reddinin `command_id`yi TUKETMEDIGI, F6 reddinde sifir
+  fiziksel cagri, credential ayrimi (GATEWAY_TOKEN ve F5 teslim tokeni
+  `/operate` icin GECERSIZ) ve kontrol sirasi kilidi.
+
 ## [1.11.1] - 2026-08-17
 
 Fiziksel DNP3 komut parametreleri artik cihaza gitmeden once dogrulaniyor

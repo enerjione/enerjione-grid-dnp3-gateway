@@ -18,6 +18,7 @@ sahaya cikmasina yetmisti:
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from http.client import HTTPConnection
 from threading import Event
 from typing import Any
@@ -112,9 +113,23 @@ def sunucu():
         server.server_close()
 
 
+def _taze() -> str:
+    """Simdi (UTC, timezone-aware) — F7 sonrasi `/operate` damga ZORUNLU."""
+    return datetime.now(timezone.utc).isoformat()
+
+
 def _operate(port: int, govde: dict[str, Any], *, token: str = _TOKEN) -> tuple[int, dict[str, Any]]:
+    """`created_at` VERILMEDIYSE taze bir damga eklenir.
+
+    F7 ile damga zorunlu oldu. Yardimciya konmasinin sebebi: asagidaki
+    testlerin her biri BASKA bir seyi olcuyor (duplicate bastirma, F1/F2 reddi,
+    404, ...) ve damgayi her govdeye elle yazmak o niyeti gurultuye bogardi.
+    Tazeligin KENDISI ayrica ve acikca test ediliyor (bkz. F7 bolumu).
+    """
     conn = HTTPConnection("127.0.0.1", port, timeout=5)
     try:
+        if "created_at" not in govde:
+            govde = {**govde, "created_at": _taze()}
         veri = json.dumps(govde).encode("utf-8")
         conn.request(
             "POST",
@@ -246,8 +261,14 @@ def test_defter_erisilemezken_komut_gonderilmez(sunucu) -> None:
     assert govde["status"] == "rejected"
 
 
-def test_command_id_yoksa_komut_yine_calisir(sunucu) -> None:
-    """Eski backend uyumu: anahtar yoksa komut engellenmez (yalnizca uyarilir)."""
+def test_command_id_yoksa_komut_calismaz(sunucu) -> None:
+    """F7: idempotency anahtari ZORUNLU (eskiden yalnizca uyarilirdi).
+
+    Eski davranis "anahtar yoksa yine calistir, sadece logla" idi. Olculen
+    sonucu: ayni istek uc kez gonderildiginde UC FIZIKSEL CROB. Backend'in
+    HTTP timeout'u CROB suresinden kisa oldugu icin retry olagan; bu yuzden
+    anahtarsiz istek artik en bastan reddedilir.
+    """
     tutucu, port = sunucu
     reader = _FakeReader()
     tutucu["reader"] = reader
@@ -255,9 +276,9 @@ def test_command_id_yoksa_komut_yine_calisir(sunucu) -> None:
 
     status, govde = _operate(port, {"device_code": "DEV-1", "command": "start_csv_upload", "index": 3})
 
-    assert status == 200
-    assert len(reader.calls) == 1
-    assert govde["ok"] is True
+    assert status == 400
+    assert govde["status"] == "command_id_missing"
+    assert reader.calls == [], "anahtarsiz istek CROB uretti"
 
 
 # --------------------------------------------------------------------------

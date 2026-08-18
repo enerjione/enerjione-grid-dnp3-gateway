@@ -25,12 +25,14 @@ import json
 import logging
 import time
 from collections import defaultdict, deque
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from threading import Event, Lock, Thread
 from typing import Any
 
 from dnp3_gateway import __version__
 from dnp3_gateway.command_authorization import authorize_output_command
+from dnp3_gateway.command_freshness import validate_command_freshness
 from dnp3_gateway.command_parameters import raw_command_parameter
 from dnp3_gateway.state import GatewayState
 
@@ -486,6 +488,12 @@ def _make_handler(
     ledger_provider: Any = None,
     refresh_token: str = "",
     command_token: str = "",
+    #: `/operate` TTL sozlesmesi — kuyruk yoluyla AYNI ayarlar
+    #: (`COMMAND_MAX_AGE_SEC`, `COMMAND_CLOCK_SKEW_TOLERANCE_SEC`).
+    #: Ayri bir esik TANIMLANMADI: iki kanalin tazelik karari ayrisirsa
+    #: hangi komutun neden reddedildigi sahada aciklanamaz hale gelir.
+    command_max_age_sec: float = 120.0,
+    command_clock_skew_tolerance_sec: float = 5.0,
     info_metrics_auth_required: bool = True,
     health_rate_limiter: _SlidingWindowRateLimiter | None = None,
     refresh_rate_limiter: _SlidingWindowRateLimiter | None = None,
@@ -566,6 +574,34 @@ def _make_handler(
             )
             return False
 
+        def _govdeyi_bosalt(self) -> None:
+            """Erken hata yanitindan ONCE istek govdesini oku ve at.
+
+            NEDEN: govde okunmadan yanit yazilip baglanti kapatilirsa isletim
+            sistemi okunmamis veri yuzunden RST gonderebilir; istemci 401/503
+            YANITINI HIC GORMEZ, `ConnectionAborted` alir. Sonuc, guvenlik
+            acisindan en kotu belirsizlik: cagiran taraf "yetkisiz" ile
+            "sunucu coktu, komut gitmis olabilir mi" arasinda ayrim yapamaz.
+
+            Yuk altinda olculdu: tam test suite'inde ~4 kosumda 1 kez, hep
+            govde tasiyan istegin erken reddedildigi yollarda.
+
+            Okuma 64 KiB ile sinirli — `Content-Length` saldirgan tarafindan
+            belirlenir ve sinirsiz okumak reddedilen bir istegi kaynak
+            tuketimine cevirirdi. Ustunu okumayiz; oradan sonrasi zaten
+            baglanti kapanisina kalir.
+            """
+            try:
+                uzunluk = int(self.headers.get("Content-Length", "0") or "0")
+            except ValueError:
+                return
+            kalan = min(max(uzunluk, 0), 65536)
+            while kalan > 0:
+                parca = self.rfile.read(min(kalan, 8192))
+                if not parca:
+                    break
+                kalan -= len(parca)
+
         def _check_bearer_auth(self, expected_token: str = refresh_token) -> bool:
             """Returns True if request carries valid Bearer token.
             Otherwise sends 401/503 response and returns False.
@@ -575,6 +611,7 @@ def _make_handler(
             endpoint'i command_token gecer. Content-Length=0 HTTP/1.1
             framing icin gerekli."""
             if not expected_token:
+                self._govdeyi_bosalt()
                 self.send_response(503)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
@@ -582,6 +619,7 @@ def _make_handler(
             auth = self.headers.get("Authorization", "")
             expected = f"Bearer {expected_token}"
             if not hmac.compare_digest(auth.encode("utf-8"), expected.encode("utf-8")):
+                self._govdeyi_bosalt()
                 self.send_response(401)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
@@ -756,6 +794,24 @@ def _make_handler(
             except (ValueError, UnicodeDecodeError):
                 self._respond_json({"ok": False, "detail": "body JSON parse edilemedi"}, status_code=400)
                 return
+            # F7: GOVDE NESNE OLMALI.
+            #
+            # Eskiden tip kontrolu yoktu ve `[1,2,3]` gibi gecerli-JSON ama
+            # nesne-olmayan bir govde asagidaki `payload.get(...)` satirinda
+            # yakalanmamis `AttributeError` uretiyordu: sunucu istege HIC
+            # yanit vermeden baglantiyi kapatiyordu. Komut gitmiyordu (yani
+            # fail-closed) ama cagiran taraf "sunucu coktu mu, komut gitti mi"
+            # sorusunu ayirt edemiyordu.
+            if not isinstance(payload, dict):
+                self._respond_json(
+                    {
+                        "ok": False,
+                        "status": "invalid_body",
+                        "detail": f"body JSON nesnesi olmali, {type(payload).__name__} geldi",
+                    },
+                    status_code=400,
+                )
+                return
             device_code = str(payload.get("device_code", "")).strip()
             if not device_code or "index" not in payload:
                 self._respond_json(
@@ -812,117 +868,199 @@ def _make_handler(
                 return
 
             op_type = str(payload.get("op_type", "latch_on"))
-            # ---- IDEMPOTENCY ------------------------------------------------
-            # Bu endpoint CommandLedger'i TAMAMEN ATLIYORDU. Backend'in HTTP
-            # timeout'u (~5sn) cihazin CROB suresinden (SN2'de 1-10sn) kisa
-            # oldugu icin retry cok olasi; gateway ikinci istegi YENI bir komut
-            # sanip AYNI binary output'a IKINCI KEZ CROB gonderiyordu. Fiziksel
-            # manevrada bu kabul edilemez. Ayrica pull kanaliyla (komut-poll)
-            # ayni komut es zamanli gelirse cift surme riski vardi.
-            ledger = ledger_provider() if ledger_provider else None
-            command_id = payload.get("command_id")
-            ledger_key: int | None = None
-            if command_id is not None and ledger is not None:
-                try:
-                    ledger_key = int(command_id)
-                except (TypeError, ValueError):
-                    self._respond_json(
-                        {"ok": False, "detail": "command_id tamsayi olmali"},
-                        status_code=400,
-                    )
-                    return
-                try:
-                    yeni_kayit = bool(ledger.start_dispatch(ledger_key))
-                except Exception:  # noqa: BLE001
-                    # DEFTER ERISILEMIYOR — komutu CALISTIRMA.
-                    #
-                    # Eski davranis fail-open idi: `ledger_key = None` ile
-                    # devam edip CROB'u gonderiyordu. Iki sessiz sonucu vardi:
-                    #   1. Tekrar-onleme yok — backend'in HTTP timeout retry'i
-                    #      (cok olasi: timeout ~5sn, CROB 1-10sn) AYNI kesiciyi
-                    #      ikinci kez surerdi.
-                    #   2. Sonuc kaydi yok — komut calissa bile backend sonucu
-                    #      hicbir zaman ogrenemezdi.
-                    # Fiziksel manevrada "belki iki kez surdum" kabul edilemez;
-                    # "suremedim, sebebi bu" kabul edilebilir ve gorunurdur.
-                    logger.exception(
-                        "operate_ledger_unavailable device=%s command_id=%s — komut REDDEDILDI "
-                        "(tekrar-onleme garantisi verilemiyor)",
-                        device_code,
-                        ledger_key,
-                    )
-                    self._respond_json(
-                        {
-                            "ok": False,
-                            "status": "rejected",
-                            "detail": (
-                                "komut defteri erisilemiyor; tekrar-onleme garanti "
-                                "edilemedigi icin komut gonderilmedi"
-                            ),
-                        },
-                        status_code=503,
-                    )
-                    return
 
-                if not yeni_kayit:
-                    # Bu komut daha once gonderilmis. TEKRAR GONDERME;
-                    # varsa kayitli sonucu don.
-                    prior = _ledger_result_for(ledger, ledger_key)
-                    logger.info(
-                        "operate_duplicate_suppressed device=%s index=%s command_id=%s "
-                        "kayitli_sonuc=%s — komut daha once gonderildi, CROB TEKRARLANMADI",
-                        device_code,
-                        index,
-                        ledger_key,
-                        "var" if prior else "yok",
-                    )
-                    # SONUCU BILMIYORSAK `ok:false` DEMEK YANLIS.
-                    #
-                    # Kayitli sonuc iki durumda bulunmaz: (a) ilk deneme HALA
-                    # sururken retry geldi, (b) sonuc backend'e teslim edilip
-                    # kayittan dusuruldu. Ikisinde de komut KABUL EDILMISTIR.
-                    # `ok:false` donmek cagirana "basarisiz" dedirtir; operator
-                    # YENI bir command_id ile tekrar dener ve kesici GERCEKTEN
-                    # iki kez surulur — tam da bu defterin onlemek icin var
-                    # oldugu sey.
-                    #
-                    # Bilinmeyen sonuc `status:"pending"` ile bildirilir;
-                    # cagiran taraf sonucu bekler, yeniden denemez.
-                    govde: dict[str, Any] = {
-                        "duplicate": True,
-                        "detail": "komut daha once islendi; CROB tekrarlanmadi",
-                        "result": prior,
-                    }
-                    if prior is not None:
-                        govde["ok"] = bool(prior.get("ok"))
-                        govde["status"] = str(prior.get("status", "unknown"))
-                    else:
-                        govde["ok"] = None
-                        govde["status"] = "pending"
-                        govde["detail"] = (
-                            "komut daha once kabul edildi; sonucu henuz bilinmiyor "
-                            "(YENI bir command_id ile TEKRAR DENEMEYIN)"
-                        )
-                    self._respond_json(govde, status_code=200)
-                    return
-            elif command_id is None:
-                # Idempotency anahtari YOK. Komut yine de calisir (backend eski
-                # surum olabilir) ama retry'da cift surme riski vardir; bu
-                # sessiz kalmamali.
+            # ---- F3 TAZELIK: F1/F2'DEN SONRA, LEDGER'DAN ONCE ---------------
+            #
+            # Bu endpoint'te TTL HIC YOKTU: `created_at` okunmuyordu bile, yani
+            # yakalanmis bir istek SURESIZ gecerliydi. Kuyruk yolu F3C ile
+            # strict TTL uygularken AYNI fiziksel manevra buradan zaman siniri
+            # olmadan tetiklenebiliyordu.
+            #
+            # YENI FRESHNESS KODU YAZILMADI — kuyruk yoluyla AYNI fonksiyon
+            # cagriliyor ki iki kanalin karari ayrisamasin.
+            #
+            # `require_timestamp` BURADA SABIT True: o bayrak
+            # (`COMMAND_REQUIRE_TIMESTAMP`) `created_at` gondermeyen ESKI bir
+            # backend'e kontrollu rollback icindir ve yalnizca KUYRUK yolunu
+            # ilgilendirir. Bu endpoint'in canli cagirani yok, dolayisiyla bir
+            # gecis donemi de yok: damgasiz istek en bastan reddedilir.
+            #
+            # `delivery_not_after` GECIRILMEZ: o, F3C teslim kirasina aittir ve
+            # yalnizca kuyruk yolunda uretilir.
+            #
+            # LEDGER REZERVASYONUNDAN ONCE: bayat bir istek command_id'yi
+            # TUKETMEMELI — operator ayni id ile taze bir istek gonderebilmeli.
+            tazelik = validate_command_freshness(
+                payload.get("created_at"),
+                now=datetime.now(timezone.utc),
+                max_age_sec=command_max_age_sec,
+                require_timestamp=True,
+                clock_skew_tolerance_sec=command_clock_skew_tolerance_sec,
+            )
+            if not tazelik.fresh:
                 logger.warning(
-                    "operate_without_command_id device=%s index=%s — idempotency "
-                    "anahtari gonderilmedi; istek tekrarlanirsa CROB DA TEKRARLANIR",
+                    "operate_freshness_rejected gateway=%s device=%s command_id=%s "
+                    "index=%s created_at=%r reason=%s detail=%s — CROB GONDERILMEDI, "
+                    "command_id TUKETILMEDI",
+                    gateway_code,
                     device_code,
+                    payload.get("command_id"),
                     index,
+                    payload.get("created_at"),
+                    tazelik.status,
+                    tazelik.detail,
                 )
-            else:
-                # command_id verilmis ama defter hic yok (provider bagli degil).
+                self._respond_json(
+                    {"ok": False, "status": tazelik.status, "detail": tazelik.detail},
+                    status_code=400,
+                )
+                return
+
+            # ---- IDEMPOTENCY: command_id VE defter ZORUNLU ------------------
+            #
+            # Bu endpoint CommandLedger'i once TAMAMEN atliyordu, sonra
+            # OPSIYONEL kullaniyordu: `command_id` yoksa komut yine calisiyor,
+            # yalnizca bir uyari dusuyordu. Olculen sonuc: ayni istek ard arda
+            # uc kez gonderildiginde UC FIZIKSEL CROB uretiliyordu.
+            #
+            # Backend'in HTTP timeout'u (~5sn) cihazin CROB suresinden (SN2'de
+            # 1-10sn) kisa oldugu icin retry cok olasi. "Belki iki kez surdum"
+            # fiziksel manevrada kabul edilemez; "suremedim, sebebi bu" kabul
+            # edilebilir ve gorunurdur. Ikisi de artik ZORUNLU.
+            command_id = payload.get("command_id")
+            if command_id is None:
+                self._respond_json(
+                    {
+                        "ok": False,
+                        "status": "command_id_missing",
+                        "detail": (
+                            "command_id zorunlu; tekrar-onleme anahtari olmadan komut "
+                            "gonderilmez (istek tekrarlanirsa CROB da tekrarlanirdi)"
+                        ),
+                    },
+                    status_code=400,
+                )
+                return
+            # STRICT: `int(...)` ile DONUSTURULMEZ. `True` bir `int` alt sinifidir
+            # ve `"1"` sessizce 1 olurdu; iki farkli cagiran deftere ayri anahtar
+            # yazdigini sanip ayni kesiciyi iki kez surebilirdi. Defterin mevcut
+            # sozlesmesi tamsayidir (bkz. `CommandLedger.start_dispatch`).
+            if not isinstance(command_id, int) or isinstance(command_id, bool):
+                self._respond_json(
+                    {
+                        "ok": False,
+                        "status": "command_id_invalid",
+                        "detail": (
+                            f"command_id tamsayi olmali (bool degil), {type(command_id).__name__} geldi"
+                        ),
+                    },
+                    status_code=400,
+                )
+                return
+            ledger_key: int = command_id
+
+            # DEFTER YOKSA KOMUT YOK. Eskiden bu durum yalnizca loglanip komut
+            # GONDERILIYORDU: tekrar-onleme garantisi olmadan fiziksel manevra.
+            try:
+                ledger = ledger_provider() if ledger_provider else None
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "operate_ledger_provider_failed device=%s command_id=%s",
+                    device_code,
+                    ledger_key,
+                )
+                ledger = None
+            if ledger is None:
                 logger.error(
                     "operate_ledger_missing device=%s command_id=%s — komut defteri "
-                    "yapilandirilmamis; tekrar-onleme YOK",
+                    "yapilandirilmamis; tekrar-onleme garanti EDILEMEZ, komut REDDEDILDI",
                     device_code,
-                    command_id,
+                    ledger_key,
                 )
+                self._respond_json(
+                    {
+                        "ok": False,
+                        "status": "rejected",
+                        "detail": (
+                            "komut defteri yapilandirilmamis; tekrar-onleme garanti "
+                            "edilemedigi icin komut gonderilmedi"
+                        ),
+                    },
+                    status_code=503,
+                )
+                return
+
+            try:
+                yeni_kayit = bool(ledger.start_dispatch(ledger_key))
+            except Exception:  # noqa: BLE001
+                # DEFTER ERISILEMIYOR — komutu CALISTIRMA.
+                #
+                # Eski davranis fail-open idi: `ledger_key = None` ile devam
+                # edip CROB'u gonderiyordu. Iki sessiz sonucu vardi:
+                #   1. Tekrar-onleme yok — backend'in HTTP timeout retry'i
+                #      (cok olasi: timeout ~5sn, CROB 1-10sn) AYNI kesiciyi
+                #      ikinci kez surerdi.
+                #   2. Sonuc kaydi yok — komut calissa bile backend sonucu
+                #      hicbir zaman ogrenemezdi.
+                logger.exception(
+                    "operate_ledger_unavailable device=%s command_id=%s — komut REDDEDILDI "
+                    "(tekrar-onleme garantisi verilemiyor)",
+                    device_code,
+                    ledger_key,
+                )
+                self._respond_json(
+                    {
+                        "ok": False,
+                        "status": "rejected",
+                        "detail": (
+                            "komut defteri erisilemiyor; tekrar-onleme garanti "
+                            "edilemedigi icin komut gonderilmedi"
+                        ),
+                    },
+                    status_code=503,
+                )
+                return
+
+            if not yeni_kayit:
+                # Bu komut daha once gonderilmis. TEKRAR GONDERME; varsa
+                # kayitli sonucu don.
+                prior = _ledger_result_for(ledger, ledger_key)
+                logger.info(
+                    "operate_duplicate_suppressed device=%s index=%s command_id=%s "
+                    "kayitli_sonuc=%s — komut daha once gonderildi, CROB TEKRARLANMADI",
+                    device_code,
+                    index,
+                    ledger_key,
+                    "var" if prior else "yok",
+                )
+                # SONUCU BILMIYORSAK `ok:false` DEMEK YANLIS.
+                #
+                # Kayitli sonuc iki durumda bulunmaz: (a) ilk deneme HALA
+                # sururken retry geldi, (b) sonuc backend'e teslim edilip
+                # kayittan dusuruldu. Ikisinde de komut KABUL EDILMISTIR.
+                # `ok:false` donmek cagirana "basarisiz" dedirtir; operator
+                # YENI bir command_id ile tekrar dener ve kesici GERCEKTEN iki
+                # kez surulur — tam da bu defterin onlemek icin var oldugu sey.
+                #
+                # Bilinmeyen sonuc `status:"pending"` ile bildirilir; cagiran
+                # taraf sonucu bekler, yeniden denemez.
+                govde: dict[str, Any] = {
+                    "duplicate": True,
+                    "detail": "komut daha once islendi; CROB tekrarlanmadi",
+                    "result": prior,
+                }
+                if prior is not None:
+                    govde["ok"] = bool(prior.get("ok"))
+                    govde["status"] = str(prior.get("status", "unknown"))
+                else:
+                    govde["ok"] = None
+                    govde["status"] = "pending"
+                    govde["detail"] = (
+                        "komut daha once kabul edildi; sonucu henuz bilinmiyor "
+                        "(YENI bir command_id ile TEKRAR DENEMEYIN)"
+                    )
+                self._respond_json(govde, status_code=200)
+                return
 
             try:
                 result = reader.operate_device(
@@ -942,33 +1080,33 @@ def _make_handler(
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.exception("operate_failed device=%s index=%s", device_code, index)
-                if ledger_key is not None:
-                    _ledger_record(
-                        ledger,
-                        ledger_key,
-                        {
-                            "id": ledger_key,
-                            "ok": False,
-                            "status": "error",
-                            "error": str(exc)[:400],
-                        },
-                    )
-                self._respond_json({"ok": False, "detail": str(exc)}, status_code=500)
-                return
-            ok = bool(result.get("ok"))
-            if ledger_key is not None:
+                # Defter ZORUNLU oldugu icin kosul yok: sonuc HER ZAMAN
+                # yazilir, yoksa cagiran taraf hatayi hic ogrenemezdi.
                 _ledger_record(
                     ledger,
                     ledger_key,
                     {
                         "id": ledger_key,
-                        "ok": ok,
-                        "status": str(result.get("status", "unknown")),
-                        "error": result.get("error"),
-                        "control": result.get("control"),
-                        "dnp3_status": result.get("dnp3_status"),
+                        "ok": False,
+                        "status": "error",
+                        "error": str(exc)[:400],
                     },
                 )
+                self._respond_json({"ok": False, "detail": str(exc)}, status_code=500)
+                return
+            ok = bool(result.get("ok"))
+            _ledger_record(
+                ledger,
+                ledger_key,
+                {
+                    "id": ledger_key,
+                    "ok": ok,
+                    "status": str(result.get("status", "unknown")),
+                    "error": result.get("error"),
+                    "control": result.get("control"),
+                    "dnp3_status": result.get("dnp3_status"),
+                },
+            )
             # Gonderilen CROB tipini de logla: olay sonrasi "hangi komut
             # gonderildi" sorusu eskiden log'dan cevaplanamiyordu.
             logger.info(
@@ -1291,6 +1429,12 @@ def start_health_server(
     ledger_provider: Any = None,
     refresh_token: str = "",
     command_token: str = "",
+    #: `/operate` TTL sozlesmesi — kuyruk yoluyla AYNI ayarlar
+    #: (`COMMAND_MAX_AGE_SEC`, `COMMAND_CLOCK_SKEW_TOLERANCE_SEC`).
+    #: Ayri bir esik TANIMLANMADI: iki kanalin tazelik karari ayrisirsa
+    #: hangi komutun neden reddedildigi sahada aciklanamaz hale gelir.
+    command_max_age_sec: float = 120.0,
+    command_clock_skew_tolerance_sec: float = 5.0,
     info_metrics_auth_required: bool = True,
     health_rate_limit_per_min: int = _HEALTH_RATE_LIMIT_PER_MIN,
     refresh_rate_limit_per_min: int = _REFRESH_RATE_LIMIT_PER_MIN,
@@ -1388,6 +1532,8 @@ def start_health_server(
         ledger_provider=ledger_provider,
         refresh_token=refresh_token,
         command_token=command_token,
+        command_max_age_sec=command_max_age_sec,
+        command_clock_skew_tolerance_sec=command_clock_skew_tolerance_sec,
         info_metrics_auth_required=info_metrics_auth_required,
         health_rate_limiter=health_rl,
         refresh_rate_limiter=refresh_rl,
