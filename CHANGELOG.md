@@ -2,6 +2,94 @@
 
 Semver'a gore tutulur. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.11.4] - 2026-08-18
+
+Gateway uretim kapanis surumu. **Tek gercek kod degisikligi ClockGuard
+soguk-acilis fail-safe'i**; geri kalani stale dokumantasyon ve deployment
+pinning duzeltmesidir.
+
+**KOMUT DUZLEMI DEGISMEDI.** F1/F2/F3/F3C/F4/F5/F6/F7, DirectOperate, SBO,
+`/pending` semantigi, telemetri/quality semantigi ve DNP3 polling araliklari
+AYNEN duruyor. Yeni command framework, CROB soyutlamasi, pulse/timing
+ozelligi, request imzalama, yeni credential veya TLS/mTLS EKLENMEDI.
+
+### Fixed
+- **ClockGuard soguk acilista saat yazmaya IZIN VERIYORDU.**
+  `is_safe_for_time_sync` hic olcum yapilmadiysa `True` donuyordu; gerekcesi
+  "backend'e hic ulasilamamis olabilir, eski davranisi bozmayalim" idi. Bu,
+  korumanin en cok gerektigi ani tam olarak acikta birakiyordu:
+
+      host acilir        -> RTC/NTP henuz duzelmemis
+      backend ULASILMAZ  -> Date gozlemi YOK -> guard "guvenli" der
+      onbellekli config  -> DNP3 ayaga kalkar
+      DNP3_TIME_SYNC=lan -> DOGRULANMAMIS host saati outstation'lara YAZILIR
+
+  Yani "olcemedim" durumu en riskliyken en gevsek karari veriyordu. Artik
+  olcum yoksa saat YAZILMAZ; ilk gecerli backend `Date` gozleminde kapi
+  acilir, saat sonradan saparsa yeniden kapanir, duzelirse tekrar acilir.
+
+  **KAPSAM: yalnizca DNP3 saat yazma.** Boot, onbellekli config, DNP3
+  baglanti/polling, telemetri, NATS/outbox, health ve komut akisi
+  ETKILENMEZ. Bir test bu siniri kilitliyor: bayrak baska bir yola
+  baglanirsa kirilir.
+- **Stale F5 dokumantasyonu.** F5 rollout tamamlandi ve saha kabulu yapildi,
+  ama sozlesme/SECURITY.md/.env.example hala "backend F5A sahaya cikmadi"
+  diyor ve `GATEWAY_COMMAND_DELIVERY_TOKEN` icin "PROVISION EDILMEZ"
+  talimati veriyordu — yani DOGRU yapilandirmayi engelleyen bir metin.
+  Gercek sozlesme yazildi; `status` artik `available`.
+- **Uretim compose ciktisi sessizce `:latest`e baglaniyordu.**
+  `render_compose.py` `--image` verilmezse `:latest` uretiyordu: dosyaya
+  bakarak "hangi surum kurulu" CEVAPLANAMIYOR ve siradan bir
+  `docker compose pull` gateway'i baska bir surume gecirebiliyordu.
+
+### Changed
+- `ClockGuard.clock_state` (**yeni**): `unknown` | `safe` | `unsafe`.
+  `unknown` ile `unsafe` AYRI raporlanir — ikisi de saat yazmayi engeller
+  ama operatorun yapacagi sey farklidir ("henuz dogrulayamadim" vs
+  "saatin sapmis"). `/health` ve DNP3 loglari bu ayrimi gosterir.
+- `render_compose.py` `--image` verilmezse imaji `VERSION`dan EXACT semver
+  olarak turetir (orn. `ghcr.io/.../enerjione-grid-dnp3-gateway:1.11.4`).
+  **`:latest` YAYIN politikasi DEGISMEDI** — release workflow onu basmaya
+  devam eder; degisen yalnizca tuketim tarafi. Digest ile daha kati pin
+  isteyen kurulumlar icin `--image` hala calisir.
+- `docs/DOCKER.md` CLI ornegi `--install-mode` ve yeni imaj davranisini
+  gosteriyor.
+
+### Unchanged
+- v1.11.3 traceability mekanizmasi AYNEN: kaynak sozlesme kendi commit'ini
+  TASIMAZ (self-referential); `gateway_source_sha` baseline, gercek revizyon
+  release artifact'inda ve imaj etiketinde uretilir.
+- v1.11.3 dependency lock mekanizmasi AYNEN: `--require-hashes`, imaj-lock
+  CI karsilastirmasi, `yadnp3==3.2.1.1` ayri katmanda exact pin. Runtime
+  bagimliligi degismedigi icin lock YENIDEN URETILMEDI.
+- `config.py` `INSTALL_MODE` varsayilani `remote`; F5 runtime politikasi;
+  komut credential varsayilanlari.
+
+### Added
+- `tests/test_clock_cold_boot.py` — 17 test. ClockGuard karar tablosu
+  (unknown/safe/unsafe, toparlanma, bozuk/eksik `Date`) **ve** gercek DNP3
+  saat yazma noktasi (`Now()`): soguk acilista gecersiz `DNPTime`, backend
+  gelince gecerli. Gercek cihaz YOK.
+- `tests/test_stale_hardening.py` — 18 test. Stale F5 ifadelerinin geri
+  gelmesini, uretim compose'unun `:latest`e donmesini ve traceability/lock
+  mekanizmalarinin bozulmasini kilitler.
+- Yedi mutasyonla dislerinin oldugu dogrulandi (ClockGuard fail-open,
+  `:latest`, surum kaymasi x2, `--require-hashes` kaldirma, F5 metnini geri
+  alma, INSTALL_MODE kaldirma -> hepsi KIRMIZI).
+
+### Verified
+Izole kurtarma kabulu (yerel gecici container, gercek saha cihazi YOK,
+backend ve NATS bilerek erisilemez):
+- graceful restart / SIGKILL restart / container recreate sonrasi
+  `instance_id` KALICI; SQLite `integrity_check` = ok (outbox + ledger)
+- `INSTALL_MODE=local` + NATS kapali -> proses ayakta, **HTTP yedegine
+  gecmiyor** (`fallback=yok`), health `issues` gorunur; NATS acilinca
+  `jetstream_publisher_ready`
+- backend kapali -> `clock_state=unknown`, `safe_for_time_sync=false`,
+  fiziksel CROB = 0
+- volume korunursa state korunur; volume silinirse YENI instance/epoch
+- SIGTERM -> exit: 0.8s / 5.7s / 13.9s (butce 30s)
+
 ## [1.11.3] - 2026-08-18
 
 Uretim oncesi sertlestirme paketi: **deployment dogrulugu + release

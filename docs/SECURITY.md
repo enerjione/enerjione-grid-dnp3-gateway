@@ -79,13 +79,18 @@ Iki duzlem AYNI anahtari kullanmak ZORUNDA DEGIL:
 | `GET /config` | Gateway kimligi: `GATEWAY_TOKEN` |
 | `GET /pending`, komut uclari | `GATEWAY_COMMAND_DELIVERY_TOKEN` **doluysa YALNIZCA o**; **bos ise** `GATEWAY_TOKEN` |
 
-> **GECIS DURUMU — F5A tamamlanmadi.** Ayri komut-duzlemi credential'i
-> (`GATEWAY_COMMAND_DELIVERY_TOKEN`) gateway tarafinda hazir (F5B, v1.11.0)
-> ama **backend F5A sahaya cikmadi**. Bu degisken backend hazir olmadan
-> **TANIMLANMAMALIDIR**: doluysa gateway `/pending` yanitini YALNIZCA o
-> anahtarla dogrular ve backend hala `GATEWAY_TOKEN` ile imzaliyorsa komut
-> kanali fail-closed kapanir. Bos birakildiginda davranis v1.10 ile birebir
-> aynidir.
+> **F5 TAMAMLANDI.** Backend F5A ve gateway F5B sahaya cikti, saha kabulu
+> yapildi. `GATEWAY_COMMAND_DELIVERY_TOKEN` artik bir gecis alani degil,
+> kuyruklanmis komut duzleminin kalici credential'idir ve **onerilen
+> yapilandirmadir**.
+>
+> **Kati ayrim korunur:** dolu ise `/pending` yaniti YALNIZCA bu anahtarla
+> dogrulanir, `GATEWAY_TOKEN`a geri DUSULMEZ.
+>
+> **Geriye donuk uyumluluk:** bos birakilirsa komut uclari `GATEWAY_TOKEN`
+> kullanir (v1.10 davranisi). Bu yalnizca henuz provision edilmemis
+> kurulumlarin calismaya devam etmesi icindir; yeni kurulumlarda ayri
+> credential verilmelidir.
 
 ### Rollback
 

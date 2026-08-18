@@ -132,8 +132,10 @@ class Settings(BaseSettings):
             "duzleminden ayirir.\n"
             "\n"
             "BOS = mevcut (v1.10) davranis: komut uclari da `GATEWAY_TOKEN` "
-            "kullanir. Bu yalnizca backend F5A sahaya cikana kadar gecerli bir "
-            "GECIS durumudur; sonrasinda zorunlu hale gelecek.\n"
+            "kullanir. F5 rollout TAMAMLANDI (backend F5A + gateway F5B); bu "
+            "yalnizca henuz provision edilmemis kurulumlarin calismaya devam "
+            "etmesi icin korunan GERIYE DONUK UYUMLULUK yoludur, onerilen "
+            "yapilandirma degildir.\n"
             "\n"
             "DOLU ise `/pending` yaniti YALNIZCA bu anahtarla dogrulanir — "
             "`GATEWAY_TOKEN`a geri dusulmez. `GATEWAY_TOKEN` ve "
@@ -1117,8 +1119,8 @@ class Settings(BaseSettings):
                     )
                 # F5: kuyruklanmis komut duzlemi credential'i.
                 #
-                # BOS OLMASI HATA DEGIL — backend F5A sahaya cikana kadar
-                # gecis durumu bu (bkz. alan aciklamasi). Ama DOLUYSA gercekten
+                # BOS OLMASI HATA DEGIL - henuz provision edilmemis kurulumlar icin
+                # geriye donuk uyumluluk yolu (bkz. alan aciklamasi). Ama DOLUYSA gercekten
                 # AYRI bir sir olmali: digerleriyle ayni deger verilirse ayrimin
                 # tamami kagit uzerinde kalir, komut duzlemi hala config
                 # duzlemiyle ayni sirla korunuyor olurdu.

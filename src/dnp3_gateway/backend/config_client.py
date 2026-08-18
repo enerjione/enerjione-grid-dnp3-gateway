@@ -471,7 +471,7 @@ class BackendConfigClient:
         """Bu baglam icin yanit imzasinin HMAC anahtari.
 
         `/config` kimlik duzlemine, `/pending` komut duzlemine aittir. Komut
-        duzlemi credential'i yapilandirilmamissa (backend F5A oncesi) komut
+        duzlemi credential'i yapilandirilmamissa (geriye donuk uyumluluk) komut
         ucu da kimlik token'ina duser — bu GECICI bir gecis davranisidir.
         """
         if context == "pending" and self._command_delivery_token:
@@ -490,7 +490,7 @@ class BackendConfigClient:
         -------------------
           config  -> her zaman `identity.token`
           pending -> komut duzlemi token'i DOLUYSA yalnizca o; bos ise
-                     `identity.token` (backend F5A oncesi gecis durumu)
+                     `identity.token` (yalnizca geriye donuk uyumluluk)
 
         GERI DUSME YOK: komut token'i yapilandirilmisken dogrulama
         basarisiz olursa `identity.token` ile TEKRAR DENENMEZ. Denenseydi

@@ -511,7 +511,10 @@ def test_disk_guard_olmayan_yol_patlamaz(tmp_path: Path) -> None:
 def test_clock_guard_sapma_hesaplar() -> None:
     g = ClockGuard()
     assert g.snapshot()["skew_sec"] is None
-    assert g.is_safe_for_time_sync is True  # olcum yoksa eski davranis
+    # SOGUK ACILIS FAIL-SAFE: olcum yoksa saat YAZILMAZ. Eskiden True idi ve
+    # korumayi tam da en cok gerektigi anda (host acilisi, backend erisilemez)
+    # devre disi birakiyordu. Ayrintili testler: test_clock_cold_boot.py
+    assert g.is_safe_for_time_sync is False
 
     from datetime import datetime, timedelta, timezone
     from email.utils import format_datetime
