@@ -67,6 +67,21 @@ def _render_text(template: str, replacements: dict[str, str]) -> str:
     return re.sub(r"\{\{\s*([A-Z0-9_]+)\s*\}\}", _sub, template)
 
 
+INSTALL_MODES = ("local", "remote")
+
+
+def _validate_install_mode(mode: str) -> str:
+    """`local` | `remote` — VARSAYILANI YOK, bilincli secilmeli.
+
+    Bu deger NATS erisilemedigi anda ne olacagini belirler; yanlis secim
+    yalnizca ARIZA aninda gorunur (yerel kurulumda sessizce HTTP'ye dusme).
+    Sessiz bir varsayilan tam da duzeltilen hatanin kaynagiydi.
+    """
+    if mode not in INSTALL_MODES:
+        raise RenderError(f"INSTALL_MODE gecersiz: {mode!r}. Gecerli: {list(INSTALL_MODES)}")
+    return mode
+
+
 def render_compose(
     *,
     code: str,
@@ -75,6 +90,7 @@ def render_compose(
     backend_url: str,
     nats_url: str,
     host_port: int,
+    install_mode: str,
     image: str = "ghcr.io/enerjione/enerjione-grid-dnp3-gateway:latest",
     app_environment: str = "production",
     template_path: Path = DEFAULT_TEMPLATE_PATH,
@@ -100,6 +116,7 @@ def render_compose(
             "HOST_HEALTH_PORT": str(host_port),
             "IMAGE": image,
             "APP_ENVIRONMENT": app_environment,
+            "INSTALL_MODE": _validate_install_mode(install_mode),
         },
     )
 
@@ -111,6 +128,7 @@ def render_env(
     name: str,
     backend_url: str,
     nats_url: str,
+    install_mode: str,
     app_environment: str = "production",
     template_path: Path = DEFAULT_ENV_TEMPLATE_PATH,
 ) -> str:
@@ -127,6 +145,7 @@ def render_env(
             "BACKEND_API_URL": backend_url.rstrip("/"),
             "NATS_URL": nats_url,
             "APP_ENVIRONMENT": app_environment,
+            "INSTALL_MODE": _validate_install_mode(install_mode),
         },
     )
 
@@ -160,6 +179,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--image",
         default="ghcr.io/enerjione/enerjione-grid-dnp3-gateway:latest",
         help="Docker image tag (default: ghcr.io/enerjione/enerjione-grid-dnp3-gateway:latest)",
+    )
+    p.add_argument(
+        "--install-mode",
+        required=True,
+        choices=INSTALL_MODES,
+        help=(
+            "Kurulum tipi. `local`: gateway backend ile ayni makinede — NATS zorunlu, "
+            "HTTP yedegi YOK. `remote`: uzak saha — NATS birincil + HTTP yedegi. VARSAYILANI YOK: yanlis secim yalnizca ariza aninda gorunur."
+        ),
     )
     p.add_argument(
         "--app-environment",
@@ -200,6 +228,7 @@ def main(argv: list[str] | None = None) -> int:
             name=args.name,
             backend_url=args.backend_url,
             nats_url=args.nats_url,
+            install_mode=args.install_mode,
             app_environment=args.app_environment,
         )
     else:
@@ -210,6 +239,7 @@ def main(argv: list[str] | None = None) -> int:
             backend_url=args.backend_url,
             nats_url=args.nats_url,
             host_port=args.host_port,
+            install_mode=args.install_mode,
             image=args.image,
             app_environment=args.app_environment,
         )

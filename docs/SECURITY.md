@@ -42,19 +42,61 @@ Her config isteginde su basliklar gider (bkz. `src/dnp3_gateway/auth/headers.py`
 - `X-Request-Id` — istek bazli UUID (Kibana/Loki/Grafana korelasyonu)
 - `User-Agent: EnerjiOne-Dnp3Gateway/{versiyon} (env=...)`
 
-## Config response imzasi (opsiyonel HMAC)
+## Backend yanit ozgunlugu — ZORUNLU HMAC
 
-Gateway, backend'in donduğu config payload'i icin `X-Config-Signature: <hex sha256>`
-header'ini destekler:
+**v1.10.0'dan beri varsayilan `REQUIRE_BACKEND_RESPONSE_SIGNATURE=true`.**
+Once opsiyoneldi; su an uretim varsayilani ZORUNLU ve fail-closed.
+
+Kapsam: `GET /config` ve `GET /pending` **200** yanitlari. Header:
+`X-Config-Signature: <hex sha256>`.
 
 ```
-expected = HMAC-SHA256(gateway_token, body_bytes).hexdigest()
+expected = HMAC-SHA256(imza_anahtari, body_bytes).hexdigest()
 hmac.compare_digest(sig_header, expected)
 ```
 
-Header gelmezse (eski backend) gateway eskisi gibi devam eder — defense-in-depth.
-Header gelir ve eslesmezse `GatewayConfigError` raise edilip refresh thread
-exponential backoff'a duser. HTTPS yokken MITM korumasi saglar.
+### Karar tablosu (varsayilan yapilandirma)
+
+| Yanit | Sonuc |
+|---|---|
+| Gecerli imza | **Kabul** — islenmeye devam |
+| Imza header'i YOK | **Fail-closed** — reddedilir |
+| Imza bozuk/hatali formatta | **Fail-closed** — reddedilir |
+| Imza eslesmiyor | **Fail-closed** — reddedilir |
+
+Reddedilen yanitta **JSON parse edilmez, config uygulanmaz, komut dagitimi
+yapilmaz.** Yani reddedilen bir `/pending` yaniti icin `PendingPoll` bile
+uretilmez: komut kuyruga girmez, nonce uygulanmaz, `ledger.start_dispatch`
+ve `operate_device` cagrilmaz. `GatewayConfigError` yukselir ve refresh
+thread exponential backoff'a duser.
+
+### Imza anahtari
+
+Iki duzlem AYNI anahtari kullanmak ZORUNDA DEGIL:
+
+| Uc | Imza anahtari |
+|---|---|
+| `GET /config` | Gateway kimligi: `GATEWAY_TOKEN` |
+| `GET /pending`, komut uclari | `GATEWAY_COMMAND_DELIVERY_TOKEN` **doluysa YALNIZCA o**; **bos ise** `GATEWAY_TOKEN` |
+
+> **GECIS DURUMU — F5A tamamlanmadi.** Ayri komut-duzlemi credential'i
+> (`GATEWAY_COMMAND_DELIVERY_TOKEN`) gateway tarafinda hazir (F5B, v1.11.0)
+> ama **backend F5A sahaya cikmadi**. Bu degisken backend hazir olmadan
+> **TANIMLANMAMALIDIR**: doluysa gateway `/pending` yanitini YALNIZCA o
+> anahtarla dogrular ve backend hala `GATEWAY_TOKEN` ile imzaliyorsa komut
+> kanali fail-closed kapanir. Bos birakildiginda davranis v1.10 ile birebir
+> aynidir.
+
+### Rollback
+
+`REQUIRE_BACKEND_RESPONSE_SIGNATURE=false` **yalnizca** imza gondermeyen ESKI
+bir backend'e kontrollu, GECICI rollback icindir ve boot'ta gorunur uyari
+uretir.
+
+**Bu modda bile bypass YOKTUR:** imza GELIYOR ama gecersizse (bozuk ya da
+eslesmiyor) yanit yine **reddedilir**. Bayrak yalnizca "imza header'i hic
+yok" durumunu tolere eder; "imza var ama yanlis" her zaman fail-closed'dir.
+Aksi halde saldirgan bozuk bir imza gondererek dogrulamayi atlatabilirdi.
 
 ## TLS
 

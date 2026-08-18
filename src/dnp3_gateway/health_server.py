@@ -772,12 +772,58 @@ def _make_handler(
                 cikisi KALICI olarak enerjili birakir. Entegratorler docstring'i
                 API sozlesmesi olarak okudugu icin "kisa darbe" bekleyip kalici
                 latch gonderilmesine yol aciyordu.)
-              * `command_id`: OPSIYONEL ama ONERILEN idempotency anahtari.
-                Verilirse komut CommandLedger'a yazilir ve ayni id ikinci kez
-                gelirse CROB TEKRAR GONDERILMEZ. Backend'in HTTP timeout'u
-                (~5sn) cihazin CROB suresinden (SN2'de 1-10sn) kisa oldugu icin
-                retry cok olasi; idempotency olmadan ayni kesici IKI KEZ
-                surulebiliyordu.
+              * `command_id`: **ZORUNLU** (v1.11.2 / F7-G). STRICT tamsayi —
+                `bool` KABUL EDILMEZ (`True` bir `int` alt sinifidir) ve
+                `"5001"` gibi metinler donusturulmez. Duplicate suppression /
+                idempotency anahtaridir: komut CommandLedger'a rezerve edilir
+                ve ayni id ikinci kez gelirse CROB TEKRAR GONDERILMEZ.
+                Eskiden opsiyoneldi; olculen sonucu ayni istegin uc kez
+                gonderilmesinde UC FIZIKSEL CROB idi. Backend'in HTTP
+                timeout'u (~5sn) cihazin CROB suresinden (SN2'de 1-10sn) kisa
+                oldugu icin retry olagandir.
+              * `created_at`: **ZORUNLU** (v1.11.2 / F7-G). Timezone-AWARE
+                ISO-8601. Kuyruk yoluyla AYNI fonksiyon ve AYNI esiklerle
+                degerlendirilir: `COMMAND_MAX_AGE_SEC` (TTL) ve
+                `COMMAND_CLOCK_SKEW_TOLERANCE_SEC` (izin verilen ileri sapma).
+                Eksik / bozuk / timezone'suz / bayat / asiri-gelecek damga
+                reddedilir. Bu uc icin `require_timestamp` SABIT `True`:
+                `COMMAND_REQUIRE_TIMESTAMP` bayragi yalnizca kuyruk yolunun
+                eski-backend rollback'i icindir.
+              * **CommandLedger ZORUNLU.** Defter yapilandirilmamissa,
+                `None` donuyorsa ya da erisilemiyorsa istek **503** ile
+                reddedilir ve FIZIKSEL islem YAPILMAZ. Eskiden defter yoksa
+                komut yine gonderiliyor, yalnizca log dusuyordu: tekrar-onleme
+                garantisi olmadan fiziksel manevra.
+
+            SOZLESME
+
+              ZORUNLU : device_code, command, index, created_at, command_id
+              OPSIYONEL: op_type (varsayilan `latch_on`), count (1),
+                         on_time_ms (100), off_time_ms (100), timeout_sec (10.0)
+
+            Ornek govde::
+
+                {
+                  "device_code": "SN2_0",
+                  "command": "reset_all_fcis",
+                  "index": 7,
+                  "created_at": "2026-08-18T09:15:00+00:00",
+                  "command_id": 5001,
+                  "op_type": "latch_on",
+                  "count": 1,
+                  "on_time_ms": 0,
+                  "off_time_ms": 0,
+                  "timeout_sec": 10.0
+                }
+
+            KONTROL SIRASI (kaynakta bu sirayla; testle korunuyor)
+
+                auth -> JSON/tip -> zorunlu alanlar -> F1/F2 -> tazelik
+                     -> command_id + defter rezervasyonu -> F6 -> fiziksel
+
+            Rezervasyon yetkilendirme ve tazelikten SONRA yapilir: reddedilen
+            bir istek `command_id`yi TUKETMEZ, boylece operator duzeltilmis
+            komutu ayni id ile gonderebilir.
             """
             if not self._check_bearer_auth(command_token):
                 return  # 401 veya 503 zaten gonderildi

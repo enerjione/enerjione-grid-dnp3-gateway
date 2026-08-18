@@ -142,6 +142,36 @@ jobs:
       # NOT: `--entrypoint python` ile entrypoint ATLANIYOR — o script
       # GATEWAY_CODE/GATEWAY_TOKEN zorunlu kilar ve burada amac imajin
       # ICERIGINI dogrulamak. Entrypoint'in kendisi ayri bir adimda test edilir.
+      # URETIM IMAJI LOCK'TAKI SURUMLERI TASIYOR MU
+      #
+      # Dockerfile'i sessizce `requirements.txt` (araliklar) haline geri
+      # dondurmek imaji yeniden tekrar-uretilemez yapardi ve bu HICBIR
+      # yerde gorunmezdi. Bu adim imajin ICINDEKI surumleri lock ile
+      # karsilastirir; ilk uyusmazlikta duser.
+      - name: Imaj kilitli bagimliliklari mi tasiyor
+        run: |
+          docker run --rm --entrypoint python dnp3-gateway:ci -m pip freeze \
+            | sed -E 's/ @ .*#sha256=.*//' > /tmp/imaj-freeze.txt
+          python - <<'PY'
+          import re, pathlib, sys
+          lock = pathlib.Path("requirements-lock-linux-py311.txt").read_text(encoding="utf-8")
+          beklenen = dict(re.findall(r"^([A-Za-z0-9_.\-]+)==([^ \\\n]+)", lock, re.M))
+          # `pip freeze` wheel'den kurulmus paketleri `ad @ file://...` seklinde
+          # yazar; yukaridaki sed onu `ad` haline getirir, surum ise METADATA'dan
+          # gelir. Bu yuzden surumu importlib ile teyit ediyoruz.
+          import subprocess, json
+          kod = ("import json,importlib.metadata as m;"
+                 "print(json.dumps({k: m.version(k) for k in " + repr(sorted(beklenen)) + "}))")
+          ciktı = subprocess.run(
+              ["docker", "run", "--rm", "--entrypoint", "python", "dnp3-gateway:ci", "-c", kod],
+              capture_output=True, text=True, check=True).stdout
+          gercek = json.loads(ciktı)
+          hata = [f"{k}: lock={v} imaj={gercek.get(k)}" for k, v in beklenen.items() if gercek.get(k) != v]
+          if hata:
+              print("IMAJ LOCK ILE UYUSMUYOR:", *hata, sep="\n  ")
+              sys.exit(1)
+          print(f"imaj {len(beklenen)} kilitli paketin hepsini tam surumuyle tasiyor")
+          PY
       - name: Imajin icinde DNP3 native yuklu mu
         run: |
           docker run --rm --entrypoint python dnp3-gateway:ci \

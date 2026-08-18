@@ -1,7 +1,9 @@
 {
   "contract_version": 1,
-  "gateway_release": "1.11.2",
-  "gateway_source_sha": "db833e20d05a07c86f2f5768bc8570954add3a97",
+  "gateway_release": "1.11.3",
+  "gateway_source_ref": "v1.11.3",
+  "gateway_source_sha": "9f0aa251b307e6a094451be055e3b9badfc62933",
+  "gateway_source_sha_semantics": "BU DOSYADAKI DEGER, KENDISINI ICEREN COMMIT DEGILDIR ve olamaz: dosyaya yeni SHA yazmak yeni bir commit uretir ve SHA yeniden degisir (self-referential). Buradaki deger, bu sozlesmenin turetildigi YAYIMLANMIS BASELINE surumun commit'idir. Bir artifact'in GERCEK revizyonu iki yerde yasar ve ikisi de release sirasinda uretilir: (1) imaj etiketi org.opencontainers.image.revision=<GITHUB_SHA>, (2) release workflow'un urettigi gateway-deployment-contract.generated.json (gateway_source_sha alani GITHUB_SHA ile doldurulur). Tuketiciler revizyon icin BUNLARA bakmali; kaynak dosyadaki deger yalnizca baseline'dir.",
   "owner": "enerjione/enerjione-grid-dnp3-gateway",
   "description": "Bir uretim DNP3 gateway kurulumunun TASIMASI GEREKEN deployment sozlesmesi. Gateway repo'su sahibidir; Grid repo'su tam kopyasini vendor eder ve CI'da karsilastirir. Runtime'da iki repo birbirine baglanmaz.",
   "environment_defaults": {
@@ -125,5 +127,6 @@
       "ordering_constraint": "BACKEND F5A SAHAYA CIKMADAN PROVISION EDILMEZ. Erken verilirse gateway `/pending` yanitini backend'in bilmedigi bir anahtarla dogrular; F4B fail-closed oldugu icin komut duzlemi DURUR. Grid render yollari bu degiskeni F5A tamamlanana kadar URETMEMELIDIR.",
       "production_guard": "Gateway, production'da bu degerin GATEWAY_TOKEN veya GATEWAY_COMMAND_TOKEN ile ayni olmasini reddeder."
     }
-  }
+  },
+  "gateway_source_sha_baseline_ref": "v1.11.2"
 }

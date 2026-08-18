@@ -2,6 +2,95 @@
 
 Semver'a gore tutulur. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.11.3] - 2026-08-18
+
+Uretim oncesi sertlestirme paketi: **deployment dogrulugu + release
+izlenebilirligi + dokumantasyon + tekrar-uretilebilir build**.
+
+**RUNTIME DAVRANISI DEGISMEDI.** Tek satir komut/telemetri mantigi
+degistirilmedi; F1/F2/F3/F4/F5/F6/F7, DirectOperate, SBO, `/pending`
+semantigi, NATS/outbox ve quality flag davranisi AYNEN duruyor.
+
+### Fixed
+- **`INSTALL_MODE` compose sablonundan EKSIKTI.** Sozlesme onu
+  `required_environment` icinde sayiyordu ama `docker/compose.template.yml`
+  hic tasimiyordu; `.env.template` ise SABIT `remote` yaziyordu. Bu sablondan
+  kurulan bir gateway `config.py` varsayilani `remote`a duserdi — YEREL
+  kurulumda yanlis: "NATS erisilemezse HTTP'ye dus" davranisini sessizce
+  kazanir ve ayni makinede NATS'a erisememenin bir YAPILANDIRMA HATASI
+  oldugunu gizler. Ikisi de artik render zamani secilen `{{INSTALL_MODE}}`.
+  `scripts/render_compose.py` icin `--install-mode` **zorunlu** (varsayilan
+  YOK) ve `local|remote` disina cikan deger `RenderError` uretir.
+  *Sahadaki mevcut kurulumlar ETKILENMEZ: GW-001/GW-002 container env'inde
+  `INSTALL_MODE=local` zaten set (appliance ajanindan geliyor). Hata sablon
+  yolunda ve LATENT idi.*
+- **Zayif sozlesme testi bu hatayi kaciriyordu.** Test
+  `anahtar in env or anahtar in compose` diyordu; `or` yuzunden yalnizca
+  `.env`de bulunmak yetiyordu. Artik iki sablon AYRI AYRI olculuyor — ikisi
+  de kendi kullanim sozlesmesinde "tam env kaynagi" oldugunu iddia ediyor.
+- **`gateway_source_sha` eskiydi ve surdurulemez bir sey iddia ediyordu.**
+  Deger v1.11.0'in commit'inde takili kalmisti. Kaynak dosya KENDI commit'ini
+  tasiyamaz (dosyaya SHA yazmak yeni commit uretir, SHA degisir).
+- **`docs/SECURITY.md` HMAC'i hala "opsiyonel" anlatiyordu** ("header gelmezse
+  eski backend icin devam edilir"). Bu v1.10.0'dan beri uretim varsayilani
+  DEGIL.
+- **`/operate` docstring'i `command_id`yi "OPSIYONEL ama ONERILEN" diyordu.**
+  v1.11.2 / F7-G ile `command_id`, `created_at` ve durable CommandLedger
+  ZORUNLU oldu.
+
+### Changed
+- `gateway_source_ref` (**yeni alan**) = `v<VERSION>`; yazim aninda
+  bilinebilir ve dogrulanabilir. `gateway_source_sha` alan adi ve `[0-9a-f]{40}`
+  formati Grid parity semasi icin KORUNDU, ama artik ne oldugunu ACIKCA
+  soyluyor (`gateway_source_sha_semantics`): son yayimlanmis surumun
+  BASELINE commit'i. Gercek revizyon iki yerde uretilir — imaj etiketi
+  `org.opencontainers.image.revision` ve release workflow'un urettigi
+  `gateway-deployment-contract.generated.json` (`GITHUB_SHA` enjekte edilir).
+  Release workflow ayrica `gateway_release == VERSION` ve
+  `gateway_source_ref == v<VERSION>` dogrulamasi yapar; stale bir sabit SHA
+  artifact'a SESSIZCE tasinamaz.
+- `docs/SECURITY.md` "Backend yanit ozgunlugu — ZORUNLU HMAC" olarak yeniden
+  yazildi: karar tablosu (gecerli / eksik / bozuk / eslesmeyen), reddedilen
+  yanitta JSON parse ve komut dagitiminin YAPILMADIGI, imza anahtari ayrimi
+  (config -> `GATEWAY_TOKEN`; `/pending` -> `GATEWAY_COMMAND_DELIVERY_TOKEN`
+  doluysa yalnizca o) ve F5A'nin **tamamlanmadigi** acikca belirtildi.
+  Rollback bayraginin bile "imza var ama gecersiz" durumunu bypass ETMEDIGI
+  yazildi.
+- `/operate` docstring'i gercek sozlesmeyi veriyor: zorunlu/opsiyonel alan
+  listesi, ornek govde, `command_id`in STRICT tamsayi (bool degil) oldugu,
+  `created_at`in `COMMAND_MAX_AGE_SEC` + `COMMAND_CLOCK_SKEW_TOLERANCE_SEC`
+  ile degerlendirildigi, defter yoksa 503 ve fiziksel islem olmadigi, ve
+  kontrol sirasi.
+
+### Added
+- **`requirements-lock-linux-py311.txt`** — uretim imaji icin exact pin +
+  `--generate-hashes`. Gerekce olculdu: sahadaki GW-002 imajinda
+  `charset-normalizer 3.5.0` / `idna 3.18` kuruluyken AYNI kaynaktan bugun
+  cozulen sonuc `3.5.1` / `3.19`. Ayni commit farkli imaj uretiyordu; bir
+  regresyonun kod mu bagimlilik mi oldugunu ayirt etmek imkansizdi.
+  Lock uretim platformunun kendisinde (`python:3.11-slim-bookworm`) uretildi.
+- `Dockerfile` builder katmani lock'u `--require-hashes` ile kullaniyor ve
+  imajin Python surumunun lock hedefiyle ayni oldugunu dogruluyor.
+  **`yadnp3` lock'a DAHIL DEGIL, bilincli:** yalnizca manylinux_x86_64 ve
+  win_amd64 wheel'i var ve `requirements-dnp3.txt` icinde exact pin
+  (`==3.2.1.1`) ile AYRI bir katmanda kuruluyor — ayri `pip install` cagrisi
+  oldugu icin hash-checking modundan etkilenmez.
+- CI: imajin ICINDEKI surumler lock ile karsilastiriliyor. "Lock'u regenerate
+  et, diff cikmasin" testi BILINCLI olarak yazilmadi: pip-compile izin verilen
+  en yeni surume cozer, dolayisiyla upstream'de yeni bir yayin ciktiginda
+  gercek bir sorun olmadan KIRMIZI olurdu.
+- `tests/test_preprod_hardening.py` — 40 test. Alti mutasyonla dislerinin
+  oldugu dogrulandi (INSTALL_MODE kaldirma, sabit `remote`, surum kaydirma,
+  SECURITY.md geri alma, docstring geri alma, Dockerfile'i araliklara
+  dondurme -> hepsi KIRMIZI).
+
+### Unchanged
+- `config.py` `INSTALL_MODE` varsayilani `remote` KALDI (mevcut kurulumlarin
+  geriye donuk uyumu). Sorun deployment katmaninda cozuldu.
+- `pyproject.toml` bagimlilik araliklari kutuphane uyumlulugu icin KALDI;
+  exact surumler yalnizca uretim imajinda.
+- Backend ve `enerjione-grid` deposu DEGISTIRILMEDI.
+
 ## [1.11.2] - 2026-08-18
 
 `POST /operate` sertlestirildi (F7-G). Kuyruk yolunda zaten var olan
