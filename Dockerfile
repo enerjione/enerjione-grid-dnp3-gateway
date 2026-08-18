@@ -42,9 +42,27 @@ ENV PIP_NO_CACHE_DIR=1 \
 WORKDIR /build
 
 # Proje bagimliliklarini ayri katmanda kur — kaynak degisince yeniden derleme yok.
-COPY requirements.txt /build/requirements.txt
-RUN pip install --upgrade pip \
-    && pip wheel --wheel-dir=/build/wheels -r /build/requirements.txt
+#
+# KILITLI SURUMLER — URETIM IMAJI TEKRAR URETILEBILIR OLMALI.
+#
+# Onceden `requirements.txt` (aralikli: `pydantic>=2.5,<3.0`) kullaniliyordu.
+# Sonucu olculdu: sahadaki GW-002 imajinda `charset-normalizer 3.5.0` ve
+# `idna 3.18` varken AYNI kaynaktan bugun uretilen cozumde `3.5.1` ve `3.19`
+# cikiyor. Yani "ayni commit'i yeniden build et" farkli bir imaj uretiyordu;
+# bir regresyonun kaynagini ayirt etmek (kod mu, bagimlilik mi) imkansizdi.
+#
+# Lock `--generate-hashes` ile uretildi; `--require-hashes` her indirilen
+# dosyanin sha256'sini dogrular, yani yalnizca surum degil ICERIK de sabit.
+#
+# yadnp3 BU LOCK'A DAHIL DEGIL, bilincli: yalnizca manylinux_x86_64 ve
+# win_amd64 wheel'i var ve zaten `requirements-dnp3.txt` icinde EXACT pin
+# (==3.2.1.1) ile ayri bir katmanda kuruluyor. Ayri `pip install` cagrisi
+# oldugu icin buradaki hash-checking modu onu etkilemez.
+COPY requirements-lock-linux-py311.txt /build/requirements-lock-linux-py311.txt
+RUN python -c "import sys; assert sys.version_info[:2] == (3, 11), \
+        f'Lock dosyasi Python 3.11 icin uretildi, imaj {sys.version_info[:2]} kullaniyor'" \
+    && pip install --upgrade pip \
+    && pip wheel --require-hashes --wheel-dir=/build/wheels -r /build/requirements-lock-linux-py311.txt
 
 # ---------- Runtime stage --------------------------------------------------
 FROM python:${PYTHON_VERSION}-slim-bookworm AS runtime

@@ -127,9 +127,30 @@ def test_sozlesme_bu_surumu_tarif_ediyor():
     assert re.fullmatch(r"[0-9a-f]{40}", SOZLESME["gateway_source_sha"])
 
 
-def test_zorunlu_alanlar_sablonlarda_yer_tutucu_olarak_var():
-    """Sozlesme 'her kurulum bunlari SAGLAMALI' diyor; sablon bos birakmamali."""
-    env = _env_dosyasi()
+def test_zorunlu_alanlar_compose_sabloninda_eksiksiz():
+    """compose KENDI BASINA calistigini iddia ediyor -> hepsini TASIMALI.
+
+    ESKI TEST YETERSIZDI: `anahtar in env or anahtar in compose` diyordu.
+    `or` yuzunden bir anahtarin YALNIZCA .env sablonunda olmasi yetiyordu —
+    ve `INSTALL_MODE` tam olarak boyle kacti: sozlesmede zorunlu, .env'de
+    vardi, compose'da HIC YOKTU, test yesildi.
+
+    Sonucu sessizdi: compose ile kurulan bir gateway `INSTALL_MODE`
+    gormeyecegi icin config.py varsayilani `remote`a duser. YEREL bir
+    kurulumda bu "NATS erisilemezse HTTP'ye dus" demektir; ayni makinede
+    NATS'a erisememek bir YAPILANDIRMA HATASIDIR ve HTTP yedegi o hatayi
+    gizler.
+
+    Sablonun kendi iddiasi (dosya basligi): "Uretilen dosya tek basina
+    calisir: `docker compose -f gw-001.yml up -d`." Test o iddiayi olcer.
+    """
     compose = _compose_env()
-    for anahtar in SOZLESME["required_environment"]:
-        assert anahtar in env or anahtar in compose, f"zorunlu `{anahtar}` hicbir sablonda yok"
+    eksik = [a for a in SOZLESME["required_environment"] if a not in compose]
+    assert not eksik, f"compose sablonunda zorunlu anahtar(lar) YOK: {eksik}"
+
+
+def test_zorunlu_alanlar_env_sabloninda_eksiksiz():
+    """`.env` sablonu `--env-file` yolunun TEK env kaynagi -> hepsini tasimali."""
+    env = _env_dosyasi()
+    eksik = [a for a in SOZLESME["required_environment"] if a not in env]
+    assert not eksik, f".env sablonunda zorunlu anahtar(lar) YOK: {eksik}"

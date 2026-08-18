@@ -95,6 +95,40 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # RELEASE TRACEABILITY
+      #
+      # Kaynak `docker/gateway-deployment-contract.json` KENDI commit'ini
+      # tasiyamaz (self-referential: dosyaya SHA yazmak SHA'yi degistirir).
+      # Oradaki `gateway_source_sha` bu yuzden yalnizca BASELINE'dir.
+      # Gercek revizyon BURADA uretilir ve iki yerde yasar: bu artifact ve
+      # imajin `org.opencontainers.image.revision` etiketi.
+      - name: Contract artifact'ini uret (gercek GITHUB_SHA ile)
+        run: |
+          python - <<'PY'
+          import json, os, pathlib
+          yol = pathlib.Path("docker/gateway-deployment-contract.json")
+          s = json.loads(yol.read_text(encoding="utf-8"))
+          surum = pathlib.Path("VERSION").read_text(encoding="utf-8").strip()
+          # Stale sabit SHA'nin artifact'a SESSIZCE tasinmasini engelle.
+          assert s["gateway_release"] == surum, (
+              f"contract gateway_release={s['gateway_release']} ama VERSION={surum}")
+          assert s["gateway_source_ref"] == f"v{surum}", (
+              f"contract gateway_source_ref={s['gateway_source_ref']} ama VERSION={surum}")
+          s["gateway_source_sha"] = os.environ["GITHUB_SHA"]
+          s["gateway_source_sha_semantics"] = (
+              "Bu GENERATED artifact'ta deger GERCEK release commit'idir "
+              "(GITHUB_SHA, release workflow tarafindan enjekte edildi).")
+          s.pop("gateway_source_sha_baseline_ref", None)
+          out = pathlib.Path("gateway-deployment-contract.generated.json")
+          out.write_text(json.dumps(s, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+          print(f"generated contract: release={surum} sha={s['gateway_source_sha']}")
+          PY
+      - name: Contract artifact'ini yukle
+        uses: actions/upload-artifact@v4
+        with:
+          name: gateway-deployment-contract
+          path: gateway-deployment-contract.generated.json
+
       - name: Ozet
         run: |
           echo "### Yayinlanan etiketler" >> "$GITHUB_STEP_SUMMARY"

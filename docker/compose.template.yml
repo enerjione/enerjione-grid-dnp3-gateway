@@ -10,6 +10,12 @@
 #   {{HOST_HEALTH_PORT}}— host tarafinda exposed port (her instance icin farkli)
 #   {{IMAGE}}           — docker image tag (orn. ghcr.io/enerjione/enerjione-grid-dnp3-gateway:0.4.6)
 #   {{APP_ENVIRONMENT}} — production | staging | development
+#   {{INSTALL_MODE}}    — local | remote. NATS ERISILEMEDIGINDE ne olacagini
+#                         BELIRLER: `local` (gateway backend ile ayni makinede)
+#                         NATS'i zorunlu tutar, HTTP yedegi YOKTUR — ayni makinede
+#                         NATS'a erisememek yapilandirma hatasidir ve sessizce
+#                         HTTP'ye dusmek onu gizler. `remote` (uzak saha kurulumu)
+#                         NATS birincil + HTTP yedegidir.
 #
 # Uretilen dosya tek basina calisir: `docker compose -f gw-001.yml up -d`.
 # Ayni host'ta N tane gateway icin N tane farkli dosya / project name kullanilir.
@@ -53,6 +59,15 @@ services:
       GATEWAY_MODE: "dnp3"
       BACKEND_API_URL: "{{BACKEND_API_URL}}"
       BACKEND_API_VERIFY_SSL: "true"
+      # KURULUM TIPI — sozlesmede `required_environment` icinde, ama bu
+      # sablondan EKSIKTI. Eksikligi sessizdi: config.py varsayilani
+      # `remote` oldugu icin YEREL bir kurulum "NATS erisilemezse HTTP'ye
+      # dus" davranisini sessizce kazaniyordu. `local` kurulumda bu YANLIS:
+      # ayni makinede NATS'a erisememek bir yapilandirma hatasidir ve
+      # HTTP yedegi o hatayi gizleyerek 500-cihaz hedefini bozar.
+      #
+      # Deger render zamani gelir; burada VARSAYILAN YOK — bilincli secim.
+      INSTALL_MODE: "{{INSTALL_MODE}}"
       # TELEMETRI YOLU: STANDART `nats` — telemetri dogrudan JetStream'e
       # basilir (subject: e1.telemetry.raw.<code>), backend'e HIC ugramaz.
       # HTTP ingest yalnizca bilincli rollback icindir (`http`): o yolda her
