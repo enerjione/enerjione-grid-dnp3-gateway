@@ -67,6 +67,29 @@ def _render_text(template: str, replacements: dict[str, str]) -> str:
     return re.sub(r"\{\{\s*([A-Z0-9_]+)\s*\}\}", _sub, template)
 
 
+#: Uretim imajinin GHCR yolu. Etiket VERSION'dan turetilir.
+IMAGE_REPO = "ghcr.io/enerjione/enerjione-grid-dnp3-gateway"
+
+
+def _surum() -> str:
+    """Depodaki VERSION dosyasi."""
+    return (Path(__file__).resolve().parents[1] / "VERSION").read_text(encoding="utf-8").strip()
+
+
+def default_image() -> str:
+    """`--image` verilmediginde kullanilacak EXACT semver imaj.
+
+    Eskiden varsayilan `:latest` idi. Uretim compose ciktisinin `:latest`e
+    bagli kalmasi iki sey demekti: (1) "bu kurulumda hangi surum var"
+    sorusu dosyaya bakarak CEVAPLANAMAZ, (2) siradan bir
+    `docker compose pull` gateway'i sessizce baska bir surume gecirir.
+
+    `:latest` YAYIN politikasi degismedi (release workflow onu basmaya devam
+    eder); degisen yalnizca uretilen compose'un neye SABITLENDIGI.
+    """
+    return f"{IMAGE_REPO}:{_surum()}"
+
+
 INSTALL_MODES = ("local", "remote")
 
 
@@ -91,7 +114,7 @@ def render_compose(
     nats_url: str,
     host_port: int,
     install_mode: str,
-    image: str = "ghcr.io/enerjione/enerjione-grid-dnp3-gateway:latest",
+    image: str | None = None,
     app_environment: str = "production",
     template_path: Path = DEFAULT_TEMPLATE_PATH,
 ) -> str:
@@ -114,7 +137,7 @@ def render_compose(
             "BACKEND_API_URL": backend_url.rstrip("/"),
             "NATS_URL": nats_url,
             "HOST_HEALTH_PORT": str(host_port),
-            "IMAGE": image,
+            "IMAGE": image or default_image(),
             "APP_ENVIRONMENT": app_environment,
             "INSTALL_MODE": _validate_install_mode(install_mode),
         },
@@ -177,8 +200,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--image",
-        default="ghcr.io/enerjione/enerjione-grid-dnp3-gateway:latest",
-        help="Docker image tag (default: ghcr.io/enerjione/enerjione-grid-dnp3-gateway:latest)",
+        default=None,
+        help=(
+            "Docker image. Verilmezse VERSION dosyasindan EXACT semver turetilir "
+            "(orn. ghcr.io/enerjione/enerjione-grid-dnp3-gateway:1.11.4). Uretim ciktisi bilerek `:latest`e BAGLANMAZ."
+        ),
     )
     p.add_argument(
         "--install-mode",

@@ -1,8 +1,8 @@
 {
   "contract_version": 1,
-  "gateway_release": "1.11.3",
-  "gateway_source_ref": "v1.11.3",
-  "gateway_source_sha": "9f0aa251b307e6a094451be055e3b9badfc62933",
+  "gateway_release": "1.11.4",
+  "gateway_source_ref": "v1.11.4",
+  "gateway_source_sha": "9668f34b10472abb416d1334747014ead58e7b53",
   "gateway_source_sha_semantics": "BU DOSYADAKI DEGER, KENDISINI ICEREN COMMIT DEGILDIR ve olamaz: dosyaya yeni SHA yazmak yeni bir commit uretir ve SHA yeniden degisir (self-referential). Buradaki deger, bu sozlesmenin turetildigi YAYIMLANMIS BASELINE surumun commit'idir. Bir artifact'in GERCEK revizyonu iki yerde yasar ve ikisi de release sirasinda uretilir: (1) imaj etiketi org.opencontainers.image.revision=<GITHUB_SHA>, (2) release workflow'un urettigi gateway-deployment-contract.generated.json (gateway_source_sha alani GITHUB_SHA ile doldurulur). Tuketiciler revizyon icin BUNLARA bakmali; kaynak dosyadaki deger yalnizca baseline'dir.",
   "owner": "enerjione/enerjione-grid-dnp3-gateway",
   "description": "Bir uretim DNP3 gateway kurulumunun TASIMASI GEREKEN deployment sozlesmesi. Gateway repo'su sahibidir; Grid repo'su tam kopyasini vendor eder ve CI'da karsilastirir. Runtime'da iki repo birbirine baglanmaz.",
@@ -121,12 +121,14 @@
   },
   "transition_environment": {
     "GATEWAY_COMMAND_DELIVERY_TOKEN": {
-      "status": "optional_until_backend_f5a",
-      "default_when_absent": "bos -> komut uclari GATEWAY_TOKEN kullanir (v1.10 davranisi)",
-      "why": "Kuyruklanmis komut duzlemi icin ayri credential (F5B, gateway 1.11.0). Dolu ise `/pending` yaniti YALNIZCA bu anahtarla dogrulanir.",
-      "ordering_constraint": "BACKEND F5A SAHAYA CIKMADAN PROVISION EDILMEZ. Erken verilirse gateway `/pending` yanitini backend'in bilmedigi bir anahtarla dogrular; F4B fail-closed oldugu icin komut duzlemi DURUR. Grid render yollari bu degiskeni F5A tamamlanana kadar URETMEMELIDIR.",
+      "status": "available",
+      "rollout": "F5 TAMAMLANDI (backend F5A + gateway F5B, gateway 1.11.0). Saha kabulu yapildi. Bu alan artik bir GECIS durumu degil, kalici sozlesmedir.",
+      "why": "Kuyruklanmis komut duzlemi icin AYRILMIS credential. `/config` ile `/pending` ayni sirri paylassaydi, o sir sizinca yalnizca konfigurasyon degil FIZIKSEL KOMUT duzlemi de ele gecerdi.",
+      "scope": "Dolu ise `GET /pending`, `POST /command-delivery-acks` ve `POST /command-results` isteklerinde `X-Gateway-Command-Token` basligiyla gonderilir ve `/pending` YANIT IMZASININ HMAC anahtari olur. `/config` her zaman GATEWAY_TOKEN ile dogrulanir. `/operate` bu token'i KULLANMAZ (onun kendi credential'i var: GATEWAY_COMMAND_TOKEN).",
+      "strict_separation": "Dolu ise `/pending` yaniti YALNIZCA bu anahtarla dogrulanir; GATEWAY_TOKEN'a geri DUSULMEZ. Bu kati ayrim gateway tarafinda korunur ve DEGISTIRILMEDI.",
+      "backward_compatibility": "Bos birakilirsa komut uclari GATEWAY_TOKEN kullanir (v1.10 davranisi). Bu YALNIZCA geriye donuk uyumluluk icindir — hala provision edilmemis kurulumlarin calismaya devam etmesi icin korunuyor; onerilen yapilandirma degildir.",
       "production_guard": "Gateway, production'da bu degerin GATEWAY_TOKEN veya GATEWAY_COMMAND_TOKEN ile ayni olmasini reddeder."
     }
   },
-  "gateway_source_sha_baseline_ref": "v1.11.2"
+  "gateway_source_sha_baseline_ref": "v1.11.3"
 }

@@ -172,16 +172,44 @@ class ClockGuard:
             logger.info("clock_skew_recovered skew_sec=%.1f", skew)
 
     @property
+    def clock_state(self) -> str:
+        """`unknown` | `safe` | `unsafe`.
+
+        `unknown`, `unsafe`ten AYRI tutulur: ikisi de saat yazmayi engeller
+        ama sebepleri farklidir ve operatorun gordugu sey farkli olmali —
+        "saatin sapmis" ile "saatini henuz dogrulayamadim" ayni sey degildir.
+        """
+        with self._lock:
+            skew = self._skew_sec
+        if skew is None:
+            return "unknown"
+        return "safe" if abs(skew) < CLOCK_UNSAFE_SKEW_SEC else "unsafe"
+
+    @property
     def is_safe_for_time_sync(self) -> bool:
         """Outstation'lara saat yazmak guvenli mi?
 
-        Hic olcum yapilmadiysa True (backend'e hic ulasilamamis olabilir;
-        eski davranisi bozmayalim).
+        HIC OLCUM YOKSA `False` — SOGUK ACILIS FAIL-SAFE.
+
+        Eski davranis burada `True` donuyordu ("backend'e hic ulasilamamis
+        olabilir; eski davranisi bozmayalim"). Bu, korumanin en cok gerektigi
+        ani tam olarak acikta birakiyordu:
+
+            host acilir -> RTC/NTP henuz duzelmemis
+            -> backend ULASILAMAZ (yani Date gozlemi YOK)
+            -> onbellekli config ile DNP3 ayaga kalkar
+            -> DNP3_TIME_SYNC=lan
+            -> DOGRULANMAMIS host saati outstation'lara yazilir
+
+        Yani "olcemedim" en riskli durumken en gevsek karari veriyordu.
+        Backend'e ulasilabildigi anda ilk `Date` basligi durumu netlestirir;
+        o ana kadar yazmamak, yanlis saati 300 cihaza yazmaktan iyidir.
+
+        KAPSAM: bu bayrak YALNIZCA DNP3 saat yazmayi (`Now()` -> DNPTime)
+        kapatir. Boot, onbellekli config, DNP3 baglanti/polling, telemetri,
+        NATS/outbox, health ve komut akisi (F1-F7) ETKILENMEZ.
         """
-        with self._lock:
-            if self._skew_sec is None:
-                return True
-            return abs(self._skew_sec) < CLOCK_UNSAFE_SKEW_SEC
+        return self.clock_state == "safe"
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -191,4 +219,7 @@ class ClockGuard:
             "skew_sec": round(skew, 2) if skew is not None else None,
             "checked_at_epoch": checked,
             "safe_for_time_sync": self.is_safe_for_time_sync,
+            # Operator "neden yazilmiyor" sorusunu tek bakista cevaplayabilsin:
+            # `unknown` (henuz dogrulanmadi) ile `unsafe` (sapmis) ayri.
+            "clock_state": self.clock_state,
         }

@@ -1374,12 +1374,26 @@ def _make_master_app(cache: _DeviceCache, device_code: str) -> Any:
                 try:
                     if not guard.is_safe_for_time_sync:
                         if _saat_uyarisi_ver(device_code):
-                            logger.error(
-                                "dnp3_time_sync_suspended device=%s — gateway saati "
-                                "guvenilmez (sapma esigi asildi); outstation'a saat "
-                                "YAZILMIYOR. Sunucuda NTP/w32time servisini kontrol edin.",
-                                device_code,
-                            )
+                            # `unknown` ile `unsafe` AYRI raporlanir: ikisi de
+                            # yazmayi engeller ama operatorun yapacagi sey farkli.
+                            durum = getattr(guard, "clock_state", "unsafe")
+                            if durum == "unknown":
+                                logger.warning(
+                                    "dnp3_time_sync_suspended device=%s sebep=clock_unknown — "
+                                    "gateway saati backend'e karsi HENUZ DOGRULANMADI "
+                                    "(soguk acilis / backend erisilemez); outstation'a saat "
+                                    "YAZILMIYOR. Backend'e ilk basarili istekte cozulur. "
+                                    "Telemetri, polling ve komut akisi ETKILENMEZ.",
+                                    device_code,
+                                )
+                            else:
+                                logger.error(
+                                    "dnp3_time_sync_suspended device=%s sebep=clock_unsafe — "
+                                    "gateway saati guvenilmez (sapma esigi asildi); "
+                                    "outstation'a saat YAZILMIYOR. Sunucuda NTP/w32time "
+                                    "servisini kontrol edin.",
+                                    device_code,
+                                )
                         return _gecersiz_dnptime()
                 except Exception:  # noqa: BLE001
                     logger.debug("clock_guard_check_failed", exc_info=True)

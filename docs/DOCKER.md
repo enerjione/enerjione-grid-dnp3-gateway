@@ -110,12 +110,34 @@ python scripts/render_compose.py \
     --backend-url https://api.enerjione.local/api/v1 \
     --nats-url nats://nats.local:4222 \
     --host-port 8021 \
-    --image ghcr.io/enerjione/enerjione-grid-dnp3-gateway:0.4.6 \
+    --install-mode remote \
     --output ./gateways/gw-002.yml
 ```
 
 CLI `--token` verilmezse rastgele uretip stderr'a yazar; bu degeri backend
 veritabanina ayni kod altinda eklemek operator sorumlulugundadir.
+
+**`--install-mode` ZORUNLU** (`local` | `remote`). Varsayilani yoktur, bilerek:
+bu deger NATS erisilemedigi anda ne olacagini belirler ve yanlis secim
+yalnizca ARIZA aninda gorunur.
+
+* `local` — gateway backend ile **ayni makinede**. NATS zorunlu, HTTP yedegi
+  **YOK**: ayni makinede NATS'a erisememek bir yapilandirma hatasidir ve
+  sessizce HTTP'ye dusmek onu gizler.
+* `remote` — **uzak saha** kurulumu. NATS birincil, erisilemezse HTTP yedegi.
+
+**`--image` verilmezse `VERSION` dosyasindan EXACT semver turetilir**
+(orn. `ghcr.io/enerjione/enerjione-grid-dnp3-gateway:1.11.4`). Uretim
+ciktisi bilerek `:latest`e **baglanmaz**: `:latest` ile dosyaya bakarak
+"hangi surum kurulu" sorusu cevaplanamaz ve siradan bir `docker compose pull`
+gateway'i sessizce baska bir surume gecirebilir. (`:latest` etiketi YAYINDA
+basilmaya devam eder; degisen yalnizca tuketim tarafi.)
+
+Daha da kati bir pin isteniyorsa `--image` ile digest verilebilir:
+
+```bash
+    --image ghcr.io/enerjione/enerjione-grid-dnp3-gateway@sha256:<digest>
+```
 
 ## 3. Calistirma
 

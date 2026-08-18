@@ -237,7 +237,13 @@ def test_security_md_rollbackte_bile_bypass_olmadigini_soyluyor():
 def test_security_md_imza_anahtari_ayrimini_dogru_anlatiyor():
     m = _security()
     assert "GATEWAY_COMMAND_DELIVERY_TOKEN" in m
-    assert "GECIS DURUMU" in m and "F5A" in m, "F5A tamamlanmis gibi anlatilmamali"
+    # F5 TAMAMLANDI (backend F5A + gateway F5B, saha kabulu yapildi).
+    # Bu test eskiden "GECIS DURUMU / F5A tamamlanmadi" ifadelerinin
+    # VARLIGINI kilitliyordu; o ifadeler artik YANLIS oldugu icin yon
+    # tersine cevrildi: ayrintili stale kontrolu
+    # `test_stale_hardening.py` icinde.
+    assert "F5 TAMAMLANDI" in m
+    assert "Kati ayrim korunur" in m
 
 
 # ==========================================================================
@@ -342,11 +348,21 @@ def test_lock_runtime_bagimliliklarinin_hepsini_kapsiyor():
 
 
 def test_dockerfile_lock_kullaniyor_ve_hash_dogruluyor():
-    """REGRESYON: builder araliklara geri donerse imaj tekrar-uretilemez olur."""
+    """REGRESYON: builder araliklara geri donerse imaj tekrar-uretilemez olur.
+
+    Kontrol YORUM METNINDE degil, GERCEK `pip wheel` komutunda yapilir:
+    dosyanin aciklama satirlarinda da `--require-hashes` geciyor ve duz bir
+    "metin iceriyor mu" testi, bayrak komuttan silinse bile yesil kaliyordu
+    (mutasyon denemesiyle bulundu).
+    """
     df = (KOK / "Dockerfile").read_text(encoding="utf-8")
     assert LOCK_YOLU.name in df
-    assert "--require-hashes" in df
-    assert "pip wheel --wheel-dir=/build/wheels -r /build/requirements.txt" not in df
+
+    komutlar = [s.strip() for s in df.splitlines() if "pip wheel" in s and not s.lstrip().startswith("#")]
+    assert komutlar, "Dockerfile'da `pip wheel` komutu yok"
+    for k in komutlar:
+        assert "--require-hashes" in k, f"hash dogrulamasi olmadan wheel uretiliyor: {k}"
+        assert LOCK_YOLU.name in k, f"wheel lock disindan uretiliyor: {k}"
 
 
 def test_dockerfile_lock_python_surumunu_dogruluyor():
