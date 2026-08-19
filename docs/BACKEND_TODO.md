@@ -327,7 +327,15 @@ Gateway bu rejimi cihazin DNP3 noktalarindan **CIKARMAZ** (otomatik
 | Alan | Tip | Zorunlu | Varsayilan | Anlami |
 |---|---|---|---|---|
 | `session_policy` | string | hayir | `"continuous"` | `"continuous"` = bugunku davranis (periyodik Class 1/2/3 + Class 0 + acilis integrity). `"smart"` = hicbir tekrarlayan tarama YOK, acilis integrity YOK, beklenen kapanma `comm_lost` URETMEZ. |
-| `smart_max_silence_sec` | int \| null | hayir | `null` | `session_policy="smart"` iken: cihaz bu kadar saniye HIC gecerli DNP3 kaniti gondermezse `smart_idle -> lost` gecisi yapilir ve normal comm_lost calisir. `null` = denetim kapali. Kabul araligi **60 .. 2592000** (30 gun). |
+| `smart_max_silence_sec` | int \| null | hayir | `null` | `session_policy="smart"` iken: cihaz bu kadar saniye HIC gecerli DNP3 kaniti gondermezse `smart_idle -> lost` gecisi yapilir ve normal comm_lost calisir. `null`/eksik = **cihaz seviyesinde ezme yok** ("kapali" DEMEK DEGIL — bkz. cozum sirasi). Kabul araligi **60 .. 2592000** (30 gun). |
+
+**Sessizlik esiginin kanonik cozum sirasi**
+
+1. gecerli cihaz degeri (`smart_max_silence_sec`, 60..2592000)
+2. `DNP3_SMART_MAX_SILENCE_SEC` (`0` = kapali, `60..2592000` = gecerli)
+3. kapali
+
+Gecersiz bir cihaz degeri 1. adimi atlar ve ayni siradan devam eder.
 
 ### Dogrulama kurallari (gateway tarafinda ZATEN uygulaniyor)
 

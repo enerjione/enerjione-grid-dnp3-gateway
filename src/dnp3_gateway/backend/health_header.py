@@ -129,7 +129,13 @@ def build_payload(
         # sayim eskiden sahte comm_lost'a donusuyordu; artik ayri bir gozlem
         # ve merkezden gorulebilmesi gerekiyor. Yayindaki backend tanimadigi
         # anahtarlari `raw_json`e yaziyor — ek kolon/migration GEREKMEZ.
-        # `smart_idle`: Smart politikadaki SAGLIKLI uyuyan cihaz sayisi.
+        # `smart_idle` : Smart politikadaki SAGLIKLI uyuyan cihaz sayisi.
+        # `smart_lost`  : Smart politikali ama GERCEKTEN kopuk cihaz sayisi
+        #                 (sessizlik penceresi asilmis). Ikisi ayri sayilir;
+        #                 karistirilirlarsa uyuyan filo arizali gorunur.
+        #
+        # `smart_lost` sayac olarak GIDER ama `states` haritasini DEGISTIRMEZ:
+        # o cihazlar zaten `lost` durumundadir ve oraya `lost` olarak girer.
         # Yayindaki backend tanimadigi anahtarlari `raw_json`e yaziyor —
         # migration GEREKMEZ, eski backend KIRILMAZ.
         for anahtar in (
@@ -140,6 +146,7 @@ def build_payload(
             "unknown",
             "alive_no_data",
             "smart_idle",
+            "smart_lost",
         ):
             if anahtar in device_summary:
                 devices[anahtar] = device_summary[anahtar]

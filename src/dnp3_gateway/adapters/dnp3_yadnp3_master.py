@@ -28,6 +28,10 @@ from typing import Any
 
 from dnp3_gateway.adapters.base import SignalReading, TelemetryReader
 from dnp3_gateway.backend import DeviceConfig, SignalConfig
+from dnp3_gateway.backend.config_client import (
+    _SMART_SILENCE_MAX_SEC,
+    _SMART_SILENCE_MIN_SEC,
+)
 from dnp3_gateway.command_parameters import validate_command_parameters
 from dnp3_gateway.session_state_store import SessionStateRecord, SessionStateStore
 
@@ -2833,19 +2837,37 @@ class Yadnp3TelemetryReader(TelemetryReader):
         return "smart"
 
     def _smart_silence_limit(self, device: DeviceConfig) -> int | None:
-        """Bu CIHAZ icin sessizlik esigi (saniye); None = denetim KAPALI.
+        """Bu CIHAZ icin etkin sessizlik esigi (saniye); None = denetim KAPALI.
 
-        Oncelik: cihaz bazli backend degeri > kurulum geneli yedek > KAPALI.
-        Adapter'da gomulu bir sure YOKTUR: dogru deger cihazin Dial-In rapor
-        programina baglidir ve uydurulmasi, saglikli bir cihazi erken offline
-        ilan etmek demek olurdu.
+        KANONIK COZUM SIRASI (sozlesme — docs/HORSTMANN_SMART_MODE.md):
+
+          1. GECERLI cihaz degeri (`smart_max_silence_sec`, 60..2592000)
+          2. `DNP3_SMART_MAX_SILENCE_SEC` (0 = kapali, 60..2592000 = gecerli)
+          3. KAPALI
+
+        `null` / eksik cihaz degeri "denetim kapali" DEMEK DEGILDIR; yalnizca
+        "cihaz seviyesinde ezme yok" demektir ve karar 2. adima duser.
+
+        GECERSIZ cihaz degeri (aralik disi, bozuk tip) de AYNI sekilde ele
+        alinir: cihaz ezmesi YOK SAYILIR ve env yedegine dusulur. Uydurma bir
+        esikle cihazi erken offline ilan etmektense yapilandirilmis yedege
+        donmek dogrudur.
+
+        ARALIK KONTROLU BURADA DA YAPILIR — backend parser'i zaten suzuyor
+        ama `DeviceConfig` DISK ONBELLEGINDEN de gelebilir
+        (`state.load_from_cache` alanlari dogrudan JSON'dan kurar ve parser'i
+        ATLAR). Iki yolun ayni sinirlari uygulamasi sart; aksi halde
+        onbellekten gelen 30 saniyelik bir esik normal uyuyan her cihazi
+        kopuk ilan ederdi.
         """
         ozel = getattr(device, "smart_max_silence_sec", None)
-        try:
-            if ozel is not None and int(ozel) > 0:
-                return int(ozel)
-        except (TypeError, ValueError):
-            pass
+        if ozel is not None:
+            try:
+                n = int(ozel)
+            except (TypeError, ValueError):
+                n = None
+            if n is not None and _SMART_SILENCE_MIN_SEC <= n <= _SMART_SILENCE_MAX_SEC:
+                return n
         return self._smart_max_silence_sec
 
     def _durumu_geri_yukle(self, mm: _ManagedMaster, device: DeviceConfig) -> None:

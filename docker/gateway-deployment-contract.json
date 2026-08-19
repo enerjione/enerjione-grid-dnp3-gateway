@@ -147,10 +147,10 @@
     "smart_requires_endpoint_type": "initiating",
     "smart_wrong_endpoint_behavior": "fail_safe_continuous: session_policy=smart + ip_endpoint_type!=initiating kombinasyonunda cihaz 'continuous' olarak calistirilir ve ERROR loglanir. Config TUMDEN reddedilmez.",
     "smart_max_silence_default": null,
-    "smart_max_silence_default_semantic": "null/eksik = sessizlik denetimi KAPALI; cihaz suresiz smart_idle kalabilir. Gateway'de GOMULU bir sure YOKTUR. Kurulum geneli yedek: DNP3_SMART_MAX_SILENCE_SEC (varsayilan 0 = kapali). Oncelik: cihaz alani > env yedegi > kapali.",
+    "smart_max_silence_default_semantic": "null/eksik = CIHAZ SEVIYESINDE EZME YOK (denetim kapali DEMEK DEGILDIR). Cozum sirasi: (1) gecerli cihaz degeri 60..2592000, (2) DNP3_SMART_MAX_SILENCE_SEC [0=kapali, 60..2592000=gecerli], (3) kapali. GECERSIZ cihaz degeri: cihaz ezmesi YOK SAYILIR ve ayni sirayla env yedegine dusulur; env 0/yoksa kapali.",
     "smart_max_silence_min": 60,
     "smart_max_silence_max": 2592000,
-    "smart_max_silence_invalid_behavior": "ignored_disabled: aralik disi (0 ve negatifler dahil), bozuk tip ya da ayristirilamayan deger -> null (denetim kapali) + WARNING. Config DUSMEZ.",
+    "smart_max_silence_invalid_behavior": "device_override_ignored: aralik disi (0 ve negatifler dahil), bozuk tip ya da ayristirilamayan cihaz degeri -> cihaz ezmesi yok sayilir + WARNING, env yedegine dusulur. Config DUSMEZ.",
     "smart_idle_health_state": "smart_idle",
     "smart_idle_counted_as_lost": false,
     "smart_idle_in_devices_states": false,
@@ -164,6 +164,13 @@
       "unknown"
     ],
     "unknown_device_config_fields": "ignored",
-    "command_plane_changed": false
+    "command_plane_changed": false,
+    "smart_max_silence_resolution_order": [
+      "valid_device_value(60..2592000)",
+      "env:DNP3_SMART_MAX_SILENCE_SEC(0=disabled,60..2592000)",
+      "disabled"
+    ],
+    "env_smart_max_silence_accepted": "0 | 60..2592000",
+    "env_smart_max_silence_invalid_behavior": "fail_closed: 1..59 ve 2592000 ustu boot'ta config hatasi uretir (ConfigError)."
   }
 }

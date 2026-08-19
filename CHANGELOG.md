@@ -139,7 +139,18 @@ Testlerle kilitli: `tests/test_smart_session_contract.py` (GS01..GS14).
 | Alan | Tip | Varsayilan | Kural |
 |---|---|---|---|
 | `session_policy` | string | `"continuous"` | `"continuous"` \| `"smart"`. Tanimsiz deger -> **TUM config reddedilir** (`GatewayConfigError`); sessizce varsayilana DUSMEZ. |
-| `smart_max_silence_sec` | int \| null | `null` | `null` = sessizlik denetimi KAPALI. Kabul araligi **60 .. 2592000** (30 gun). Aralik disi (0 ve negatifler dahil), bozuk tip -> **`null`e dusurulur + WARNING**, config DUSMEZ. |
+| `smart_max_silence_sec` | int \| null | `null` | `null`/eksik = **cihaz seviyesinde ezme yok** ("kapali" DEMEK DEGIL). Kabul araligi **60 .. 2592000** (30 gun). Aralik disi (0 ve negatifler dahil) ya da bozuk tip -> **cihaz ezmesi yok sayilir + WARNING**, env yedegine dusulur, config DUSMEZ. |
+
+**Sessizlik esiginin KANONIK cozum sirasi**
+
+1. **gecerli cihaz degeri** (`smart_max_silence_sec`, 60..2592000)
+2. **`DNP3_SMART_MAX_SILENCE_SEC`** (`0` = kapali, `60..2592000` = gecerli)
+3. **kapali**
+
+Gecersiz bir cihaz degeri 1. adimi atlar ve ayni siradan devam eder.
+Env yedegi **fail-closed** dogrulanir: `1..59` ve `2592000` ustu **boot'ta
+config hatasi** uretir — o araliktaki bir esik normal bir Smart uykusunu bile
+kopuk ilan ederdi.
 
 **Uc tipi kisiti:** `session_policy="smart"` YALNIZCA
 `ip_endpoint_type="initiating"` ile gecerlidir (baglantiyi cihaz baslatir).
@@ -148,9 +159,8 @@ calistirilir ve ERROR loglanir — config TUMDEN reddedilmez, cunku tek bir
 yanlis cihaz yuzunden tum filonun config yenilemesini bloke etmek daha kotu
 bir uretim sonucudur.
 
-**Gateway varsayilani:** adapter'da GOMULU bir sessizlik suresi YOKTUR.
-Oncelik: cihaz alani > `DNP3_SMART_MAX_SILENCE_SEC` (varsayilan `0` = kapali)
-> kapali.
+**Gateway varsayilani:** adapter'da GOMULU bir sessizlik suresi YOKTUR;
+`DNP3_SMART_MAX_SILENCE_SEC` varsayilani `0` (kapali).
 
 **Health sozlesmesi**
 
@@ -159,7 +169,7 @@ Oncelik: cihaz alani > `DNP3_SMART_MAX_SILENCE_SEC` (varsayilan `0` = kapali)
 | `smart_idle` health state | `"smart_idle"` |
 | `devices.lost` icine dahil mi | **HAYIR** |
 | `devices.states` haritasina girer mi | **HAYIR** (saglikli durum) |
-| Yeni sayaclar | `devices.smart_idle`, `devices.smart_lost` |
+| Yeni sayaclar | `devices.smart_idle`, `devices.smart_lost` (ikisi de saglik basligina TASINIR) |
 | Mevcut sayaclar | `total`/`online`/`recovering`/`lost`/`unknown` **DEGISMEDI** |
 
 > `smart_idle`in `lost` sayilmasi bir URETIM HATASI uretirdi: Grid'in

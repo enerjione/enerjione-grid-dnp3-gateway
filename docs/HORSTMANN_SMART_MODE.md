@@ -143,11 +143,26 @@ esik asildi
     -> lost -> mevcut comm_lost mekanizmasi (TEK bir kenar yayini)
 ```
 
-Esik cihaz basina cozulur:
+### Kanonik cozum sirasi
 
-1. `DeviceConfig.smart_max_silence_sec` (backend, cihaz bazli),
-2. `DNP3_SMART_MAX_SILENCE_SEC` (kurulum geneli yedek),
-3. yoksa **denetim KAPALI**.
+`smart_max_silence_sec` = `null` / eksik demek **"cihaz seviyesinde ezme yok"**
+demektir — **"denetim kapali" DEMEK DEGILDIR**. Karar su sirayla cozulur:
+
+1. **gecerli cihaz degeri** — `DeviceConfig.smart_max_silence_sec`, **60..2592000**
+2. **`DNP3_SMART_MAX_SILENCE_SEC`** — kurulum geneli yedek (`0` = kapali,
+   `60..2592000` = gecerli)
+3. **kapali**
+
+**Gecersiz cihaz degeri** (aralik disi — `0` ve negatifler dahil —, bozuk tip
+ya da ayristirilamayan deger): cihaz ezmesi **yok sayilir** + WARNING, ve ayni
+sirayla **2. adima** dusulur. Config DUSMEZ.
+
+> Aralik kontrolu hem backend parser'inda hem adapter'da yapilir: `DeviceConfig`
+> disk onbelleginden de gelebilir ve o yol parser'i atlar.
+
+**Env yedegi fail-closed dogrulanir:** `1..59` ve `2592000` ustu degerler
+**boot'ta config hatasi** uretir. O araliktaki bir esik normal bir Smart
+uykusunu bile kopuk ilan ederdi.
 
 > **Adapter'da gomulu bir sure YOKTUR** — bilincli. Dogru deger cihazin
 > Dial-In rapor programina baglidir ve yalnizca kurulumu yapan bilir.
@@ -168,8 +183,8 @@ Esik asildiktan sonra cihaz, **yeni ve kanitli bir oturum** kurmadan tekrar
 | Anahtar | Yer | Varsayilan | Aciklama |
 |---|---|---|---|
 | `session_policy` | backend, cihaz basina | `continuous` | `continuous` \| `smart` |
-| `smart_max_silence_sec` | backend, cihaz basina | `null` | Sessizlik esigi (60..2592000 sn) |
-| `DNP3_SMART_MAX_SILENCE_SEC` | gateway `.env` | `0` (kapali) | Cihaz bazli deger yoksa yedek |
+| `smart_max_silence_sec` | backend, cihaz basina | `null` (= ezme yok) | Sessizlik esigi, **60..2592000** sn. Gecersizse yok sayilir, env yedegine dusulur. |
+| `DNP3_SMART_MAX_SILENCE_SEC` | gateway `.env` | `0` (kapali) | Cihaz ezmesi yokken kullanilan yedek. Kabul: **`0` veya `60..2592000`**; `1..59` boot'ta REDDEDILIR. |
 
 Politikanin kendisi icin **env anahtari yoktur**: karar cihaz basinadir ve
 kurulum geneli bir bayrakla verilemez.
@@ -205,6 +220,9 @@ Ozet sayimlar (`/health` -> `devices`): `online`, `recovering`, `lost`,
 
 Sayaclar (`devices.recovery`): `smart_idle_wakeup_total`,
 `smart_silence_lost_total`.
+
+Backend'e giden saglik basligi (`X-E1-Gateway-Health`) `devices.smart_idle` ve
+`devices.smart_lost` sayaclarini da tasir.
 
 `smart_idle`, backend'e giden saglik basliginda **sorun olarak
 raporlanmaz** — aksi halde saglikli uyuyan filo arizali gorunurdu.

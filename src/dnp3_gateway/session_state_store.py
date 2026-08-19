@@ -217,6 +217,18 @@ class SessionStateStore:
 
         Hiz sinirlidir (`MIN_WRITE_INTERVAL_SEC`); `force=True` kapanista
         siniri atlar — surec olurken son durum kaybolmamali.
+
+        DAYANIKLILIK: yazim BASARISIZ olursa `_kirli` GERI ALINIR.
+        Aksi halde tek bir gecici disk hatasi (dolu disk, kilitli dosya,
+        anlik izin sorunu) kaydi KALICI olarak dusururdu: bayrak temizlenmis
+        oldugu icin bir daha hic yazilmaz ve restart'ta uyuyan filo sahte
+        comm_lost uretirdi — yani tam da bu dosyanin onlemek icin var oldugu
+        sey.
+
+        `_son_yazim` BILEREK geri alinmaz: kalici bir disk hatasinda her
+        `read_device` cagrisi yeni bir yazim denemesi tetiklerdi. Hiz siniri
+        korunarak yeniden deneme ~5 saniyede bire indirilir; kapanistaki
+        `force=True` yolu bu sinirdan etkilenmez.
         """
         if self._path is None:
             return False
@@ -250,15 +262,21 @@ class SessionStateStore:
                     pass
                 raise
             return True
-        except OSError as exc:
-            # Diske yazamamak telemetriyi DURDURMAZ; yalnizca restart sonrasi
-            # uyku bilgisi kaybolur. Tek satir uyari yeter (her 5sn'de bir
-            # loglamak, asil sorunu — dolu diski — gizlerdi).
+        except Exception as exc:  # noqa: BLE001
+            # KAYIT KAYBOLMASIN: bayragi geri ac ki bir sonraki flush yeniden
+            # denesin. `record()` bu arada yeni bir degisiklik yazdiysa zaten
+            # True'dur; True'yu tekrar True yapmak zararsizdir (yaris yok).
+            with self._lock:
+                self._kirli = True
+            # Diske yazamamak telemetriyi DURDURMAZ — istisna DISARI SIZMAZ;
+            # yalnizca restart sonrasi uyku bilgisi kaybolabilir. Tek satir
+            # uyari yeter (her 5 sn'de bir loglamak asil sorunu gizlerdi).
             if not self._yazim_hatasi_uyarildi:
                 self._yazim_hatasi_uyarildi = True
                 logger.warning(
                     "session_state_store_persist_failed path=%s error=%s — restart "
-                    "sonrasi Smart uyku durumu geri yuklenemeyebilir",
+                    "sonrasi smart_idle durumu geri yuklenemeyebilir; yazim yeniden "
+                    "denenecek",
                     self._path,
                     exc,
                 )
