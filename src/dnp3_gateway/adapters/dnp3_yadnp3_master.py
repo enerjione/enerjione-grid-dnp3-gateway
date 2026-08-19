@@ -29,6 +29,7 @@ from typing import Any
 from dnp3_gateway.adapters.base import SignalReading, TelemetryReader
 from dnp3_gateway.backend import DeviceConfig, SignalConfig
 from dnp3_gateway.command_parameters import validate_command_parameters
+from dnp3_gateway.session_state_store import SessionStateRecord, SessionStateStore
 
 logger = logging.getLogger(__name__)
 
@@ -398,6 +399,39 @@ def _bayatlik_esigi_sn(scan_interval_sec: float, baseline_interval_sec: float) -
     )
 
 
+# HORSTMANN SMART MODE — SESSIZLIK PENCERESI
+# ------------------------------------------
+# Smart moddaki bir Horstmann, DNP3 oturumu BOSA DUSTUKTEN 15 saniye sonra
+# hucresel modemi kapatir (Initiating Endpoint Mode). Gateway 5 saniyede bir
+# Class scan gonderirse bu sayac HICBIR ZAMAN dolmaz ve cihaz modemini
+# kapatamaz — yani gateway, cihazin en temel tasarim davranisini kirar.
+#
+# Cozum kutuphane seviyesinde: `session_policy="smart"` olan bir cihazin
+# master'ina `AddClassScan` HIC EKLENMEZ ve `AssignClassDuringStartup` False
+# doner (bkz. `_ManagedMaster`). Olculdu (yadnp3 3.2.1.1, gercek loopback):
+# boyle bir master 20 saniyede master->outstation yonunde SIFIR bayt uretir;
+# cihazin unsolicited raporlari normal sekilde islenmeye devam eder.
+#
+# Bu sabit yalnizca DOGRULAMA/dokumantasyon icindir: testler sessizlik
+# penceresini bunun uzerinden olcer. Sartname: "Initiating Endpoint
+# inactivity timeout is fixed at 15 seconds" + "Any TCP/DNP traffic resets
+# this inactivity timeout".
+HORSTMANN_IDLE_TIMEOUT_SEC = 15.0
+
+# SMART SESSIZLIK DENETIMI
+# ------------------------
+# "TCP kopuk" ile "cihaz zamaninda haber vermedi" AYRI seylerdir. Smart
+# politikada modemin kapali olmasi beklenen durumdur; ama cihaz sonsuza kadar
+# da kaybolamaz.
+#
+# BURADA GOMULU BIR SURE YOKTUR — bilincli. Dogru deger cihazin Dial-In rapor
+# programina baglidir ve yalnizca kurulumu yapan bilir; adapter'a "24 saat"
+# gomulseydi, saatlik rapor veren bir cihaz saatlerce olu gorunmeden kalirdi
+# ya da gunluk rapor veren bir cihaz her gun sahte comm_lost uretirdi.
+# Kaynak sirasi: DeviceConfig.smart_max_silence_sec > DNP3_SMART_MAX_SILENCE_SEC
+# > KAPALI (denetim yok).
+
+
 # OLCUM SESSIZLIGI YOKLAMASI — "kopuk deme, SOR".
 # Cihaz cevap veriyor (kanit taze) ama olcum tablosu bayat kaldiysa periyodik
 # integrity poll gonderilir. Bu, eskiden sahte comm_lost URETEN kosulun
@@ -506,6 +540,31 @@ def _g110_bloklari(
         )
         parcali = parcali[:_G110_MAX_BLOK]
     return tuple(parcali)
+
+
+#: `smart` + `listening` uyarisi verilmis cihazlar. Bu kosul KALICIDIR
+#: (config duzeltilene kadar surer); her poll cycle'inda loglamak defteri
+#: doldurur ve gercek arizalari gizlerdi.
+_uc_uyari_lock = threading.Lock()
+_uc_uyarilan: set[str] = set()
+
+
+def _uc_uyarisi_ver(device_code: str) -> bool:
+    with _uc_uyari_lock:
+        if device_code in _uc_uyarilan:
+            return False
+        _uc_uyarilan.add(device_code)
+        return True
+
+
+def _epoch_metni(epoch: float | None) -> str:
+    """Log icin okunabilir UTC damgasi; yoksa "?"."""
+    if not epoch:
+        return "?"
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(epoch)))
+    except (TypeError, ValueError, OSError):
+        return "?"
 
 
 class Yadnp3AdapterError(RuntimeError):
@@ -632,6 +691,48 @@ class _DeviceCache:
         # log atmasi icin tek seferlik bayrak. read_device tuketince temizler.
         self._pending_recovery_publish: bool = False
 
+        # ---- OTURUM YASAM DONGUSU — CIHAZ BASINA ---------------------------
+        # BURASI KASITLI OLARAK _DeviceCache ICINDE: her cihazin kendi cache'i
+        # var, dolayisiyla politika ve uyku durumu dogal olarak CIHAZ BASINADIR.
+        # Gateway genelinde tek bir "smart mi" degiskeni YOKTUR ve olamaz;
+        # ayni proseste bir continuous cihaz baska bir cihazin uykusunu
+        # engellemez.
+        #
+        # "continuous" (varsayilan) -> bugunku davranis, hicbir sey degismez.
+        # "smart"                   -> Horstmann Smart Mode yasam dongusu.
+        self._session_policy: str = "continuous"
+
+        # BU OTURUMDA GECERLI DNP3 KANITI GORULDU MU?
+        #
+        # Sadece TCP baglantisi YETMEZ (sartname geregi): kanit bir OLCUM,
+        # gecerli bir IIN ya da BASARILI bir DNP3 gorevi olmalidir — yani
+        # `set()` veya `note_evidence()`. Gerekce: 4G'de soket kurulup DNP3
+        # katmani hic konusmadan da dusebilir; bunu "basarili oturum" sayip
+        # `smart_idle`e gecmek GERCEK bir arizayi saglikli uyku gibi
+        # gosterirdi. Her `OnOpen`da sifirlanir.
+        self._session_evidence: bool = False
+
+        # SMART IDLE — modem kapali, cihaz SAGLIKLI. 0.0 = idle degil.
+        self._smart_idle_since: float = 0.0
+        self._smart_idle_since_wall: float = 0.0
+
+        # SON GECERLI TEMAS — MONOTONIC (calisma zamani karari bunun uzerinden
+        # verilir; sartname geregi). `_last_evidence_at`ten farki: o link
+        # kopusunda SIFIRLANIR, bu ise sessizlik denetiminin capasi oldugu
+        # icin KORUNUR.
+        self._last_valid_contact: float = 0.0
+        # Duvar saati karsiligi — YALNIZCA gosterim ve kalicilastirma icin.
+        self._last_valid_contact_wall: float = 0.0
+
+        # Bekleyen "uyandi" olayinin suresi (saniye); -1 = bekleyen olay YOK.
+        # IO thread'i idle'i bitirir, kenar-tetikli log'u poll thread'i basar.
+        #
+        # SENTINEL -1, 0 DEGIL: cok kisa bir idle (ya da hizli bir test)
+        # suresi 0.0 uretebilir ve "0 = olay yok" kabul edilseydi o uyanma
+        # SESSIZCE DUSERDI — kenar-tetikli log'un tam da kacirmamasi gereken
+        # sey bu.
+        self._smart_wakeup_pending: float = -1.0
+
     def set(
         self,
         group: int,
@@ -679,6 +780,10 @@ class _DeviceCache:
             # Veri gelmesi en guclu canlilik kanitidir; kanit saatini de besler.
             # Bu sayede `kanit_yasi <= veri_yasi` degismezligi korunur.
             self._last_evidence_at = now
+            # Olcum, sartnamedeki "gecerli DNP3 kaniti"nin en guclu halidir.
+            self._session_evidence = True
+            self._last_valid_contact = now
+            self._last_valid_contact_wall = self._last_update_wall
             # Kalite bayragi degisimi de bir DEGISIKLIKTIR: deger ayni kalsa
             # bile nokta 'gecerli'den 'REFERENCE_ERR'e gecmisse SCADA bunu
             # gormeli.
@@ -926,10 +1031,50 @@ class _DeviceCache:
             return time.monotonic() - self._link_opened_at
 
     def set_connected(self, ok: bool) -> None:
+        """TCP durumu degisti (opendnp3 `OnOpen` / `OnClose`).
+
+        SARTNAMEDEKI GECIS TABLOSU BURADA UYGULANIR:
+
+            TCP acildi                              -> recovering
+            TCP kapandi + continuous                -> lost
+            TCP kapandi + smart + oturumda KANIT VAR-> smart_idle
+            TCP kapandi + smart + KANIT YOK         -> lost
+
+        "Kanit" salt TCP baglantisi DEGILDIR: olcum, gecerli IIN ya da
+        basarili bir DNP3 gorevi olmalidir (bkz. `_session_evidence`).
+        Bu ayrim olmadan, DNP3 katmani hic konusmadan dusen bir 4G soketi
+        "saglikli uyku" gibi gorunur ve GERCEK bir ariza gizlenirdi.
+        """
         with self._lock:
             if ok and not self._connected:
-                self._link_opened_at = time.monotonic()
+                now = time.monotonic()
+                self._link_opened_at = now
+                # UYANDI: yeni oturum basliyor. Idle bayragi BURADA temizlenir
+                # (bu callback opendnp3 IO thread'inden gelir), ama idle SURESI
+                # kaybolmasin diye bekleyen bir "uyanma olayi"na cevrilir;
+                # kenar-tetikli log'u poll thread'i basar (bkz.
+                # `consume_smart_wakeup`). Loglamayi buradan yapmak IO
+                # thread'ini bloklamak olurdu.
+                if self._smart_idle_since:
+                    self._smart_wakeup_pending = max(0.0, now - self._smart_idle_since)
+                    self._smart_idle_since = 0.0
+                    self._smart_idle_since_wall = 0.0
+                # YENI OTURUM: kanit sayfasi temiz baslar.
+                self._session_evidence = False
             elif not ok:
+                # BEKLENEN KAPANMA MI, ARIZA MI?
+                # Smart politikada, icinde GECERLI KANIT gecmis bir oturumun
+                # ardindan gelen kapanma cihazin TASARIM davranisidir: DNP3
+                # oturumu bosa dustu, cihaz modemi kapatti. Bunu `comm_lost`
+                # yayinlamak saglikli bir sahayi arizali gosterirdi.
+                #
+                # Kanitsiz bir oturumun kapanmasi idle SAYILMAZ ve mevcut
+                # lost/comm_lost yolundan gecer — Smart politika bir kopmayi
+                # gizlemek icin kullanilamaz.
+                smart_idle_e_gec = self._session_policy == "smart" and self._session_evidence
+                if smart_idle_e_gec:
+                    self._smart_idle_since = time.monotonic()
+                    self._smart_idle_since_wall = time.time()
                 self._link_opened_at = 0.0
                 # Link koptu: string'ler statik ama cihaz degistirilmis /
                 # konfigi guncellenmis olabilir. Sonraki OnOpen yeniden
@@ -939,16 +1084,18 @@ class _DeviceCache:
                 self._g110_deneme = 0
                 self._g110_sonraki_at = 0.0
             self._connected = ok
-            # Link tamamen koptu → state'i lost'a dusur. recovery flag'lerini
-            # temizle ki sonraki OnOpen yeniden recovering tetiklesin.
             if not ok:
-                self._state = "lost"
+                # smart_idle SAGLIKLI bir durumdur; `lost` DEGILDIR.
+                # continuous politikada davranis birebir eskisi gibi kalir.
+                self._state = "smart_idle" if self._smart_idle_since else "lost"
                 self._recovery_started_at = 0.0
                 self._recovery_anchor_at = 0.0
                 self._pending_recovery_publish = False
                 # Kanit da GECERSIZ: link kapandiysa onceki yanitlar artik
                 # "cihaz ulasilabilir" demez. Sifirlanmasaydi kopmus bir cihaz
                 # kanit esigi dolana kadar komut kabul ediyor gorunurdu.
+                # (`_last_valid_contact` AYRI ve korunur — sessizlik denetimi
+                # onun uzerinden calisir.)
                 self._last_evidence_at = 0.0
 
     def is_connected(self) -> bool:
@@ -983,8 +1130,16 @@ class _DeviceCache:
         Bu yuzden kural tek yonlu: yalnizca BASARI kanittir.
         """
         now = time.monotonic()
+        wall = time.time()
         with self._lock:
             self._last_evidence_at = now
+            # Sartname: gecerli IIN ve BASARILI DNP3 gorevi de kanittir.
+            self._session_evidence = True
+            # Sessizlik denetiminin capasi. `_last_evidence_at` link kopusunda
+            # sifirlanir, bu ALAN SIFIRLANMAZ: "cihaz en son ne zaman haber
+            # verdi" sorusu link durumundan bagimsizdir.
+            self._last_valid_contact = now
+            self._last_valid_contact_wall = wall
 
     def last_evidence_at(self) -> float:
         """Son canlilik kanitinin MONOTONIC damgasi (0.0 = hic kanit yok)."""
@@ -1035,6 +1190,107 @@ class _DeviceCache:
                 self._recovery_started_at = 0.0
                 self._recovery_anchor_at = 0.0
                 self._pending_recovery_publish = False
+
+    # ---- Oturum yasam dongusu / smart_idle (CIHAZ BASINA) ------------------
+
+    def session_policy(self) -> str:
+        with self._lock:
+            return self._session_policy
+
+    def set_session_policy(self, policy: str) -> None:
+        """Politika master kurulurken bir kez yazilir.
+
+        Degisirse master ZATEN yeniden kurulur (`connection_fingerprint`
+        `session_policy`i icerir), dolayisiyla burada gecis mantigi YOKTUR.
+        """
+        with self._lock:
+            self._session_policy = "smart" if str(policy).lower() == "smart" else "continuous"
+
+    def session_evidence(self) -> bool:
+        """Bu link oturumunda GECERLI DNP3 kaniti gorulduu mu?"""
+        with self._lock:
+            return self._session_evidence
+
+    def is_smart_idle(self) -> bool:
+        with self._lock:
+            return self._smart_idle_since != 0.0
+
+    def smart_idle_age(self) -> float:
+        """`smart_idle` durumunda gecen sure (saniye); degilse -1."""
+        with self._lock:
+            if self._smart_idle_since == 0.0:
+                return -1.0
+            return time.monotonic() - self._smart_idle_since
+
+    def smart_idle_since_wall(self) -> float | None:
+        with self._lock:
+            return self._smart_idle_since_wall or None
+
+    def last_valid_contact(self) -> float:
+        """Son GECERLI DNP3 kanitinin MONOTONIC damgasi (0.0 = hic yok).
+
+        Sessizlik denetimi bunu kullanir. Monotonic secilmesi sartname
+        geregidir ve gerekcesi somuttur: duvar saatiyle olculse, tek bir NTP
+        siçramasi 600 uyuyan cihazi ayni anda `lost` yapardi.
+        """
+        with self._lock:
+            return self._last_valid_contact
+
+    def last_valid_contact_wall(self) -> float | None:
+        """Duvar saati karsiligi — gosterim ve kalicilastirma icin."""
+        with self._lock:
+            return self._last_valid_contact_wall or None
+
+    def smart_idle_to_lost(self) -> bool:
+        """Sessizlik esigi asildi: `smart_idle` -> `lost`. Donen: gecis oldu mu.
+
+        Kanit sayfasi da temizlenir; aksi halde cihaz bir sonraki cycle'da
+        ayni kosulla kendiliginden `smart_idle`e geri doner ve comm_lost tek
+        cycle sonra susardi — yani gercekten kaybolmus bir cihaz SCADA'da son
+        iyi degeriyle canli gorunmeye devam ederdi.
+        """
+        with self._lock:
+            if self._smart_idle_since == 0.0:
+                return False
+            self._smart_idle_since = 0.0
+            self._smart_idle_since_wall = 0.0
+            self._session_evidence = False
+            self._state = "lost"
+            return True
+
+    def consume_smart_wakeup(self) -> float:
+        """IO thread'inin birakti uyanma olayini tuket; suresini doner (yoksa -1)."""
+        with self._lock:
+            sure = self._smart_wakeup_pending
+            self._smart_wakeup_pending = -1.0
+            return sure
+
+    def restore_smart_idle(
+        self,
+        *,
+        smart_idle_since_wall: float | None,
+        last_valid_contact_wall: float | None,
+    ) -> None:
+        """Kalici kayittan (restart sonrasi) `smart_idle` durumunu geri yukle.
+
+        Monotonic saat restart'ta sifirlandigi icin yaslar duvar saati
+        farkindan turetilir. Boylece yeniden baslayan bir gateway, uyuyan
+        cihazlari comm_lost firtinasina cevirmeden kaldigi yerden devam eder.
+        """
+        now_mono = time.monotonic()
+        now_wall = time.time()
+        with self._lock:
+            if self._session_policy != "smart":
+                return
+            if last_valid_contact_wall:
+                self._last_valid_contact_wall = float(last_valid_contact_wall)
+                yas = max(0.0, now_wall - float(last_valid_contact_wall))
+                self._last_valid_contact = max(0.0, now_mono - yas)
+            if smart_idle_since_wall:
+                yas = max(0.0, now_wall - float(smart_idle_since_wall))
+                self._smart_idle_since = max(0.0, now_mono - yas)
+                self._smart_idle_since_wall = float(smart_idle_since_wall)
+                self._state = "smart_idle"
 
     def consume_recovery_publish(self) -> bool:
         """Fresh frame ile recovery confirmed olduysa True doner; tek seferlik.
@@ -1280,7 +1536,9 @@ def _report_iin(cache: _DeviceCache, device_code: str, iin: Any) -> None:
         )
 
 
-def _make_master_app(cache: _DeviceCache, device_code: str) -> Any:
+def _make_master_app(
+    cache: _DeviceCache, device_code: str, *, assign_class_during_startup: bool = True
+) -> Any:
     if not _YADNP3_AVAILABLE:
         raise Yadnp3AdapterError(f"yadnp3 yuklu degil: {_YADNP3_IMPORT_ERROR}")
 
@@ -1342,12 +1600,19 @@ def _make_master_app(cache: _DeviceCache, device_code: str) -> Any:
             logger.info("yadnp3_master_link_close device=%s", device_code)
 
         def AssignClassDuringStartup(self):  # noqa: N802
-            # True: OpenDNP3 link acilir acilmaz baslangic integrity poll'u
-            # tetikler (Class 0/1/2/3 hepsini bir kerede toplar). Bu olmadigi
-            # zaman ilk veri scheduled scan'i (baseline 30sn / event 1sn) bek-
-            # liyor; cihaz baglandiktan sonra ilk değerin frontend'e ulaşmasi
-            # 30 sn'ye varabilir. True yapmak ilk veriyi <1sn'ye duşurur.
-            return True
+            # continuous (VARSAYILAN, True): OpenDNP3 link acilir acilmaz
+            # baslangic integrity poll'u tetikler (Class 0/1/2/3 hepsini bir
+            # kerede toplar). Bu olmadigi zaman ilk veri scheduled scan'i
+            # (baseline 30sn / event 1sn) bekliyor; cihaz baglandiktan sonra
+            # ilk degerin frontend'e ulasmasi 30 sn'ye varabilir. True yapmak
+            # ilk veriyi <1sn'ye dusurur.
+            #
+            # smart (False): acilista integrity poll'u GONDERILMEZ. Smart
+            # Navigator'da ad-hoc Class 0 yoklamasi zaten YALNIZCA Boost
+            # modda mumkundur; dahasi bu poll cihazin 15 saniyelik hareketsizlik
+            # sayacini sifirlayan gereksiz trafiktir. Cihaz raporunu KENDISI
+            # unsolicited olarak gonderir — beklenen akis budur.
+            return assign_class_during_startup
 
         def Now(self):  # noqa: N802
             """opendnp3 outstation'a saat yazarken bu degeri kullanir.
@@ -1426,6 +1691,7 @@ class _ManagedMaster:
         scan_interval_sec: int,
         baseline_interval_sec: int,
         time_sync: str = "lan",
+        session_policy: str = "continuous",
     ) -> None:
         self.device = device
         self.cache = _DeviceCache()
@@ -1445,6 +1711,26 @@ class _ManagedMaster:
         # komut ucustayken oturumu yikmak gorevi cevapsiz birakir ve sonuc
         # CommandStatus.UNDEFINED doner (sahada olculdu 2026-08-11).
         self.last_command_at: float = 0.0
+        # OTURUM YASAM DONGUSU — bu cihaza OZEL, ACIKCA yapilandirilir.
+        #
+        #   "continuous" (VARSAYILAN): bugunku davranis. Class 1/2/3 event
+        #       scan + Class 0 integrity scan opendnp3 zamanlayicisinda kosar,
+        #       ve baglantida acilis integrity poll'u yapilir.
+        #
+        #   "smart": HICBIR tekrarlayan tarama kurulmaz ve acilis integrity
+        #       poll'u YAPILMAZ. Zorunlu, cunku Smart Navigator'in
+        #       hareketsizlik sayaci HER DNP3 frame'inde sifirlanir ve 15
+        #       saniyeye ulasmazsa modem kapanamaz. Kutuphane bir taramayi
+        #       sonradan durdurmayi sunmadigi icin (yadnp3 3.2.1.1'de
+        #       `IMasterScan` yalnizca `Demand()` tasiyor) kontrol "eklememek"
+        #       uzerinden kurulur.
+        #
+        # Politika CIHAZ BASINADIR ve `connection_fingerprint`e dahildir:
+        # degisirse YALNIZCA o cihazin master'i yeniden kurulur.
+        self.session_policy: str = "smart" if str(session_policy).lower() == "smart" else "continuous"
+        self.cache.set_session_policy(self.session_policy)
+        self._scan_event: Any = None
+        self._scan_class0: Any = None
 
         endpoint_type = (device.ip_endpoint_type or "listening").lower()
         channel_mode: str
@@ -1476,7 +1762,12 @@ class _ManagedMaster:
             channel_endpoint_label = f"{device.ip_address}:{tcp_port}"
 
         self._soe = _make_soe_handler(self.cache, device.code)
-        self._app = _make_master_app(self.cache, device.code)
+        self._app = _make_master_app(
+            self.cache,
+            device.code,
+            # smart: acilista Class 0/integrity ISTENMEZ (kabul kriteri E).
+            assign_class_during_startup=(self.session_policy != "smart"),
+        )
         cfg = opendnp3.MasterStackConfig()
         # Outstation unsolicited frame'leri SOE handler tarafindan dogal islenir;
         # disable etmiyoruz (kucuk mesaj ek yuk yok).
@@ -1518,6 +1809,49 @@ class _ManagedMaster:
         #      Tum statik noktalari yeniden okur — ama _DeviceCache.set() icin
         #      degeri degismemisse dirty=False, publish edilmez. Sadece kalite
         #      drift'i / kaybolan event'lerin telafisi icin guvenlik agi.
+        # PERIYODIK TARAMALAR — YALNIZCA "periodic" politikasinda.
+        #
+        # Smart moddaki bir Horstmann icin bu taramalar EKLENMEZ. Gerekce
+        # protokol degil FIZIKSEL: cihaz DNP3 oturumu 15 saniye bosta kalinca
+        # hucresel modemi kapatir; 5 saniyede bir gonderilen Class scan o
+        # sayaci her seferinde sifirlar ve modem hicbir zaman kapanamaz.
+        #
+        # Kutuphane bir scan'i sonradan DURDURMAYI desteklemiyor
+        # (`IMasterScan` yalnizca `Demand()` sunar, yadnp3 3.2.1.1), bu yuzden
+        # kontrol "eklememek" uzerinden kuruluyor. Veri kaybi YOK:
+        # `AssignClassDuringStartup=True` baglantida tam integrity snapshot'i
+        # getirir, unsolicited olaylar dogal olarak islenir ve gateway gerektiginde
+        # TEK ATISLIK `ScanClasses` gonderir (bkz. `request_integrity_poll`).
+        if self.session_policy != "smart":
+            self._periyodik_scan_ekle()
+        # G110 (Octet String) — cihaz integrity poll'de DONDURMUYOR (teshis
+        # 2026-07-20: SOE fragment'larinda OctetString yok, "Not Class 0").
+        # String'ler STATIK (seri no/IMEI/IP/firmware) — surekli okumaya gerek
+        # yok. Periyodik scan EKLENMEZ; string yalnizca baglanti kuruldugunda
+        # (recovery confirmed) BIR KEZ dar-range read ile okunur (scan_g110_once).
+        # Bu, cihaz/modem yukunu minimuma indirir + Mayis'ta bozan surekli/genis
+        # scan'den kacinir.
+        self._master.Enable()
+        logger.info(
+            "yadnp3_master_enabled device=%s mode=%s endpoint=%s remote=%s local=%s "
+            "event_scan=%ss integrity_scan=%ss session_policy=%s",
+            device.code,
+            channel_mode,
+            channel_endpoint_label,
+            device.dnp3_address,
+            local_address,
+            self._scan_interval_sec if self.session_policy != "smart" else "-",
+            self._baseline_interval_sec if self.session_policy != "smart" else "-",
+            self.session_policy,
+        )
+
+    def _periyodik_scan_ekle(self) -> None:
+        """Class 1/2/3 event + Class 0+1+2+3 baseline taramalarini kur.
+
+        Icerik ve zamanlama ESKISIYLE BIREBIR AYNI — yalnizca cagrildigi yer
+        kosullu hale geldi. Boost ve modu bilinmeyen cihazlar bu yoldan gecer,
+        yani uretim davranisi degismez.
+        """
         # Class 1/2/3 SIK event scan: outstation event buffer'inda biriken
         # degisimleri toplar. Sub-second yansima icin scan_interval_sec.
         self._scan_event = self._master.AddClassScan(
@@ -1537,25 +1871,6 @@ class _ManagedMaster:
             opendnp3.TimeDuration.Seconds(self._baseline_interval_sec),
             self._soe,
             opendnp3.TaskConfig.Default(),
-        )
-        # G110 (Octet String) — cihaz integrity poll'de DONDURMUYOR (teshis
-        # 2026-07-20: SOE fragment'larinda OctetString yok, "Not Class 0").
-        # String'ler STATIK (seri no/IMEI/IP/firmware) — surekli okumaya gerek
-        # yok. Periyodik scan EKLENMEZ; string yalnizca baglanti kuruldugunda
-        # (recovery confirmed) BIR KEZ dar-range read ile okunur (scan_g110_once).
-        # Bu, cihaz/modem yukunu minimuma indirir + Mayis'ta bozan surekli/genis
-        # scan'den kacinir.
-        self._master.Enable()
-        logger.info(
-            "yadnp3_master_enabled device=%s mode=%s endpoint=%s remote=%s local=%s "
-            "event_scan=%ss integrity_scan=%ss",
-            device.code,
-            channel_mode,
-            channel_endpoint_label,
-            device.dnp3_address,
-            local_address,
-            self._scan_interval_sec,
-            self._baseline_interval_sec,
         )
 
     @staticmethod
@@ -1941,6 +2256,8 @@ class Yadnp3TelemetryReader(TelemetryReader):
         device_count_hint: int = 0,
         lost_probe_interval_sec: float = 0.0,
         lost_relink_after_probes: int = 0,
+        smart_max_silence_sec: int | None = None,
+        session_store_path: str | None = None,
     ) -> None:
         if not _YADNP3_AVAILABLE:
             raise Yadnp3AdapterError(
@@ -1974,6 +2291,29 @@ class Yadnp3TelemetryReader(TelemetryReader):
             resolved_threads = max(4, min(32, -(-ipucu // 25))) if ipucu else 4
         self._manager = opendnp3.DNP3Manager(resolved_threads)
         self._manager_threads = resolved_threads
+        self._init_runtime_state(
+            lost_probe_interval_sec=lost_probe_interval_sec,
+            lost_relink_after_probes=lost_relink_after_probes,
+            smart_max_silence_sec=smart_max_silence_sec,
+            session_store_path=session_store_path,
+        )
+
+    def _init_runtime_state(
+        self,
+        *,
+        lost_probe_interval_sec: float = 0.0,
+        lost_relink_after_probes: int = 0,
+        smart_max_silence_sec: int | None = None,
+        session_store_path: str | None = None,
+    ) -> None:
+        """NATIVE OLMAYAN tum calisma-zamani alanlarini kurar.
+
+        `__init__`ten AYRI: bazi testler `__new__` ile ornek uretip native
+        `DNP3Manager` kurmadan durum makinesini kosuyor ve bu alanlari ELLE
+        set etmek zorunda kaliyordu. O liste her yeni alanda sessizce eskiyor
+        ve testler gercek nesneden AYRISIYORDU (bu ozellikte de tam olarak
+        oyle oldu). Tek kaynak burasi; testler de bu metodu cagirir.
+        """
         self._masters: dict[str, _ManagedMaster] = {}
         # Lock granulariteyi azaltmak icin double-check pattern: lock disinda
         # hizli dict lookup; sadece master OLUSTURURKEN lock alinir.
@@ -2006,6 +2346,28 @@ class Yadnp3TelemetryReader(TelemetryReader):
         # G110 okunamadi uyarisi verilmis cihazlar (cihaz basina TEK uyari).
         self._g110_uyarilan: set[str] = set()
 
+        # ---- SMART OTURUM YASAM DONGUSU -----------------------------------
+        # DIKKAT: burada gateway GENELINDE bir "smart mi" degiskeni YOKTUR.
+        # Politika CIHAZ BASINA `DeviceConfig.session_policy`den gelir;
+        # asagidakiler yalnizca (a) kurulum geneli yedek esik, (b) CIHAZ
+        # KODUNA anahtarlanmis kalici kayitlardir.
+        #
+        # `smart_max_silence_sec`: cihaz bazli deger YOKSA kullanilan yedek.
+        # None/0 = sessizlik denetimi KAPALI. Adapter'da gomulu bir "24 saat"
+        # varsayimi YOKTUR — dogru deger cihazin Dial-In rapor programina
+        # baglidir ve yalnizca kurulumu yapan bilir.
+        self._smart_max_silence_sec: int | None = (
+            int(smart_max_silence_sec) if smart_max_silence_sec else None
+        )
+        #: Cihaz basina kalici oturum durumu (restart sonrasi smart_idle geri
+        #: yuklenir; aksi halde uyuyan filo toplu comm_lost gorunurdu).
+        self._session_store = SessionStateStore(session_store_path)
+        self._session_store.load()
+        self._smart_sayaclari_lock = threading.Lock()
+        self._smart_idle_giris_total = 0
+        self._smart_uyanma_total = 0
+        self._smart_silence_lost_total = 0
+
     @staticmethod
     def _resolve_tcp_port(device: DeviceConfig, default_port: int) -> int:
         p = device.dnp3_tcp_port
@@ -2033,6 +2395,12 @@ class Yadnp3TelemetryReader(TelemetryReader):
             self._resolve_local_address(device, self._local_address),
             (device.ip_endpoint_type or "listening").strip().lower(),
             int(device.master_ip_port or 0),
+            # OTURUM POLITIKASI IMZAYA DAHIL: `smart` <-> `continuous` gecisi
+            # taramalarin varligini degistirir ve kutuphane calisan bir
+            # taramayi kaldiramaz. Imzada olmasaydi, backend'de politikayi
+            # degistiren operator hicbir etki gormez; cihaz eski rejimde
+            # calismaya devam eder ve bu YALNIZCA sahada fark edilirdi.
+            self._session_policy(device),
         )
 
     def _ensure_master(
@@ -2096,6 +2464,12 @@ class Yadnp3TelemetryReader(TelemetryReader):
             if hazir is None:
                 port = self._resolve_tcp_port(device, self._default_dnp3_tcp_port)
                 local_addr = self._resolve_local_address(device, self._local_address)
+                # OTURUM POLITIKASI MASTER KURULURKEN BELIRLENIR: kutuphane
+                # sonradan tarama KALDIRMAYI desteklemedigi icin, `smart` bir
+                # cihaza en bastan hic scan eklenmez. Politika config'ten
+                # ACIKCA gelir ve `connection_fingerprint`e dahildir —
+                # degisirse master yeniden kurulur.
+                policy = self._session_policy(device)
                 mm = _ManagedMaster(
                     self._manager,
                     device=device,
@@ -2104,9 +2478,11 @@ class Yadnp3TelemetryReader(TelemetryReader):
                     scan_interval_sec=self._scan_interval_sec,
                     baseline_interval_sec=self._baseline_interval_sec,
                     time_sync=self._time_sync,
+                    session_policy=policy,
                 )
                 mm.connection_fingerprint = want
                 mm.g110_ranges = g110
+                self._durumu_geri_yukle(mm, device)
                 self._masters[device.code] = mm
 
         # Yarista baska bir thread kurmus: yalnizca bloklari tazele.
@@ -2176,7 +2552,7 @@ class Yadnp3TelemetryReader(TelemetryReader):
         Artik sayacla cevaplanir.
         """
         with self._lost_probe_lock:
-            return {
+            ozet = {
                 "lost_probe_total": self._lost_probe_total,
                 "forced_relink_total": self._forced_relink_total,
                 "devices_probing": len(self._lost_probe),
@@ -2185,6 +2561,17 @@ class Yadnp3TelemetryReader(TelemetryReader):
                 # siniri icin kayitta kalir ama BURAYA SAYILMAZ).
                 "devices_alive_no_data": sum(1 for d in self._veri_sessizligi.values() if d.get("aktif")),
             }
+        # Smart oturum yasam dongusu sayaclari: "cihazlar gercekten uyuyup
+        # uyaniyor mu?" sorusu sahada aksi halde ancak paket yakalayarak
+        # cevaplanabilirdi.
+        with self._smart_sayaclari_lock:
+            ozet.update(
+                {
+                    "smart_idle_wakeup_total": self._smart_uyanma_total,
+                    "smart_silence_lost_total": self._smart_silence_lost_total,
+                }
+            )
+        return ozet
 
     def _veri_sessizligini_yokla(
         self, mm: Any, device: DeviceConfig, *, now: float, veri_yasi: float
@@ -2398,17 +2785,190 @@ class Yadnp3TelemetryReader(TelemetryReader):
             if self._forced_relink_total > 0:
                 self._forced_relink_total -= 1
 
+    # ------------------------------------------------------------------
+    # SMART OTURUM YASAM DONGUSU — hepsi CIHAZ BASINA
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _session_policy(device: DeviceConfig) -> str:
+        """Bu cihazin ETKIN oturum politikasi. Tanimsiz/eksik -> "continuous".
+
+        Politika ACIKCA yapilandirilir (`DeviceConfig.session_policy`);
+        cihazin DNP3 noktalarindan CIKARILMAZ. Otomatik Horstmann
+        `Operation Mode` tespiti bilincli olarak AYRI bir istir
+        (bkz. docs/BACKEND_TODO.md).
+
+        UC TIPI KISITI — `smart` YALNIZCA `initiating` ile gecerlidir.
+        Smart Mode'da baglantiyi CIHAZ baslatir (dial-in). `listening` uc,
+        gateway'in TCP CLIENT olarak cihaza baglanmasi demektir; uyuyan bir
+        modeme surekli SYN gondermek hem anlamsizdir hem de Smart Mode'un
+        kendisini imkansiz kilar. Bu kombinasyon GUVENLI TARAFA — yani
+        `continuous`a — dusurulur ve ERROR loglanir.
+
+        NEDEN CONFIG'I TUMDEN REDDETMIYORUZ: tek bir yanlis yapilandirilmis
+        cihaz yuzunden 600 cihazin config yenilemesini bloke etmek cok daha
+        kotu bir uretim sonucudur. Burada hata SESSIZ DEGIL — cihaz mevcut
+        (continuous) davranisini surdurur ve durum loglanir.
+
+        BU KONTROL ADAPTER'DA: `DeviceConfig` iki yoldan gelir — backend
+        parser'i ve DISK ONBELLEGI (`state.load_from_cache` alanlari dogrudan
+        JSON'dan kurar ve parser'i ATLAR). Tek choke point burasidir.
+        """
+        istenen = str(getattr(device, "session_policy", "") or "").lower()
+        if istenen != "smart":
+            return "continuous"
+        uc = str(getattr(device, "ip_endpoint_type", "") or "listening").strip().lower()
+        if uc != "initiating":
+            if _uc_uyarisi_ver(device.code):
+                logger.error(
+                    "session_policy_endpoint_mismatch device=%s session_policy=smart "
+                    "ip_endpoint_type=%s — Smart Mode YALNIZCA 'initiating' uc ile "
+                    "gecerlidir (baglantiyi cihaz baslatir). Cihaz GUVENLI TARAFA "
+                    "'continuous' politikayla calistiriliyor; backend'de uc tipini "
+                    "duzeltin.",
+                    device.code,
+                    uc,
+                )
+            return "continuous"
+        return "smart"
+
+    def _smart_silence_limit(self, device: DeviceConfig) -> int | None:
+        """Bu CIHAZ icin sessizlik esigi (saniye); None = denetim KAPALI.
+
+        Oncelik: cihaz bazli backend degeri > kurulum geneli yedek > KAPALI.
+        Adapter'da gomulu bir sure YOKTUR: dogru deger cihazin Dial-In rapor
+        programina baglidir ve uydurulmasi, saglikli bir cihazi erken offline
+        ilan etmek demek olurdu.
+        """
+        ozel = getattr(device, "smart_max_silence_sec", None)
+        try:
+            if ozel is not None and int(ozel) > 0:
+                return int(ozel)
+        except (TypeError, ValueError):
+            pass
+        return self._smart_max_silence_sec
+
+    def _durumu_geri_yukle(self, mm: _ManagedMaster, device: DeviceConfig) -> None:
+        """Kalici kayittan `smart_idle` durumunu yeni master'in cache'ine bas.
+
+        RESTART SENARYOSU: uyuyan Smart cihazlar varken container yeniden
+        baslarsa, bu geri yukleme olmadan hepsi bir sonraki rapora kadar
+        `comm_lost` gorunurdu. Kayit yoksa/bozuksa hicbir sey yapilmaz ve
+        cihaz `lost` ile baslar — yani ozelligin hic olmadigi davranis.
+        """
+        if mm.session_policy != "smart":
+            return
+        kayit = self._session_store.get(device.code)
+        if kayit is None or not kayit.smart_idle_since_unix:
+            return
+        # Sessizlik esigi COKTAN asilmissa idle'i geri yukleme: cihaz gercekten
+        # kayip demektir ve normal comm_lost yolundan gecmelidir.
+        limit = self._smart_silence_limit(device)
+        if limit and kayit.last_valid_contact_unix:
+            if (time.time() - kayit.last_valid_contact_unix) > limit:
+                return
+        mm.cache.restore_smart_idle(
+            smart_idle_since_wall=kayit.smart_idle_since_unix,
+            last_valid_contact_wall=kayit.last_valid_contact_unix,
+        )
+        logger.info(
+            "smart_idle_restored device=%s last_contact=%s — kalici kayittan geri "
+            "yuklendi; sahte comm_lost URETILMEDI",
+            device.code,
+            _epoch_metni(kayit.last_valid_contact_unix),
+        )
+
+    def _smart_idle_denetle(self, mm: _ManagedMaster, device: DeviceConfig) -> bool:
+        """`smart_idle` durumunu degerlendirir. Donen: HALA idle mi.
+
+        False donerse cagiran taraf NORMAL akisa devam eder (yani sessizlik
+        esigi asilmissa comm_lost yoluna dusulur).
+        """
+        cache = mm.cache
+
+        # UYANMA: IO thread'i idle'i bitirmisse kenar-tetikli tek satir log.
+        uyanma = cache.consume_smart_wakeup()
+        if uyanma >= 0:
+            with self._smart_sayaclari_lock:
+                self._smart_uyanma_total += 1
+            logger.info(
+                "smart_idle_wakeup device=%s idle_duration=%.0fs — cihaz kendi "
+                "istegiyle baglandi (ariza raporu ya da zamanlanmis rapor)",
+                device.code,
+                uyanma,
+            )
+
+        if not cache.is_smart_idle():
+            return False
+
+        # SESSIZLIK DENETIMI — "modem kapali" ile "cihaz kayboldu" AYRI seyler.
+        # Monotonic olculur: duvar saatiyle olculse tek bir NTP siçramasi tum
+        # uyuyan filoyu ayni anda `lost` yapardi.
+        limit = self._smart_silence_limit(device)
+        if limit:
+            son = cache.last_valid_contact()
+            yas = (time.monotonic() - son) if son else None
+            if yas is not None and yas > limit:
+                if cache.smart_idle_to_lost():
+                    with self._smart_sayaclari_lock:
+                        self._smart_silence_lost_total += 1
+                    logger.warning(
+                        "smart_idle_silence_exceeded device=%s ip=%s silence=%.0fs "
+                        "limit=%ds — cihaz izin verilen sessizlik penceresinde haber "
+                        "vermedi; GERCEKTEN kopuk sayiliyor (comm_lost)",
+                        device.code,
+                        device.ip_address,
+                        yas,
+                        limit,
+                    )
+                return False
+        return True
+
+    def _cihaz_durumunu_kaydet(self, mm: _ManagedMaster, device: DeviceConfig) -> None:
+        """Cihazin oturum durumunu kalici kayda yaz (hiz sinirli, atomik)."""
+        if mm.session_policy != "smart":
+            return
+        try:
+            self._session_store.record(
+                device.code,
+                SessionStateRecord(
+                    state=mm.cache.state(),
+                    last_valid_contact_unix=mm.cache.last_valid_contact_wall(),
+                    smart_idle_since_unix=mm.cache.smart_idle_since_wall(),
+                ),
+            )
+            self._session_store.flush()
+        except Exception:  # noqa: BLE001
+            # Kalicilastirma HICBIR kosulda okuma yolunu dusurmemeli.
+            logger.debug("session_store_record_error device=%s", device.code, exc_info=True)
+
     def read_device(
         self,
         *,
         device: DeviceConfig,
         signals: list[SignalConfig],
     ) -> list[SignalReading]:
+        """Cihazi oku. Kalici mod/durum kaydi HER cikis yolunda tazelenir."""
         # signals GECIRILIYOR: G110 okuma bloklari cihazin kendi sinyal
         # setinden turetiliyor (bkz. _g110_bloklari).
         mm = self._ensure_master(device, signals)
+        try:
+            return self._oku(mm=mm, device=device, signals=signals)
+        finally:
+            self._cihaz_durumunu_kaydet(mm, device)
+
+    def _oku(
+        self,
+        *,
+        mm: _ManagedMaster,
+        device: DeviceConfig,
+        signals: list[SignalConfig],
+    ) -> list[SignalReading]:
         cache = mm.cache
         connected = cache.is_connected()
+        # Politika ACIKCA yapilandirilmistir; cihazin noktalarindan
+        # CIKARILMAZ (bkz. `_session_policy`).
+        smart = mm.session_policy == "smart"
 
         # G110 (string) okumasi — link ACILDIKTAN SONRA, POLL THREAD'inden.
         # `OnOpen` yalnizca "istendi" der (o callback opendnp3'un IO
@@ -2459,6 +3019,26 @@ class Yadnp3TelemetryReader(TelemetryReader):
         # "cihaza tekrar sor" tetigidir (asagida).
         veri_bayat = last_update == 0.0 or (now - last_update) > threshold
 
+        # ================= SMART_IDLE DALI =================================
+        # `continuous` cihazlar icin bu blok HIC CALISMAZ; mevcut uretim
+        # davranisi birebir korunur.
+        if smart and self._smart_idle_denetle(mm, device):
+            # SAGLIKLI IDLE. Uc sey BILINCLI olarak YAPILMAZ:
+            #   * comm_lost YAYINLANMAZ (cihaz arizali degil, modemi kapali),
+            #   * yoklama/integrity/relink GONDERILMEZ (modemi uyandirir ve
+            #     15 saniyelik hareketsizlik sayacini sifirlardi),
+            #   * durum makinesi ZORLANMAZ.
+            # Degismemis sinyaller `no_change` doner (normal idle'da hepsi
+            # boyledir -> SIFIR mesaj) ve son bilinen degerler KORUNUR.
+            # Bekleyen bir yayin varsa — orn. operator `/refresh-all`
+            # tetiklediyse ya da oturum kapanirken onaylanmamis degerler
+            # kaldiysa — onlar yayinlanir; bu YEREL bir istir, cihaza istek
+            # gitmez ve modem uyanmaz.
+            return self._degisenleri_yayinla(mm, device, signals)
+        # Sessizlik esigi asilmissa `_smart_idle_denetle` durumu `lost`a
+        # cekti ve False dondu; asagidaki NORMAL comm_lost yoluna dusulur.
+        # `begin_stale_announce` sayesinde TEK BIR comm_lost yayinlanir.
+
         # Recovery state machine ile birlikte cihaz haberlesme durumu su sekilde
         # belirlenir:
         #   * connected=False    → state lost; comm_lost yayini (edge'de).
@@ -2495,7 +3075,15 @@ class Yadnp3TelemetryReader(TelemetryReader):
         # ediyordu — hem yanlis hem de kesici komutunu bloke eden karar.
         # Kopuk cihaz yoklamasinin (`_kopuk_cihazi_yokla`) bu duruma karsiligi
         # YOKTU: o yalnizca cihaz ZATEN 'lost' iken devreye giriyor.
-        if connected and not stale and veri_bayat:
+        #
+        # SMART POLITIKADA BU YOKLAMA YAPILMAZ. Orada "olcum gelmiyor" bir
+        # ariza belirtisi degil, cihazin susmasidir; 60 saniyede bir integrity
+        # poll gondermek cihazin 15 saniyelik hareketsizlik sayacini surekli
+        # sifirlar ve modem hicbir zaman kapanamaz — yani duzeltmeye
+        # calistigimiz hatanin ta kendisi. Smart cihaz raporunu KENDISI
+        # unsolicited gonderir; gateway hicbir sey sormaz.
+        sessiz_yoklama_serbest = not smart
+        if connected and not stale and veri_bayat and sessiz_yoklama_serbest:
             self._veri_sessizligini_yokla(
                 mm, device, now=now, veri_yasi=(now - last_update) if last_update else -1.0
             )
@@ -2515,10 +3103,13 @@ class Yadnp3TelemetryReader(TelemetryReader):
                 int(now - last_update) if last_update else -1,
                 threshold,
             )
-            try:
-                mm.request_integrity_poll()
-            except Exception:  # noqa: BLE001
-                logger.debug("yadnp3_stale_integrity_poll_error", exc_info=True)
+            # Smart modda burada SORU SORULMAZ: bayatlik zaten "modem kapandi"
+            # demek olabilir ve integrity poll onu uyandirmaya calisirdi.
+            if sessiz_yoklama_serbest:
+                try:
+                    mm.request_integrity_poll()
+                except Exception:  # noqa: BLE001
+                    logger.debug("yadnp3_stale_integrity_poll_error", exc_info=True)
 
         # Recovery grace timeout: link acik ama hala fresh frame gelmedi →
         # tekrar lost. SCADA "comm_lost" gormeye devam eder; bu zaten dogru.
@@ -2561,10 +3152,13 @@ class Yadnp3TelemetryReader(TelemetryReader):
             )
             # Cihaz yeniden konusuyor: yoklama/relink sayaclarini sifirla.
             self._lost_probe_sifirla(device.code)
-            try:
-                mm.request_integrity_poll()
-            except Exception:  # noqa: BLE001
-                logger.debug("yadnp3_relink_integrity_poll_error", exc_info=True)
+            # Smart modda oturum basina TEK aktarim kurali gecerli; ek bir
+            # integrity poll gateway kaynakli fazladan trafiktir.
+            if sessiz_yoklama_serbest:
+                try:
+                    mm.request_integrity_poll()
+                except Exception:  # noqa: BLE001
+                    logger.debug("yadnp3_relink_integrity_poll_error", exc_info=True)
 
         # KOPUK CIHAZI KENDILIGINDEN YOKLA
         # --------------------------------
@@ -2573,7 +3167,14 @@ class Yadnp3TelemetryReader(TelemetryReader):
         # cihaza HICBIR SEY sormuyor, pasif bekliyordu; kilidi ancak
         # operatorun manuel refresh'i kiriyordu. Artik periyodik olarak
         # kendimiz soruyoruz, sonuc alamazsak oturumu yeniliyoruz.
-        if cache_state == "lost":
+        #
+        # SMART MODDA YOKLAMA DA ZORLA RELINK DE YAPILMAZ. Uyuyan bir cihaza
+        # 30 saniyede bir integrity poll gondermek ve ardindan TCP oturumunu
+        # yeniden kurmaya calismak, tam olarak "modemi kapatma" davranisini
+        # kirar; ustelik #19'daki hizli yeniden baglanma dongusunu uretirdi.
+        # Smart cihazin geri gelmesi CIHAZIN kendi programina baglidir; gateway
+        # yalnizca bekler ve son kullanma suresi asilirsa offline ilan eder.
+        if cache_state == "lost" and sessiz_yoklama_serbest:
             self._kopuk_cihazi_yokla(mm, device, connected=connected)
 
         # Cihaz "online" degil mi? comm_lost yayini.
@@ -2618,6 +3219,31 @@ class Yadnp3TelemetryReader(TelemetryReader):
                 redirty_count,
             )
 
+        return self._degisenleri_yayinla(mm, device, signals)
+
+    def _degisenleri_yayinla(
+        self,
+        mm: _ManagedMaster,
+        device: DeviceConfig,
+        signals: list[SignalConfig],
+    ) -> list[SignalReading]:
+        """Degismis (dirty) sinyalleri okumaya cevirir; digerleri `no_change`.
+
+        Iki yerden cagrilir ve HER IKISINDE de yalnizca CACHE okur — cihaza
+        tek bir DNP3 istegi bile gitmez:
+
+          * `state == "online"` — normal event-driven yayin,
+          * SMART_SLEEP — cihaz uyurken de yayin yapilabilmesi icin.
+
+        Uyurken yayin NEDEN GEREKLI: operator `/refresh-all` tetikledigimde
+        (ya da backend DB restore sonrasi) `mark_all_dirty` tum degerleri
+        yeniden yayina isaretler. Uyuyan cihazlari bunun disinda tutmak,
+        580 saglikli cihazin son bilinen degerlerinin backend'e bir sonraki
+        gunluk check-in'e kadar HIC gitmemesi demekti — tam da bu ozelligin
+        onlemeye calistigi turden bir sessiz veri boslugu. Yayin YEREL bir
+        istir; modemi uyandirmaz.
+        """
+        cache = mm.cache
         readings: list[SignalReading] = []
         for s in signals:
             # TEK atomik cagri: dirty kontrolu + deger okuma + surum, hepsi ayni
@@ -2807,14 +3433,38 @@ class Yadnp3TelemetryReader(TelemetryReader):
                 son_veri = mm.cache.last_update_at()
                 if son_veri:
                     veri_yasi = time.monotonic() - son_veri
+
+                # SMART_IDLE — `state` KENDI tokeniyle raporlanir.
+                #
+                # "lost" denseydi backend uyuyan saglikli filoyu arizali
+                # gorurdu; "online" denseydi de yalan olurdu (link kapali).
+                # `health_header` bu tokeni SORUN OLMAYAN durumlar arasinda
+                # sayar. `continuous` cihazlarda `state` degeri DEGISMEDI.
+                idle_yasi = mm.cache.smart_idle_age()
+                son_temas_wall = mm.cache.last_valid_contact_wall()
+                limit = self._smart_silence_limit(mm.device)
+                silence_deadline: float | None = None
+                kalan: float | None = None
+                if limit and son_temas_wall and mm.session_policy == "smart":
+                    silence_deadline = son_temas_wall + limit
+                    kalan = max(0.0, silence_deadline - time.time())
+
                 out[code] = {
                     "state": mm.cache.state(),
+                    "session_policy": mm.session_policy,
                     "connected": mm.cache.is_connected(),
                     "last_frame_epoch": last or None,
+                    "last_valid_contact_epoch": son_temas_wall,
                     "pending_signals": mm.cache.dirty_count(),
                     "known_points": mm.cache.size(),
                     "evidence_age_sec": round(kanit_yasi, 1) if kanit_yasi >= 0 else None,
                     "data_age_sec": round(veri_yasi, 1) if veri_yasi >= 0 else None,
+                    "smart_idle_age_sec": round(idle_yasi, 1) if idle_yasi >= 0 else None,
+                    "smart_max_silence_sec": limit,
+                    "smart_silence_deadline_epoch": silence_deadline,
+                    "smart_silence_remaining_sec": round(kalan, 1) if kalan is not None else None,
+                    # Uyuyan cihaz FIZIKSEL olarak ulasilamazdir; komut yolu
+                    # bunu oldugu gibi gorur (sahte basari URETILMEZ).
                     "reachable": mm.ulasilabilir(),
                 }
             except Exception:  # noqa: BLE001
@@ -2979,6 +3629,10 @@ class Yadnp3TelemetryReader(TelemetryReader):
                     logger.debug("yadnp3_master_shutdown_error device=%s", code, exc_info=True)
                 cleaned += 1
                 logger.info("yadnp3_master_forgotten device=%s reason=removed_from_config", code)
+        # Kalici oturum kaydini da temizle; aksi halde silinen cihazlarin
+        # kayitlari dosyada sonsuza kadar birikirdi.
+        if self._session_store.forget(active_device_codes):
+            self._session_store.flush(force=True)
         return cleaned
 
     def refresh_all_devices(self) -> tuple[int, int]:
@@ -3037,6 +3691,13 @@ class Yadnp3TelemetryReader(TelemetryReader):
         return ok, total
 
     def close(self) -> None:
+        # KAPANISTA ZORLA YAZ: hiz siniri yuzunden son birkac saniyenin uyku
+        # durumu diske gitmemis olabilir. Tam da bu bilgi restart sonrasi
+        # sahte comm_lost firtinasini onleyen sey.
+        try:
+            self._session_store.flush(force=True)
+        except Exception:  # noqa: BLE001
+            logger.debug("session_store_flush_error", exc_info=True)
         with self._lock:
             for mm in list(self._masters.values()):
                 try:

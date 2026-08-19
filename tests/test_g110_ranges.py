@@ -254,6 +254,9 @@ class _SahteMaster:
         self.connection_fingerprint: tuple = ()
         self.scan_sayisi = 0
         self.last_command_at = 0.0
+        # G110 senaryolari varsayilan `continuous` politikayla kosar;
+        # Smart dallarina hic girilmez.
+        self.session_policy = "continuous"
 
     def scan_g110_once(self) -> bool:
         self.scan_sayisi += 1
@@ -268,22 +271,17 @@ class _SahteMaster:
 
 @pytest.fixture
 def okuyucu():
-    import threading
-
     r = mod.Yadnp3TelemetryReader.__new__(mod.Yadnp3TelemetryReader)
-    r._lock = threading.Lock()
-    r._masters = {}
+    # Native `DNP3Manager` KURULMAZ; calisma-zamani alanlari gercek nesnenin
+    # kullandigi TEK kaynaktan gelir (elle liste tutulsaydi yeni bir alan
+    # eklendiginde test sessizce gercek nesneden ayrisirdi).
+    r._init_runtime_state()
     r._scan_interval_sec = 5
     r._baseline_interval_sec = 30
     r._local_address = 1
     r._default_dnp3_tcp_port = 20000
     r._time_sync = "lan"
     r._manager = None
-    r._lost_probe_lock = threading.Lock()
-    r._lost_probe = {}
-    r._lost_probe_total = 0
-    r._forced_relink_total = 0
-    r._g110_uyarilan = set()
     r._publish_dnp3_quality = False
     return r
 

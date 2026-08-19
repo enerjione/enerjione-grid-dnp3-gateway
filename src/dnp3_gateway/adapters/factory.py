@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 from dnp3_gateway.adapters.base import TelemetryReader
 from dnp3_gateway.adapters.mock import MockTelemetryReader
@@ -93,6 +94,15 @@ def build_adapter(settings: Settings) -> TelemetryReader:
             # toparlanma (4G/GSM yari-acik soket senaryosu).
             lost_probe_interval_sec=settings.dnp3_lost_probe_interval_sec,
             lost_relink_after_probes=settings.dnp3_lost_relink_after_probes,
+            # Smart oturum yasam dongusu: POLITIKA cihaz basina config'ten
+            # gelir (`DeviceConfig.session_policy`); burada yalnizca kurulum
+            # geneli yedek esik ve kalici kayit dosyasinin yolu tasinir.
+            # Kayit dosyasi restart sonrasi uyuyan cihazlarin sahte comm_lost
+            # firtinasi uretmesini onler (bkz. docs/HORSTMANN_SMART_MODE.md).
+            smart_max_silence_sec=settings.dnp3_smart_max_silence_sec or None,
+            session_store_path=str(
+                Path(settings.gateway_state_dir) / f"session_state_{settings.gateway_code}.json"
+            ),
         )
         # Log ADAPTER KURULDUKTAN SONRA: `manager_threads` eskiden "auto"
         # yaziyordu ve heuristigin GERCEKTE kac thread sectigi hicbir yerde

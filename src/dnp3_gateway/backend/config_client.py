@@ -92,6 +92,34 @@ class DeviceConfig:
     retry_count: int = 2
     signal_profile: str = "default"
 
+    #: DNP3 OTURUM YASAM DONGUSU — cihaz basina, ACIKCA yapilandirilir.
+    #:
+    #:   "continuous" (VARSAYILAN): bugunku davranis. Periyodik Class 1/2/3
+    #:       event scan + Class 0 integrity scan + acilis integrity poll'u.
+    #:       Her zaman bagli DNP3 ekipmani icin dogru olan budur.
+    #:
+    #:   "smart": Horstmann Smart Navigator 2.0 Smart Mode. Cihaz raporunu
+    #:       gonderir ve DNP3 oturumu 15 SANIYE bosta kalinca hucresel modemi
+    #:       kapatir. Gateway periyodik tarama gonderirse bu sayac hicbir zaman
+    #:       dolmaz; bu yuzden `smart` politikada gateway HICBIR tekrarlayan
+    #:       tarama kurmaz ve beklenen kapanmayi comm_lost SAYMAZ.
+    #:
+    #: Varsayilan BILEREK "continuous": mevcut kurulumlarin davranisi
+    #: degismesin. Tanimsiz bir deger SESSIZCE varsayilana DUSMEZ —
+    #: konfigurasyon dogrulamasini basarisiz kilar (bkz. `_parse_session_policy`).
+    #: Bkz. docs/HORSTMANN_SMART_MODE.md
+    session_policy: str = "continuous"
+
+    #: `session_policy="smart"` iken: cihaz bu kadar saniye HIC gecerli DNP3
+    #: kaniti gondermezse `smart_idle` durumundan `lost`a dusurulur ve mevcut
+    #: comm_lost mekanizmasi calisir.
+    #:
+    #: None = denetim KAPALI (cihaz suresiz `smart_idle` kalabilir). Adapter'da
+    #: gomulu bir "24 saat" varsayimi YOKTUR: dogru deger cihazin Dial-In
+    #: rapor programina baglidir ve yalnizca kurulumu yapan bilir.
+    #: Kurulum geneli yedek: `DNP3_SMART_MAX_SILENCE_SEC`.
+    smart_max_silence_sec: int | None = None
+
 
 @dataclass(frozen=True)
 class SignalConfig:
@@ -345,6 +373,94 @@ def _parse_optional_master_address(item: dict[str, Any]) -> int | None:
         if 0 <= a <= 65519:  # DNP3 link addr range (broadcast addrs hariç)
             return a
     return None
+
+
+#: Desteklenen DNP3 oturum yasam dongusu politikalari.
+SESSION_POLICIES: frozenset[str] = frozenset({"continuous", "smart"})
+
+#: Smart sessizlik denetiminin kabul edilen araligi.
+#: Alt sinir 60 sn: daha kucuk bir deger NORMAL bir Smart uykusunu bile
+#: offline ilan eder ve ozelligi anlamsiz kilardi. Ust sinir 30 gun: bunun
+#: otesinde "offline" kavrami operatore hicbir sey soylemez.
+_SMART_SILENCE_MIN_SEC = 60
+_SMART_SILENCE_MAX_SEC = 30 * 24 * 3600
+
+
+def _parse_session_policy(item: dict[str, Any]) -> str:
+    """Cihazin oturum politikasi. Alan yoksa "continuous".
+
+    TANIMSIZ DEGER SESSIZCE VARSAYILANA DUSMEZ — `GatewayConfigError` atar.
+
+    Gerekce: bu alan cihazin haberlesme rejimini belirliyor. `"smrt"` yazim
+    hatasi sessizce "continuous"a duserse, Smart moda alinmasi gereken bir
+    cihaz periyodik taranmaya devam eder; modem hicbir zaman kapanmaz ve
+    kimse bunu fark etmez — tam olarak onlemeye calistigimiz hatanin sessiz
+    hali. Konfigurasyon dogrulamasinin basarisiz olmasi GUVENLI taraftir:
+    gateway son iyi config'iyle calismaya devam eder ve /health hatayi
+    acikca raporlar.
+    """
+    ham = item.get("session_policy")
+    if ham is None or ham == "":
+        return "continuous"
+    deger = str(ham).strip().lower()
+    if deger not in SESSION_POLICIES:
+        raise GatewayConfigError(
+            f"gecersiz session_policy={ham!r} (cihaz={item.get('code')!r}); "
+            f"izin verilenler: {sorted(SESSION_POLICIES)}"
+        )
+    if deger == "smart":
+        # UC TIPI KISITI — erken operator geri bildirimi.
+        # Smart Mode'da baglantiyi CIHAZ baslatir; `listening` uc gateway'in
+        # TCP CLIENT olarak uyuyan bir modeme baglanmaya calismasi demektir.
+        # Deger BURADA degistirilmez: etkin politika kararinin TEK yeri
+        # adapter'dir (`Yadnp3TelemetryReader._session_policy`), cunku
+        # `DeviceConfig` disk onbelleginden de gelebilir ve o yol bu parser'i
+        # ATLAR. Burasi yalnizca sorunu config cekilirken gorunur kilar.
+        uc = str(item.get("ip_endpoint_type") or "listening").strip().lower()
+        if uc != "initiating":
+            logger.error(
+                "config_session_policy_endpoint_mismatch code=%r ip_endpoint_type=%r — "
+                "session_policy=smart YALNIZCA 'initiating' uc ile gecerlidir; "
+                "gateway bu cihazi GUVENLI TARAFA 'continuous' calistiracak",
+                item.get("code"),
+                uc,
+            )
+    return deger
+
+
+def _parse_optional_smart_silence(item: dict[str, Any]) -> int | None:
+    """Cihaz bazli Smart sessizlik esigi; yoksa/gecersizse None.
+
+    None = denetim kapali; gateway kurulum geneli yedegine (varsa) duser.
+    Gecersiz deger de None'a duser: uydurma bir esikle cihazi erken offline
+    ilan etmektense denetimi hic yapmamak dogrudur. Bu alan `session_policy`
+    gibi konfigurasyonu DUSURMEZ — cunku yanlis degerin sonucu sessiz bir
+    yanlis rejim degil, yalnizca eksik bir denetimdir ve loglanir.
+    """
+    ham = item.get("smart_max_silence_sec")
+    if ham is None or ham == "":
+        return None
+    try:
+        n = int(ham)
+    except (TypeError, ValueError):
+        logger.warning(
+            "config_smart_silence_invalid code=%r received=%r — yok sayildi, "
+            "sessizlik denetimi bu cihaz icin kapali",
+            item.get("code"),
+            ham,
+        )
+        return None
+    if not (_SMART_SILENCE_MIN_SEC <= n <= _SMART_SILENCE_MAX_SEC):
+        logger.warning(
+            "config_smart_silence_out_of_range code=%r received=%d min=%d max=%d — "
+            "yok sayildi, sessizlik denetimi bu cihaz icin kapali",
+            item.get("code"),
+            n,
+            _SMART_SILENCE_MIN_SEC,
+            _SMART_SILENCE_MAX_SEC,
+        )
+        return None
+    return n
 
 
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "0.0.0.0", "::1"}
@@ -1365,6 +1481,8 @@ def _parse_gateway_config(
                         item.get("signal_profile") or "default",
                         _MAX_CODE_LENGTH,
                     ),
+                    session_policy=_parse_session_policy(item),
+                    smart_max_silence_sec=_parse_optional_smart_silence(item),
                 )
             )
         except (TypeError, ValueError) as exc:

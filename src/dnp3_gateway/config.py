@@ -696,6 +696,25 @@ class Settings(BaseSettings):
         ),
     )
 
+    # ----- Horstmann Smart Mode oturum yasam dongusu ------------------------
+    # Politika CIHAZ BASINA ve ACIKCA yapilandirilir:
+    # `DeviceConfig.session_policy` = "continuous" (varsayilan) | "smart".
+    # Bu env yalnizca cihaz bazli deger GELMEDIGINDE kullanilan yedegi verir.
+    # Ayrintili anlatim: docs/HORSTMANN_SMART_MODE.md
+    dnp3_smart_max_silence_sec: int = Field(
+        default=0,
+        ge=0,
+        le=30 * 24 * 3600,
+        description=(
+            "session_policy=smart olan bir cihaz bu kadar saniye HIC gecerli DNP3 "
+            "kaniti gondermezse smart_idle -> lost gecisi yapilir ve normal "
+            "comm_lost mekanizmasi calisir. 0 = denetim KAPALI (varsayilan). "
+            "Backend cihaz bazinda `smart_max_silence_sec` gonderirse O deger "
+            "bu ayari EZER. Dogru deger cihazin Dial-In rapor programina "
+            "baglidir; gomulu bir varsayim YOKTUR."
+        ),
+    )
+
     dnp3_event_scan_interval_sec: int = Field(
         default=0,
         ge=0,

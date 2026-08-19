@@ -205,8 +205,25 @@ EnerjiOne Grid DNP3 Gateway/
     |-- ARCHITECTURE.md
     |-- SECURITY.md
     |-- RUNBOOK.md
+    |-- HORSTMANN_SMART_MODE.md
     `-- DOCKER.md
 ```
+
+### Horstmann Smart Mode
+
+Smart Navigator 2.0 **Smart Mode** kullanan sahalar icin cihaz basina bir
+oturum politikasi vardir:
+
+| `session_policy` | Davranis |
+|---|---|
+| `continuous` (VARSAYILAN) | Bugunku davranis: periyodik Class 1/2/3 event + Class 0 integrity taramasi, acilis integrity poll'u. Her zaman bagli DNP3 ekipmani icin dogrudur. |
+| `smart` | Hicbir tekrarlayan tarama YOK, acilis integrity poll'u YOK. Cihaz raporunu kendisi gonderir; DNP3 oturumu 15 saniye bosta kalinca modemini kapatir ve bu **beklenen kapanma `comm_lost` URETMEZ** (`smart_idle` durumu). |
+
+Politika backend'den cihaz basina gelir; varsayilan `continuous` oldugu icin
+**mevcut kurulumlar etkilenmez**.
+
+Tam anlatim, durum makinesi ve saha kabul proseduru:
+[docs/HORSTMANN_SMART_MODE.md](./docs/HORSTMANN_SMART_MODE.md)
 
 ## Production checklist
 

@@ -1,8 +1,8 @@
 {
   "contract_version": 1,
-  "gateway_release": "1.11.4",
-  "gateway_source_ref": "v1.11.4",
-  "gateway_source_sha": "9668f34b10472abb416d1334747014ead58e7b53",
+  "gateway_release": "1.12.0",
+  "gateway_source_ref": "v1.12.0",
+  "gateway_source_sha": "60b9a64821086bd15c78a24e1e165006304786da",
   "gateway_source_sha_semantics": "BU DOSYADAKI DEGER, KENDISINI ICEREN COMMIT DEGILDIR ve olamaz: dosyaya yeni SHA yazmak yeni bir commit uretir ve SHA yeniden degisir (self-referential). Buradaki deger, bu sozlesmenin turetildigi YAYIMLANMIS BASELINE surumun commit'idir. Bir artifact'in GERCEK revizyonu iki yerde yasar ve ikisi de release sirasinda uretilir: (1) imaj etiketi org.opencontainers.image.revision=<GITHUB_SHA>, (2) release workflow'un urettigi gateway-deployment-contract.generated.json (gateway_source_sha alani GITHUB_SHA ile doldurulur). Tuketiciler revizyon icin BUNLARA bakmali; kaynak dosyadaki deger yalnizca baseline'dir.",
   "owner": "enerjione/enerjione-grid-dnp3-gateway",
   "description": "Bir uretim DNP3 gateway kurulumunun TASIMASI GEREKEN deployment sozlesmesi. Gateway repo'su sahibidir; Grid repo'su tam kopyasini vendor eder ve CI'da karsilastirir. Runtime'da iki repo birbirine baglanmaz.",
@@ -130,5 +130,40 @@
       "production_guard": "Gateway, production'da bu degerin GATEWAY_TOKEN veya GATEWAY_COMMAND_TOKEN ile ayni olmasini reddeder."
     }
   },
-  "gateway_source_sha_baseline_ref": "v1.11.3"
+  "gateway_source_sha_baseline_ref": "v1.11.4",
+  "smart_session": {
+    "supported": true,
+    "semantics": "Horstmann Smart Navigator 2.0 Smart Mode / Initiating Endpoint oturum yasam dongusu. Politika CIHAZ BASINA ve ACIKCA yapilandirilir; cihazin DNP3 noktalarindan CIKARILMAZ (Operation Mode otomatik tespiti AYRI bir istir). Varsayilan 'continuous' oldugu icin mevcut kurulumlarin davranisi DEGISMEZ.",
+    "device_config_fields": [
+      "session_policy",
+      "smart_max_silence_sec"
+    ],
+    "session_policy_values": [
+      "continuous",
+      "smart"
+    ],
+    "session_policy_default": "continuous",
+    "session_policy_invalid_behavior": "reject_config: tanimsiz deger TUM config'i reddeder (GatewayConfigError); gateway son iyi config'iyle calismaya devam eder. Sessizce varsayilana DUSMEZ.",
+    "smart_requires_endpoint_type": "initiating",
+    "smart_wrong_endpoint_behavior": "fail_safe_continuous: session_policy=smart + ip_endpoint_type!=initiating kombinasyonunda cihaz 'continuous' olarak calistirilir ve ERROR loglanir. Config TUMDEN reddedilmez.",
+    "smart_max_silence_default": null,
+    "smart_max_silence_default_semantic": "null/eksik = sessizlik denetimi KAPALI; cihaz suresiz smart_idle kalabilir. Gateway'de GOMULU bir sure YOKTUR. Kurulum geneli yedek: DNP3_SMART_MAX_SILENCE_SEC (varsayilan 0 = kapali). Oncelik: cihaz alani > env yedegi > kapali.",
+    "smart_max_silence_min": 60,
+    "smart_max_silence_max": 2592000,
+    "smart_max_silence_invalid_behavior": "ignored_disabled: aralik disi (0 ve negatifler dahil), bozuk tip ya da ayristirilamayan deger -> null (denetim kapali) + WARNING. Config DUSMEZ.",
+    "smart_idle_health_state": "smart_idle",
+    "smart_idle_counted_as_lost": false,
+    "smart_idle_in_devices_states": false,
+    "health_device_counters": [
+      "total",
+      "online",
+      "recovering",
+      "lost",
+      "smart_idle",
+      "smart_lost",
+      "unknown"
+    ],
+    "unknown_device_config_fields": "ignored",
+    "command_plane_changed": false
+  }
 }
