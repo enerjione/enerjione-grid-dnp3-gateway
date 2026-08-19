@@ -13,7 +13,7 @@ CLI:
         --backend-url https://api.enerjione.local/api/v1 \
         --nats-url nats://nats.enerjione.local:4222 \
         --host-port 8020 \
-        --image ghcr.io/enerjione/enerjione-grid-dnp3-gateway:0.4.6 \
+        --initiating-ports 20100-20199 \
         --output ./gw-001.yml
 
 Library:
@@ -67,6 +67,153 @@ def _render_text(template: str, replacements: dict[str, str]) -> str:
     return re.sub(r"\{\{\s*([A-Z0-9_]+)\s*\}\}", _sub, template)
 
 
+# ---------------------------------------------------------------------------
+# INITIATING DINLEYICI PORTLARI (G-INIT-02)
+# ---------------------------------------------------------------------------
+#
+# NEDEN GEREKLI: `ip_endpoint_type=initiating` cihazlarda baglantiyi CIHAZ
+# baslatir. Gateway container ici `master_ip_port` uzerinde TCP server acar;
+# bridge ag modunda o port HOST'a acilmazsa Horstmann hicbir zaman
+# baglanamaz. Sablon 1.12.0'a kadar YALNIZCA health portunu yayinliyordu.
+#
+# NEDEN ARALIK (cihaz basina tek tek degil): compose gateway OLUSTURULURKEN
+# renderlanir, cihazlar SONRA eklenir. Cihaz basina port yayini her yeni
+# cihazda compose'u yeniden render + container recreate demek olurdu.
+# Onceden ayrilmis bir blok, cihaz eklemeyi container'a dokunmadan mumkun
+# kilar — sahada asil isteyecegimiz sey budur.
+#
+# NEDEN KIMLIK ESLEMESI (host:container ayni): cihaz `master_ip_port`a
+# baglanir ve gateway container ICINDE ayni portu dinler. Host tarafinda
+# farkli bir port kullanmak zinciri koparirdi.
+#
+# NEDEN HOST NETWORKING DEGIL: host ag modu container'in TUM host
+# arayuzlerini paylasmasi demektir; dar bir port blogu yerine sinirsiz
+# maruziyet olurdu. Ayrica ayni host'ta N gateway izolasyonunu kaybederdik.
+#
+# MALIYET (dokumante edilmeli): Docker varsayilan `userland-proxy: true`
+# ile yayinlanan HER port icin bir `docker-proxy` sureci baslatir. 100'luk
+# bir blok ~100 kucuk surec demektir. Blogu gercek initiating cihaz sayisina
+# gore olcun; gerekirse daemon'da `userland-proxy: false` kullanin.
+#: Ayricalikli portlar reddedilir — container root olmayan kullanici ile
+#: kosar ve <1024 araligini bind EDEMEZ (config parser ile ayni kural).
+INITIATING_PORT_MIN = 1024
+INITIATING_PORT_MAX = 65535
+
+#: Tek bir gateway icin yayinlanabilecek TOPLAM port sayisi tavani.
+#: Kaza eseri `1024-65535` yazilmasi binlerce docker-proxy sureci uretirdi.
+INITIATING_PORT_MAX_TOTAL = 512
+
+
+def parse_initiating_ports(raw: str | None) -> list[tuple[int, int]]:
+    """`"20100-20199"` / `"20100"` / `"20100-20149,20300"` -> [(bas, son), ...].
+
+    Bos/None -> bos liste (port YAYINLANMAZ; 1.12.0 davranisi korunur).
+
+    Dogrulama BILEREK katidir: bu deger dogrudan uretilen YAML'e giriyor.
+    Bicimsiz bir metni oldugu gibi kopyalamak, compose'u calisma zamaninda
+    anlasilmaz bir hatayla dusururdu.
+    """
+    if raw is None:
+        return []
+    metin = raw.strip()
+    if not metin:
+        return []
+
+    araliklar: list[tuple[int, int]] = []
+    for parca_ham in metin.split(","):
+        parca = parca_ham.strip()
+        if not parca:
+            raise RenderError(f"initiating port listesinde bos oge: {raw!r}")
+        if "-" in parca:
+            bolum = parca.split("-")
+            if len(bolum) != 2:
+                raise RenderError(f"gecersiz port araligi: {parca!r} (beklenen: BAS-SON)")
+            bas_m, son_m = bolum[0].strip(), bolum[1].strip()
+        else:
+            bas_m = son_m = parca
+        if not (bas_m.isdigit() and son_m.isdigit()):
+            raise RenderError(f"port sayisal degil: {parca!r}")
+        bas, son = int(bas_m), int(son_m)
+        if bas > son:
+            raise RenderError(f"port araliginda BAS > SON: {parca!r}")
+        for deger in (bas, son):
+            if not (INITIATING_PORT_MIN <= deger <= INITIATING_PORT_MAX):
+                raise RenderError(
+                    f"port aralik disi: {deger} (izin verilen: "
+                    f"{INITIATING_PORT_MIN}..{INITIATING_PORT_MAX}). Ayricalikli "
+                    "portlar reddedilir: container root olmayan kullaniciyla kosar."
+                )
+        araliklar.append((bas, son))
+
+    # CAKISMA KONTROLU — ayni rendera iki kez ayni portu yayinlamak compose'u
+    # calisma zamaninda dusurur; burada yakalamak cok daha ucuzdur.
+    sirali = sorted(araliklar)
+    for onceki, sonraki in zip(sirali, sirali[1:], strict=False):
+        if sonraki[0] <= onceki[1]:
+            raise RenderError(
+                f"initiating port araliklari cakisiyor: {onceki[0]}-{onceki[1]} ve {sonraki[0]}-{sonraki[1]}"
+            )
+
+    toplam = sum(son - bas + 1 for bas, son in araliklar)
+    if toplam > INITIATING_PORT_MAX_TOTAL:
+        raise RenderError(
+            f"toplam yayinlanan port sayisi cok yuksek: {toplam} "
+            f"(tavan {INITIATING_PORT_MAX_TOTAL}). Docker her port icin bir "
+            "docker-proxy sureci baslatir; blogu gercek cihaz sayisina gore olcun."
+        )
+    return sirali
+
+
+#: Sablondaki yer tutucunun render sonrasi aldigi bicim. Bu SATIRIN TAMAMI
+#: gercek eslemelerle degistirilir ya da silinir (bkz. `_yerlestir_portlar`).
+_PORT_SENTINEL = "__INITIATING_PORTS__"
+
+
+def _render_initiating_ports(
+    araliklar: list[tuple[int, int]], *, bind_host: str, indent: str = "      "
+) -> list[str]:
+    """Compose `ports:` girdi SATIRLARI. Bos aralik -> aciklayici yorum satiri.
+
+    Esleme KIMLIKTIR (host == container): cihaz `master_ip_port`a baglanir ve
+    gateway container icinde ayni portu dinler.
+    """
+    if not araliklar:
+        return [
+            f"{indent}# (initiating dinleyici portu ayrilmadi — bu gateway'de",
+            f"{indent}#  yalnizca `listening` cihazlar var)",
+        ]
+    satirlar = []
+    for bas, son in araliklar:
+        hedef = f"{bas}-{son}" if bas != son else f"{bas}"
+        onek = f"{bind_host}:" if bind_host else ""
+        satirlar.append(f'{indent}- "{onek}{hedef}:{hedef}"')
+    return satirlar
+
+
+def _yerlestir_portlar(rendered: str, satirlar: list[str]) -> str:
+    """Sentinel SATIRINI gercek port eslemeleriyle degistir.
+
+    Neden satir-degistirme (duz yer tutucu yerine): sablonun KENDISI gecerli
+    YAML kalmali — testler ve editorler onu dogrudan parse ediyor. Bu yuzden
+    sablonda gecerli bir liste ogesi (`- "..."`) duruyor ve tam satir burada
+    degistiriliyor.
+    """
+    cikti: list[str] = []
+    bulundu = False
+    for satir in rendered.splitlines():
+        if _PORT_SENTINEL in satir:
+            bulundu = True
+            cikti.extend(satirlar)
+            continue
+        cikti.append(satir)
+    if not bulundu:
+        raise RenderError(
+            "compose sablonunda initiating port yer tutucusu bulunamadi — sablon ile renderlayici uyumsuz"
+        )
+    son = "\n".join(cikti)
+    return son + "\n" if rendered.endswith("\n") else son
+
+
 #: Uretim imajinin GHCR yolu. Etiket VERSION'dan turetilir.
 IMAGE_REPO = "ghcr.io/enerjione/enerjione-grid-dnp3-gateway"
 
@@ -116,9 +263,17 @@ def render_compose(
     install_mode: str,
     image: str | None = None,
     app_environment: str = "production",
+    initiating_ports: str | None = None,
+    initiating_bind_host: str = "0.0.0.0",
     template_path: Path = DEFAULT_TEMPLATE_PATH,
 ) -> str:
-    """Tek bir gateway icin docker compose YAML'i uretir."""
+    """Tek bir gateway icin docker compose YAML'i uretir.
+
+    `initiating_ports`: `ip_endpoint_type=initiating` cihazlarin dinleneceGi
+    HOST port blogu (orn. `"20100-20199"`). Verilmezse port YAYINLANMAZ ve
+    ciktinin davranisi 1.12.0 ile ayni kalir — yani yalnizca `listening`
+    cihazlari olan kurulumlar etkilenmez.
+    """
 
     _validate_code(code)
     if len(token) < 16:
@@ -126,8 +281,19 @@ def render_compose(
     if not 1 <= host_port <= 65535:
         raise RenderError(f"host_port aralik disi: {host_port}")
 
+    araliklar = parse_initiating_ports(initiating_ports)
+    # SAGLIK PORTU CAKISMASI: health 127.0.0.1'e baglanir ama ayni host portu
+    # iki kez yayinlanamaz. Sessizce uretip compose'u calisma zamaninda
+    # dusurmektense burada acikca reddediyoruz.
+    for bas, son in araliklar:
+        if bas <= host_port <= son:
+            raise RenderError(
+                f"host_port {host_port} initiating port blogu {bas}-{son} ICINDE; "
+                "saglik portu ile dinleyici blogu cakisamaz"
+            )
+
     template = template_path.read_text(encoding="utf-8")
-    return _render_text(
+    rendered = _render_text(
         template,
         {
             "GATEWAY_CODE": code,
@@ -140,8 +306,10 @@ def render_compose(
             "IMAGE": image or default_image(),
             "APP_ENVIRONMENT": app_environment,
             "INSTALL_MODE": _validate_install_mode(install_mode),
+            "INITIATING_PORT_MAPPINGS": _PORT_SENTINEL,
         },
     )
+    return _yerlestir_portlar(rendered, _render_initiating_ports(araliklar, bind_host=initiating_bind_host))
 
 
 def render_env(
@@ -216,6 +384,24 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--initiating-ports",
+        default=None,
+        help=(
+            "initiating cihazlarin dinlenecegi HOST port blogu "
+            "(orn. 20100-20199 veya 20100-20149,20300). Verilmezse port "
+            "YAYINLANMAZ — yalnizca `listening` cihazi olan kurulumlar icin "
+            "dogru olan budur. Ayni host'ta N gateway varsa bloklar AYRIK olmali."
+        ),
+    )
+    p.add_argument(
+        "--initiating-bind-host",
+        default="0.0.0.0",
+        help=(
+            "initiating portlarinin baglanacagi host arayuzu. Varsayilan tum "
+            "arayuzler; saha agina bakan tek bir IP vererek maruziyeti daraltin."
+        ),
+    )
+    p.add_argument(
         "--app-environment",
         default="production",
         choices=("development", "staging", "production"),
@@ -268,6 +454,8 @@ def main(argv: list[str] | None = None) -> int:
             install_mode=args.install_mode,
             image=args.image,
             app_environment=args.app_environment,
+            initiating_ports=args.initiating_ports,
+            initiating_bind_host=args.initiating_bind_host,
         )
 
     if args.output:

@@ -224,11 +224,16 @@ def test_fetch_config_ignores_missing_items() -> None:
 
 
 def _session_payload(**device_extra: Any) -> dict[str, Any]:
-    return {
-        "config_version": "v9",
-        "devices": [{"code": "A", "ip_address": "192.168.0.1", "dnp3_address": 10, **device_extra}],
-        "signals": [],
-    }
+    """`smart` istenirse uc/port da SOZLESMEYE UYGUN verilir.
+
+    `session_policy=smart` YALNIZCA `initiating` + gecerli `master_ip_port`
+    ile gecerlidir; kisitin KENDISI ayri testlerde olculur.
+    """
+    cihaz: dict[str, Any] = {"code": "A", "ip_address": "192.168.0.1", "dnp3_address": 10}
+    if str(device_extra.get("session_policy", "")).strip().lower() == "smart":
+        cihaz.update({"ip_endpoint_type": "initiating", "master_ip_port": 20100})
+    cihaz.update(device_extra)
+    return {"config_version": "v9", "devices": [cihaz], "signals": []}
 
 
 def _fetch(payload: dict[str, Any]):

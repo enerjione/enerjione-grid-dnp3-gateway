@@ -2,6 +2,113 @@
 
 Semver'a gore tutulur. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.13.0] - 2026-08-20
+
+Uretim hazirlik paketi: **G-INIT-02** (initiating uc agi + fail-closed
+dogrulama) ve **G-SMART-02** (Master Operation Mode -> otomatik oturum
+politikasi). Ikisi de GERIYE UYUMLU: varsayilanlar degismedi.
+
+**KOMUT DUZLEMI DEGISMEDI.** F1/F2/F3/F3C/F4/F5/F6/F7, DirectOperate, SBO,
+`/pending`, command freshness, `delivery_not_after`, idempotency,
+CommandLedger, response signature, command credential ve CROB dogrulamasi
+AYNEN duruyor. Uyuyan cihaz icin komut kuyruklama **EKLENMEDI** (bilincli
+non-goal): `reachable=false`, komut `offline` doner, fiziksel DNP3 islem
+sayisi **0**.
+
+### Fixed
+- **INITIATING CIHAZLAR CONTAINER'A HIC ULASAMIYORDU.** Compose sablonu
+  YALNIZCA health portunu yayinliyordu. Bridge ag modunda cihazin
+  `GATEWAY_HOST_IP:master_ip_port`a yaptigi baglanti container icindeki
+  dinleyiciye ULASMIYORDU. Sozlesmede `initiating_ports` yalnizca bir
+  GEREKCE notu olarak duruyordu; mekanizma YOKTU.
+
+  Cozum: gateway BASINA onceden ayrilmis host port blogu
+  (`render_compose.py --initiating-ports 20100-20199`), **kimlik eslemesi**
+  (host == container == `master_ip_port`).
+
+- **`ip_endpoint_type` YAZIM HATASI SESSIZCE `listening`e DUSUYORDU.**
+  Bu iki degerin anlami BIRBIRININ TERSI — kimin baglanti actigini belirler.
+  `"initating"` -> `listening`, gateway'in uyuyan bir modeme TCP client
+  olarak baglanmaya calismasi demekti; saha bunu yalnizca "cihaz yok"
+  olarak gorurdu. Artik **config REDDEDILIR**.
+
+- **`master_ip_port` EKSIK/BOZUKKEN SESSIZCE `None` OLUYORDU** ve adapter
+  `DNP3_TCP_PORT`e (20000) dusuyordu — TUM initiating cihazlar ayni portu
+  bind etmeye calisiyor, ilki disindakiler anlasilmaz bir soket hatasiyla
+  dusuyordu. Artik `initiating` icin ZORUNLU (1024..65535) ve **ayni gateway
+  icinde TEKIL** olmak zorunda; ikisi de config seviyesinde reddedilir.
+
+### Added
+- **`session_policy="auto"`** — rejim cihazin **Master `Operation Mode`**
+  noktasindan calisma aninda turetilir (Smart -> etkin `smart`, Boost ->
+  etkin `continuous`).
+
+  **Kaynak yalnizca Master/PoleMaster.** Satellite `Operation Mode`,
+  `Boost Mode Enabled` ve uc tipi bu karara KATILMAZ. Sinyal cihazin KENDI
+  katalogundan semantik kimlikle bulunur; **DNP3 index SABITLENMEZ** (statik
+  bir test sabit-index dalinin geri gelmesini engeller).
+
+- **DEGER/BAYRAK AYRIMI DOGRULANDI.** Dokumantasyondaki `0x01 = Boost`,
+  `0x81 = Smart` degerleri noktanin DEGERI DEGIL **tam DNP3 bayrak
+  oktetidir**; `0x80` biti STATE (yani degerin kendisi). Kutuphaneyle
+  olculdu (`Binary(True, Flags(0x01)) -> flags=0x81`). Dogru esleme:
+  **`1 = Smart`, `0 = Boost`** — naif "1 = Boost" varsayiminin TERSI.
+  Turetme bayrak oktetlerinden adim adim pinlendi ve `smart_raw_value` ile
+  ters cevrilebilir.
+
+- **AUTO baslangic durumu: SESSIZ.** Mod gozlenene kadar tarama kurulmaz ve
+  acilis integrity poll'u yapilmaz — siniflandirma ugruna tarama kurmak,
+  cihaz gercekten Smart ise 15 saniyelik idle sayacini surekli sifirlardi.
+  Siniflandirma icin taze bir baglanti da YIKILMAZ.
+
+  **Fallback (bilincli secim):** BAGLANTILI gecen 120 saniyede mod
+  gozlenemezse `continuous` uygulanir — veri dogrulugu pil tasarrufunun
+  onunde. Karar SESSIZ DEGIL: `auto_policy_fallback` WARNING + `/health`
+  `auto_fallback=true`.
+
+- **Dinleyici tanilama.** `AddTCPServer` bind hatasi CIHAZ BAZINDA izole
+  edilir (tum gateway dusmez) ama cihaz SAGLIKLI da gosterilmez:
+  `state="listener_error"`, `/health` -> `listener_port` + `listener_error`,
+  ozet sayaci `devices.listener_error`. Log KENAR-TETIKLI.
+
+- **`/health` yeni alanlar:** `configured_session_policy`,
+  `effective_session_policy`, `operation_mode`, `operation_mode_raw`,
+  `operation_mode_last_seen_epoch`, `auto_fallback`, `ip_endpoint_type`,
+  `master_ip_port`, `listener_expected`, `listener_port`.
+  Ozet: `listener_error` sayaci, `session_policies` (+`auto`) ve
+  `effective_policies`.
+
+- **Saha kabul dokumani** [docs/FIELD_ACCEPTANCE.md](docs/FIELD_ACCEPTANCE.md)
+  ve `scripts/field_capture.sh` (tcpdump tabanli sessizlik olcumu; Wireshark
+  GUI GEREKMEZ). Kalite bayragi pilotu (`DNP3_PUBLISH_QUALITY_FLAGS`) icin
+  tek-gateway proseduru dahil.
+
+### Changed
+- **`session_policy=smart|auto` YALNIZCA `ip_endpoint_type=initiating` ile
+  gecerli.** 1.12.0 bu kombinasyonu sessizce `continuous`a dusuruyordu
+  (`fail_safe_continuous`); artik **config reddedilir**. Operatorun acik
+  niyetini sessizce baska bir seye cevirmek, reddetmekten daha kotudur.
+  **Kirilma riski YOK:** `session_policy` gonderen bir backend surumu henuz
+  sahaya cikmadi ve alan gonderilmeyen kurulumlar `continuous` varsayilaniyla
+  etkilenmez.
+- **Oturum durumu kaydi surum 2.** `operation_mode` alani eklendi: restart
+  sonrasi `auto` cihaz yeniden sifirdan siniflandirmaya baslamaz (Boost bir
+  cihaz siniflandirma penceresi boyunca YOKLANMADAN kalirdi). Eski surum
+  dosyasi GUVENLI sekilde yok sayilir.
+- Compose sablonu artik initiating port yer tutucusu tasiyor; blok
+  verilmezse satir TAMAMEN SILINIR ve cikti 1.12.0 ile birebir ayni kalir.
+
+### Backward compatibility
+`listening` + `continuous` ve `initiating` + `continuous` kurulumlarinin
+davranisi DEGISMEDI. `--initiating-ports` verilmeyen render ciktisi 1.12.0
+ile birebir ayni. `session_policy`/`master_ip_port` gondermeyen backend'ler
+etkilenmez.
+
+### Backend/orkestrasyon sozlesmesi
+Host-port ayirma ve `auto` alani: [docs/BACKEND_TODO.md](docs/BACKEND_TODO.md)
+-> **B6**. Gateway prosesi ayni host'taki kardes instance'lari GOREMEZ;
+dagitik bir port ayirici gateway icinde UYDURULMADI.
+
 ## [1.12.0] - 2026-08-19
 
 **G-SMART-01** — Horstmann Smart Navigator 2.0 **Smart Mode / Initiating

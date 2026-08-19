@@ -33,6 +33,13 @@ from dnp3_gateway.backend.config_client import (
     _SMART_SILENCE_MIN_SEC,
 )
 from dnp3_gateway.command_parameters import validate_command_parameters
+from dnp3_gateway.operation_mode import (
+    MODE_BOOST,
+    MODE_SMART,
+    MODE_UNKNOWN,
+    normalize_operation_mode,
+    resolve_master_operation_mode_signal,
+)
 from dnp3_gateway.session_state_store import SessionStateRecord, SessionStateStore
 
 logger = logging.getLogger(__name__)
@@ -421,6 +428,31 @@ def _bayatlik_esigi_sn(scan_interval_sec: float, baseline_interval_sec: float) -
 # inactivity timeout is fixed at 15 seconds" + "Any TCP/DNP traffic resets
 # this inactivity timeout".
 HORSTMANN_IDLE_TIMEOUT_SEC = 15.0
+
+# AUTO SINIFLANDIRMA PENCERESI
+# ----------------------------
+# `session_policy=auto` cihazda mod HENUZ gozlenmemisken gateway SESSIZ
+# kalir (tarama yok, acilis integrity yok). Sebep: eger cihaz gercekten
+# Smart ise, siniflandirma ugruna kurulan periyodik tarama onun 15 saniyelik
+# hareketsizlik sayacini surekli sifirlar ve modem hicbir zaman kapanmaz —
+# yani duzeltmeye calistigimiz hatanin ta kendisi.
+#
+# Sure BAGLANTILI gecen zamanla olculur. Cihaz hic baglanmadiysa sayac
+# ILERLEMEZ: baglanti yokken tarama kurmak zaten anlamsizdir, ustelik cihaz
+# sonradan baglandiginda taramalar hazir bekliyor olurdu.
+#
+# Sure dolar ve mod hala bilinmiyorsa GUVENLI TARAFA dusulur: `continuous`.
+# IKI RISK DE GERCEK, secim bilincli:
+#   * continuous'a dusmek  -> cihaz gercekten Smart ise modemi acik kalir
+#                             (pil tuketimi; YAVAS ve gorunmez bir zarar)
+#   * smart'a dusmek       -> cihaz gercekten Boost ise periyodik yoklama
+#                             durur (telemetri bayatlar; VERI DOGRULUGU
+#                             zarari) ve beklenen kapanma comm_lost
+#                             uretmeyecegi icin gercek bir kopma gecikir
+# Veri dogrulugunu pil tasarrufunun onune koyuyoruz; ayrica `continuous`
+# 1.11.x'ten beri suregelen davranistir. Karar SESSIZ DEGIL: WARNING
+# loglanir ve `/health` `auto_fallback=true` ile gosterir.
+_AUTO_KARAR_TIMEOUT_SEC = 120.0
 
 # SMART SESSIZLIK DENETIMI
 # ------------------------
@@ -1245,6 +1277,21 @@ class _DeviceCache:
         with self._lock:
             return self._last_valid_contact_wall or None
 
+    def exit_smart_idle(self) -> float:
+        """`smart_idle`den LOST'a DUSMEDEN cik; gecen sureyi doner (yoksa -1).
+
+        `smart_idle_to_lost`tan farki: orada cihaz GERCEKTEN kayiptir ve
+        `lost`a dusurulur. Burada ise cihazin rejimi degismistir (Boost'a
+        gecti) — kayip degil, artik uyumasi BEKLENMIYOR.
+        """
+        with self._lock:
+            if self._smart_idle_since == 0.0:
+                return -1.0
+            sure = time.monotonic() - self._smart_idle_since
+            self._smart_idle_since = 0.0
+            self._smart_idle_since_wall = 0.0
+            return sure
+
     def smart_idle_to_lost(self) -> bool:
         """Sessizlik esigi asildi: `smart_idle` -> `lost`. Donen: gecis oldu mu.
 
@@ -1696,6 +1743,7 @@ class _ManagedMaster:
         baseline_interval_sec: int,
         time_sync: str = "lan",
         session_policy: str = "continuous",
+        known_mode: str | None = None,
     ) -> None:
         self.device = device
         self.cache = _DeviceCache()
@@ -1715,6 +1763,9 @@ class _ManagedMaster:
         # komut ucustayken oturumu yikmak gorevi cevapsiz birakir ve sonuc
         # CommandStatus.UNDEFINED doner (sahada olculdu 2026-08-11).
         self.last_command_at: float = 0.0
+        #: initiating cihazlarda dinlenen port; listening'de None.
+        #: /health teshisi icin tutulur (bkz. `device_health`).
+        self.listen_port: int | None = None
         # OTURUM YASAM DONGUSU — bu cihaza OZEL, ACIKCA yapilandirilir.
         #
         #   "continuous" (VARSAYILAN): bugunku davranis. Class 1/2/3 event
@@ -1731,7 +1782,39 @@ class _ManagedMaster:
         #
         # Politika CIHAZ BASINADIR ve `connection_fingerprint`e dahildir:
         # degisirse YALNIZCA o cihazin master'i yeniden kurulur.
-        self.session_policy: str = "smart" if str(session_policy).lower() == "smart" else "continuous"
+        # YAPILANDIRILAN politika (config'ten gelen, DEGISMEZ) ile ETKIN
+        # politika (calisma aninda uygulanan) AYRI tutulur. `auto` disinda
+        # ikisi ayni; `auto`da etkin politika mod gozlendikce belirlenir.
+        istenen = str(session_policy).lower()
+        #: CONFIG'ten gelen politika — DEGISMEZ, health'te oldugu gibi raporlanir.
+        self.configured_session_policy: str = istenen if istenen in ("smart", "auto") else "continuous"
+        #: `auto` cihazda ONCEDEN BILINEN mod (kalici kayittan / gecmis
+        #: gozlemden). Baslangic ETKIN politikasini belirler; yoksa sessiz baslar.
+        bilinen = known_mode if known_mode in (MODE_SMART, MODE_BOOST) else None
+
+        # ETKIN politika = su an fiilen uygulanan. `auto` disinda
+        # `configured` ile aynidir.
+        #
+        # `auto` + mod BILINMIYOR -> SESSIZ basla (tarama yok, acilis
+        # integrity yok). Siniflandirma ugruna tarama kurmak, cihaz gercekten
+        # Smart ise 15 saniyelik idle sayacini surekli sifirlardi.
+        if self.configured_session_policy == "auto":
+            self.session_policy: str = "continuous" if bilinen == MODE_BOOST else "smart"
+        elif self.configured_session_policy == "smart":
+            self.session_policy = "smart"
+        else:
+            self.session_policy = "continuous"
+
+        #: `auto` icin: mod henuz gozlenmedi mi (etkin politika gecici mi)?
+        self.auto_pending: bool = self.configured_session_policy == "auto" and bilinen is None
+        #: `auto` sinifladirmasinin BAGLANTILI gectigi sure (monotonic toplam).
+        self.auto_connected_since: float = 0.0
+        #: Sinifladirma penceresi dolup `continuous`a dusuldu mu.
+        self.auto_fallback: bool = False
+        #: Son gozlenen mod + gozlem ani (health/teshis).
+        self.operation_mode: str = bilinen or MODE_UNKNOWN
+        self.operation_mode_raw: float | None = None
+        self.operation_mode_seen_at: float | None = None
         self.cache.set_session_policy(self.session_policy)
         self._scan_event: Any = None
         self._scan_class0: Any = None
@@ -1741,16 +1824,39 @@ class _ManagedMaster:
         channel_endpoint_label: str
         if endpoint_type == "initiating":
             # Gateway TCP server modunda dinler; cihaz buraya baglanir.
-            # master_ip_port backend tarafindan atanir; yoksa fallback olarak
-            # tcp_port'u kullaniriz.
-            listen_port = int(device.master_ip_port or tcp_port)
-            self._channel = manager.AddTCPServer(
-                f"ch_{device.code}",
-                opendnp3.levels.NORMAL,
-                opendnp3.ServerAcceptMode.CloseExisting,
-                opendnp3.IPEndpoint("0.0.0.0", listen_port),
-                None,
-            )
+            #
+            # `master_ip_port` ARTIK ZORUNLU ve config seviyesinde dogrulanmis
+            # durumda (bkz. `_parse_master_ip_port`). Eski "yoksa tcp_port'a
+            # dus" davranisi KALDIRILDI: o fallback TUM initiating cihazlari
+            # ayni porta (DNP3_TCP_PORT, 20000) yigiyor ve ikinci cihazdan
+            # itibaren anlasilmaz bir soket hatasi uretiyordu.
+            #
+            # Disk onbelleginden gelen bir DeviceConfig parser'i atlayabilir
+            # (bkz. state.load_from_cache), bu yuzden burada da savunma var.
+            if not device.master_ip_port:
+                raise Yadnp3AdapterError(
+                    f"initiating cihaz {device.code!r} icin master_ip_port yok; "
+                    "dinleyici acilamaz (config dogrulamasi atlanmis olabilir)"
+                )
+            listen_port = int(device.master_ip_port)
+            self.listen_port = listen_port
+            try:
+                self._channel = manager.AddTCPServer(
+                    f"ch_{device.code}",
+                    opendnp3.levels.NORMAL,
+                    opendnp3.ServerAcceptMode.CloseExisting,
+                    opendnp3.IPEndpoint("0.0.0.0", listen_port),
+                    None,
+                )
+            except Exception as exc:  # noqa: BLE001
+                # BIND HATASI IZOLE EDILIR: port zaten kullanimda ya da
+                # ayricalikli olabilir. Tum gateway'i dusurmek, saglikli
+                # diger cihazlari da karanliga sokardi; ama cihazi SAGLIKLI
+                # gostermek de kabul edilemez — hata yukari tasinir ve
+                # `_ensure_master` bunu cihaz basina bir sorun olarak isler.
+                raise Yadnp3AdapterError(
+                    f"initiating dinleyici acilamadi device={device.code} port={listen_port}: {exc}"
+                ) from exc
             channel_mode = "initiating(server)"
             channel_endpoint_label = f"0.0.0.0:{listen_port}"
         else:
@@ -1846,7 +1952,11 @@ class _ManagedMaster:
             local_address,
             self._scan_interval_sec if self.session_policy != "smart" else "-",
             self._baseline_interval_sec if self.session_policy != "smart" else "-",
-            self.session_policy,
+            (
+                f"{self.configured_session_policy}->{self.session_policy}"
+                if self.configured_session_policy == "auto"
+                else self.session_policy
+            ),
         )
 
     def _periyodik_scan_ekle(self) -> None:
@@ -1876,6 +1986,36 @@ class _ManagedMaster:
             self._soe,
             opendnp3.TaskConfig.Default(),
         )
+
+    def enable_periodic_scans(self) -> bool:
+        """Calisma aninda periyodik taramalari baslat (quiet -> continuous).
+
+        yadnp3 3.2.1.1 ile OLCULDU: `AddClassScan` master ENABLE EDILDIKTEN
+        sonra da calisir ve tarama derhal devreye girer. Bu sayede Boost'a
+        gecen (ya da `auto`da Boost olarak siniflanan) bir cihaz icin
+        master'i yeniden kurmaya — yani calisan TCP oturumunu yikmaya —
+        GEREK KALMAZ.
+
+        TERS YON AYNI SEKILDE COZULEMEZ: kutuphane bir taramayi kaldirmayi/
+        durdurmayi SUNMUYOR (`IMasterScan` yalnizca `Demand()` tasiyor).
+        Orada master YALNIZCA O CIHAZ icin yeniden kurulur.
+
+        Donen: tarama gercekten eklendi mi.
+        """
+        if self.session_policy != "smart":
+            return False
+        try:
+            self._periyodik_scan_ekle()
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "yadnp3_periodic_scan_enable_failed device=%s — periyodik tarama "
+                "kurulamadi; master yeniden kurulacak",
+                self.device.code,
+            )
+            return False
+        self.session_policy = "continuous"
+        self.cache.set_session_policy("continuous")
+        return True
 
     @staticmethod
     def _apply_time_sync(cfg: Any, mode: str) -> None:
@@ -2367,6 +2507,25 @@ class Yadnp3TelemetryReader(TelemetryReader):
         #: yuklenir; aksi halde uyuyan filo toplu comm_lost gorunurdu).
         self._session_store = SessionStateStore(session_store_path)
         self._session_store.load()
+        #: Cihaz kodu -> (sinyal_kimligi, mod_sinyali) onbellegi.
+        self._mod_sinyal_onbellek: dict[str, tuple[Any, Any]] = {}
+        #: `auto` cihazlarda master KURULMADAN once bilinen mod (restart /
+        #: rebuild sonrasi dogru politikayla kurulabilmesi icin).
+        #:
+        #: ACILISTA kalici kayittan TOHUMLANIR: `_ensure_master` politikayi
+        #: master'i kurmadan ONCE secer, `_durumu_geri_yukle` ise SONRA kosar.
+        #: Tohumlanmasaydi restart sonrasi Boost bir cihaz yeniden sessiz
+        #: baslar ve siniflandirma penceresi boyunca YOKLANMADAN kalirdi.
+        self._bilinen_auto_mod: dict[str, str] = {
+            kod: kayit.operation_mode
+            for kod, kayit in self._session_store.snapshot().items()
+            if kayit.operation_mode in (MODE_SMART, MODE_BOOST)
+        }
+        self._auto_mod_degisimi_total = 0
+        #: Cihaz basina AKTIF dinleyici bind hatalari (initiating).
+        #: `/health` bunlari raporlar; kenar-tetikli loglanir.
+        self._dinleyici_lock = threading.Lock()
+        self._dinleyici_hatalari: dict[str, dict[str, Any]] = {}
         self._smart_sayaclari_lock = threading.Lock()
         self._smart_idle_giris_total = 0
         self._smart_uyanma_total = 0
@@ -2474,16 +2633,32 @@ class Yadnp3TelemetryReader(TelemetryReader):
                 # ACIKCA gelir ve `connection_fingerprint`e dahildir —
                 # degisirse master yeniden kurulur.
                 policy = self._session_policy(device)
-                mm = _ManagedMaster(
-                    self._manager,
-                    device=device,
-                    local_address=local_addr,
-                    tcp_port=port,
-                    scan_interval_sec=self._scan_interval_sec,
-                    baseline_interval_sec=self._baseline_interval_sec,
-                    time_sync=self._time_sync,
-                    session_policy=policy,
-                )
+                # BILINEN MOD AYRI GECIRILIR — politikanin kendisi DUSURULMEZ.
+                # Politikayi "continuous"a cevirmek, cihazin `auto` olarak
+                # yapilandirildigi bilgisini kaybettirir ve health yanlis
+                # raporlar; ayrica sonraki mod degisimleri islenemezdi.
+                bilinen_mod = self._bilinen_auto_mod.get(device.code)
+                try:
+                    mm = _ManagedMaster(
+                        self._manager,
+                        device=device,
+                        local_address=local_addr,
+                        tcp_port=port,
+                        scan_interval_sec=self._scan_interval_sec,
+                        baseline_interval_sec=self._baseline_interval_sec,
+                        time_sync=self._time_sync,
+                        session_policy=policy,
+                        known_mode=bilinen_mod,
+                    )
+                except Yadnp3AdapterError as exc:
+                    # DINLEYICI KURULAMADI (port dolu / ayricalikli / bind
+                    # reddedildi). CIHAZ BAZINDA izole edilir: bu cihaz
+                    # kurulamaz ama DIGER cihazlar etkilenmez. Sessiz de
+                    # kalmaz — kalici bir sorun olarak kaydedilir ve
+                    # `/health` bunu raporlar.
+                    self._dinleyici_hatasi_kaydet(device, exc)
+                    raise
+                self._dinleyici_hatasi_temizle(device.code)
                 mm.connection_fingerprint = want
                 mm.g110_ranges = g110
                 self._durumu_geri_yukle(mm, device)
@@ -2793,6 +2968,210 @@ class Yadnp3TelemetryReader(TelemetryReader):
     # SMART OTURUM YASAM DONGUSU — hepsi CIHAZ BASINA
     # ------------------------------------------------------------------
 
+    def _masteri_dusur(self, mm: _ManagedMaster, device_code: str) -> None:
+        """YALNIZCA bu cihazin master/kanalini kapat.
+
+        Bir sonraki cycle'da `_ensure_master` dogru politikayla yeniden kurar.
+        DNP3Manager'a ya da diger cihazlarin master'larina DOKUNULMAZ.
+        """
+        try:
+            mm.shutdown()
+        except Exception:  # noqa: BLE001
+            logger.debug("yadnp3_master_shutdown_error device=%s", device_code, exc_info=True)
+        with self._lock:
+            if self._masters.get(device_code) is mm:
+                self._masters.pop(device_code, None)
+
+    # ---- AUTO: Master Operation Mode -> etkin politika -----------------
+
+    def _mod_sinyalini_coz(self, device: DeviceConfig, signals: list[SignalConfig] | None) -> Any | None:
+        """MASTER `Operation Mode` sinyali — CIHAZ BASINA onbellekli.
+
+        Onbellek sinyal setinin kimligini tasir: profil/katalog degisirse
+        yeniden cozulur. Her cycle 193 sinyali yeniden taramak 600 cihazda
+        anlamsiz bir maliyet olurdu.
+        """
+        kimlik = tuple(sorted((x.key or "") for x in (signals or ())))
+        onbellek = self._mod_sinyal_onbellek.get(device.code)
+        if onbellek is not None and onbellek[0] == kimlik:
+            return onbellek[1]
+        sinyal = resolve_master_operation_mode_signal(device, signals)
+        self._mod_sinyal_onbellek[device.code] = (kimlik, sinyal)
+        return sinyal
+
+    def _auto_politikayi_coz(
+        self,
+        mm: _ManagedMaster,
+        device: DeviceConfig,
+        signals: list[SignalConfig],
+        *,
+        connected: bool,
+        now: float,
+    ) -> bool:
+        """`auto` cihazin ETKIN politikasini gozlenen moda gore ayarlar.
+
+        Donen: master DUSURULDU mu (cagiran taraf o master'da islem yapmamali).
+
+        Karar KAYNAGI yalnizca MASTER `Operation Mode` noktasidir. Satellite
+        noktalari ve `Boost Mode Enabled` KATILMAZ (bkz. operation_mode).
+        """
+        if mm.configured_session_policy != "auto":
+            return False
+
+        sinyal = self._mod_sinyalini_coz(device, signals)
+        gozlenen = MODE_UNKNOWN
+        ham: float | None = None
+        if sinyal is not None:
+            kayit = mm.cache.get(sinyal.dnp3_object_group, sinyal.dnp3_index)
+            ham = kayit[0] if kayit else None
+            gozlenen = normalize_operation_mode(ham)
+
+        if gozlenen != MODE_UNKNOWN:
+            mm.operation_mode_raw = ham
+            mm.operation_mode_seen_at = time.time()
+            if gozlenen != mm.operation_mode:
+                onceki = mm.operation_mode
+                mm.operation_mode = gozlenen
+                return self._auto_modu_uygula(mm, device, onceki=onceki, yeni=gozlenen, ham=ham)
+            # AYNI MOD TEKRAR: hicbir sey yapilmaz (rebuild/flap YOK).
+            return False
+
+        # --- Mod HALA bilinmiyor: baglantili sureyi say, sinirda fallback ---
+        if not connected:
+            # Baglanti yokken sayac ILERLEMEZ: tarama kurmak anlamsiz olurdu
+            # ve cihaz sonradan baglandiginda taramalar hazir beklerdi.
+            mm.auto_connected_since = 0.0
+            return False
+        if mm.auto_connected_since == 0.0:
+            mm.auto_connected_since = now
+            return False
+        if (now - mm.auto_connected_since) < _AUTO_KARAR_TIMEOUT_SEC:
+            return False
+        if mm.auto_fallback:
+            return False
+
+        mm.auto_fallback = True
+        mm.auto_pending = False
+        logger.warning(
+            "auto_policy_fallback device=%s window=%.0fs — MASTER 'Operation Mode' "
+            "bu surede GOZLENEMEDI; GUVENLI TARAFA `continuous` uygulaniyor "
+            "(veri dogrulugu pil tasarrufunun onunde). Cihaz gercekten Smart ise "
+            "modemi acik kalir: nokta katalogunda `master.operation_mode` var mi "
+            "ve cihaz bu noktayi raporluyor mu kontrol edin.",
+            device.code,
+            _AUTO_KARAR_TIMEOUT_SEC,
+        )
+        if mm.enable_periodic_scans():
+            return False
+        self._masteri_dusur(mm, device.code)
+        return True
+
+    def _auto_modu_uygula(
+        self,
+        mm: _ManagedMaster,
+        device: DeviceConfig,
+        *,
+        onceki: str,
+        yeni: str,
+        ham: float | None,
+    ) -> bool:
+        """Gozlenen mod DEGISTI: YALNIZCA bu cihazin politikasini uyarla.
+
+        Donen: master dusuruldu mu.
+        """
+        mm.auto_pending = False
+        mm.auto_fallback = False
+        with self._smart_sayaclari_lock:
+            self._auto_mod_degisimi_total += 1
+        # HAM DEGER LOGLANIR: 0/1 -> Smart/Boost turetmesi sahada tek satirdan
+        # dogrulanabilsin diye (bkz. operation_mode modulu).
+        logger.info(
+            "device_operation_mode_changed device=%s old=%s new=%s raw=%s effective_policy=%s",
+            device.code,
+            onceki,
+            yeni,
+            ham,
+            mm.session_policy,
+        )
+
+        if yeni == MODE_SMART:
+            if mm.session_policy == "smart":
+                return False  # zaten sessiz — rebuild YOK
+            # BOOST -> SMART: kutuphane calisan bir taramayi KALDIRAMAZ,
+            # tek cozum BU CIHAZIN master'ini yeniden kurmak. Diger
+            # cihazlarin master/kanalina DOKUNULMAZ.
+            logger.info(
+                "auto_scan_disabled device=%s — periyodik taramalar durduruluyor "
+                "(master YALNIZCA bu cihaz icin yeniden kuruluyor)",
+                device.code,
+            )
+            self._bilinen_auto_mod[device.code] = MODE_SMART
+            self._masteri_dusur(mm, device.code)
+            return True
+
+        # SMART -> BOOST (ya da ilk siniflandirma Boost): tarama calisma
+        # aninda eklenir, ACIK OTURUM YIKILMAZ.
+        self._bilinen_auto_mod[device.code] = MODE_BOOST
+        mm.cache.exit_smart_idle()
+        if mm.enable_periodic_scans():
+            logger.info(
+                "auto_scan_enabled device=%s event_scan=%ss integrity_scan=%ss — "
+                "surekli haberlesme davranisi devrede",
+                device.code,
+                self._scan_interval_sec,
+                self._baseline_interval_sec,
+            )
+            return False
+        self._masteri_dusur(mm, device.code)
+        return True
+
+    # ---- Dinleyici (initiating) tanilama -------------------------------
+
+    def _dinleyici_hatasi_kaydet(self, device: DeviceConfig, exc: Exception) -> None:
+        """Bind hatasini cihaz basina kaydet + KENAR-TETIKLI logla.
+
+        Bu kosul KALICIDIR (port baskasinda oldugu surece surer); her poll
+        cycle'inda loglamak defteri doldurur ve gercek arizalari gizlerdi.
+        """
+        kod = device.code
+        mesaj = str(exc)
+        with self._dinleyici_lock:
+            onceki = self._dinleyici_hatalari.get(kod)
+            self._dinleyici_hatalari[kod] = {
+                "port": device.master_ip_port,
+                "error": mesaj[:200],
+                "since_epoch": (onceki or {}).get("since_epoch") or time.time(),
+            }
+            yeni_mi = onceki is None or onceki.get("error") != mesaj[:200]
+        if yeni_mi:
+            logger.error(
+                "dnp3_listener_bind_failed device=%s port=%s error=%s — bu cihaz "
+                "icin dinleyici ACILAMADI. Port baska bir surec/gateway tarafindan "
+                "kullaniliyor olabilir. DIGER cihazlar etkilenmez; /health bu "
+                "cihazi `listener_error` ile raporlar.",
+                kod,
+                device.master_ip_port,
+                mesaj[:200],
+            )
+
+    def _dinleyici_hatasi_temizle(self, device_code: str) -> None:
+        """Dinleyici artik acildi: kaydi dusur (kenar-tetikli iyilesme logu)."""
+        if device_code not in self._dinleyici_hatalari:
+            return
+        with self._dinleyici_lock:
+            dustu = self._dinleyici_hatalari.pop(device_code, None)
+        if dustu:
+            logger.info(
+                "dnp3_listener_bind_recovered device=%s port=%s — dinleyici acildi",
+                device_code,
+                dustu.get("port"),
+            )
+
+    def listener_errors(self) -> dict[str, dict[str, Any]]:
+        """Aktif dinleyici bind hatalari (health/teshis icin)."""
+        with self._dinleyici_lock:
+            return {k: dict(v) for k, v in self._dinleyici_hatalari.items()}
+
     @staticmethod
     def _session_policy(device: DeviceConfig) -> str:
         """Bu cihazin ETKIN oturum politikasi. Tanimsiz/eksik -> "continuous".
@@ -2819,7 +3198,7 @@ class Yadnp3TelemetryReader(TelemetryReader):
         JSON'dan kurar ve parser'i ATLAR). Tek choke point burasidir.
         """
         istenen = str(getattr(device, "session_policy", "") or "").lower()
-        if istenen != "smart":
+        if istenen not in ("smart", "auto"):
             return "continuous"
         uc = str(getattr(device, "ip_endpoint_type", "") or "listening").strip().lower()
         if uc != "initiating":
@@ -2834,7 +3213,7 @@ class Yadnp3TelemetryReader(TelemetryReader):
                     uc,
                 )
             return "continuous"
-        return "smart"
+        return istenen
 
     def _smart_silence_limit(self, device: DeviceConfig) -> int | None:
         """Bu CIHAZ icin etkin sessizlik esigi (saniye); None = denetim KAPALI.
@@ -2878,10 +3257,20 @@ class Yadnp3TelemetryReader(TelemetryReader):
         `comm_lost` gorunurdu. Kayit yoksa/bozuksa hicbir sey yapilmaz ve
         cihaz `lost` ile baslar — yani ozelligin hic olmadigi davranis.
         """
-        if mm.session_policy != "smart":
-            return
         kayit = self._session_store.get(device.code)
-        if kayit is None or not kayit.smart_idle_since_unix:
+        if kayit is None:
+            return
+        # `auto`: son gozlenen modu geri yukle ki master dogru politikayla
+        # kurulsun ve Boost bir cihaz siniflandirma penceresi boyunca
+        # yoklanmadan kalmasin.
+        if mm.configured_session_policy == "auto" and kayit.operation_mode in (
+            MODE_SMART,
+            MODE_BOOST,
+        ):
+            mm.operation_mode = kayit.operation_mode
+            mm.auto_pending = False
+            self._bilinen_auto_mod[device.code] = kayit.operation_mode
+        if mm.session_policy != "smart" or not kayit.smart_idle_since_unix:
             return
         # Sessizlik esigi COKTAN asilmissa idle'i geri yukleme: cihaz gercekten
         # kayip demektir ve normal comm_lost yolundan gecmelidir.
@@ -2948,7 +3337,9 @@ class Yadnp3TelemetryReader(TelemetryReader):
 
     def _cihaz_durumunu_kaydet(self, mm: _ManagedMaster, device: DeviceConfig) -> None:
         """Cihazin oturum durumunu kalici kayda yaz (hiz sinirli, atomik)."""
-        if mm.session_policy != "smart":
+        # `auto` cihazlar da yazilir: gozlenen mod restart'tan sonra dogru
+        # politikayla master kurmak icin gerekli.
+        if mm.session_policy != "smart" and mm.configured_session_policy != "auto":
             return
         try:
             self._session_store.record(
@@ -2957,6 +3348,7 @@ class Yadnp3TelemetryReader(TelemetryReader):
                     state=mm.cache.state(),
                     last_valid_contact_unix=mm.cache.last_valid_contact_wall(),
                     smart_idle_since_unix=mm.cache.smart_idle_since_wall(),
+                    operation_mode=mm.operation_mode,
                 ),
             )
             self._session_store.flush()
@@ -2988,8 +3380,29 @@ class Yadnp3TelemetryReader(TelemetryReader):
     ) -> list[SignalReading]:
         cache = mm.cache
         connected = cache.is_connected()
-        # Politika ACIKCA yapilandirilmistir; cihazin noktalarindan
-        # CIKARILMAZ (bkz. `_session_policy`).
+
+        # AUTO SINIFLANDIRMA — HER SEYDEN ONCE.
+        # `auto` disinda HICBIR SEY YAPMAZ (aninda False doner), yani manuel
+        # `continuous`/`smart` davranisi birebir korunur.
+        if self._auto_politikayi_coz(mm, device, signals, connected=connected, now=time.monotonic()):
+            # Mod gecisi bu cihazin master'ini kapatti; bir sonraki cycle'da
+            # dogru politikayla yeniden kurulacak. Kapanmis bir master
+            # uzerinde durum makinesi yurutmek anlamsiz — ve `comm_lost`
+            # yayinlamak YANLIS olurdu: cihaz saglikli, oturumu BIZ kapattik.
+            return [
+                SignalReading(
+                    signal_key=x.key,
+                    source=x.source,
+                    data_type=x.data_type,
+                    raw_value=0.0,
+                    scaled_value=0.0,
+                    quality="no_change",
+                    value_string=None,
+                )
+                for x in signals
+            ]
+
+        # ETKIN politika: `auto` cozuldukce degisebilir, manuelde sabittir.
         smart = mm.session_policy == "smart"
 
         # G110 (string) okumasi — link ACILDIKTAN SONRA, POLL THREAD'inden.
@@ -3473,7 +3886,26 @@ class Yadnp3TelemetryReader(TelemetryReader):
 
                 out[code] = {
                     "state": mm.cache.state(),
+                    # YAPILANDIRILAN ile ETKIN politika AYRI raporlanir:
+                    # `auto` cihazda "ne istendi" ile "su an ne uygulaniyor"
+                    # farkli olabilir ve teshis tam olarak bu farkta.
                     "session_policy": mm.session_policy,
+                    "configured_session_policy": mm.configured_session_policy,
+                    "effective_session_policy": (
+                        "unknown"
+                        if (mm.configured_session_policy == "auto" and mm.auto_pending)
+                        else mm.session_policy
+                    ),
+                    "operation_mode": mm.operation_mode,
+                    "operation_mode_raw": mm.operation_mode_raw,
+                    "operation_mode_last_seen_epoch": mm.operation_mode_seen_at,
+                    "auto_fallback": mm.auto_fallback,
+                    # UC TIPI + DINLEYICI — initiating sorunlarinin teshisi
+                    # icin. Hicbiri gizli bilgi degil; token/kimlik tasimaz.
+                    "ip_endpoint_type": (mm.device.ip_endpoint_type or "listening"),
+                    "master_ip_port": mm.device.master_ip_port,
+                    "listener_expected": bool(mm.listen_port),
+                    "listener_port": mm.listen_port,
                     "connected": mm.cache.is_connected(),
                     "last_frame_epoch": last or None,
                     "last_valid_contact_epoch": son_temas_wall,
@@ -3491,6 +3923,28 @@ class Yadnp3TelemetryReader(TelemetryReader):
                 }
             except Exception:  # noqa: BLE001
                 out[code] = {"state": "unknown", "last_frame_epoch": None}
+
+        # DINLEYICISI ACILAMAYAN CIHAZLAR: master hic kurulamadigi icin
+        # `self._masters` icinde YOKLAR ve yukaridaki dongu onlari atlar.
+        # Sessiz kalmak, saha icin en kotu sonuc olurdu: cihaz `/health`te
+        # hic gorunmez ve "neden veri gelmiyor" sorusunun cevabi hicbir
+        # yerde yazmazdi.
+        for kod, bilgi in self.listener_errors().items():
+            if kod in out:
+                continue
+            out[kod] = {
+                "state": "listener_error",
+                "session_policy": "unknown",
+                "ip_endpoint_type": "initiating",
+                "master_ip_port": bilgi.get("port"),
+                "listener_expected": True,
+                "listener_port": bilgi.get("port"),
+                "listener_error": bilgi.get("error"),
+                "listener_error_since_epoch": bilgi.get("since_epoch"),
+                "connected": False,
+                "reachable": False,
+                "last_frame_epoch": None,
+            }
         return out
 
     def commit_published(

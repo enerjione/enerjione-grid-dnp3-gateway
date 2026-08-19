@@ -255,8 +255,10 @@ class _SahteMaster:
         self.scan_sayisi = 0
         self.last_command_at = 0.0
         # G110 senaryolari varsayilan `continuous` politikayla kosar;
-        # Smart dallarina hic girilmez.
+        # Smart/auto dallarina hic girilmez.
+        self.configured_session_policy = "continuous"
         self.session_policy = "continuous"
+        self.listen_port = None
 
     def scan_g110_once(self) -> bool:
         self.scan_sayisi += 1

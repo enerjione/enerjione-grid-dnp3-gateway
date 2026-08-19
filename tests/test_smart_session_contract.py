@@ -208,7 +208,7 @@ def test_gs07e_sayisal_metin_ve_float_daraltilir() -> None:
 # ==========================================================================
 
 
-@pytest.mark.parametrize("deger", ["smrt", "SMART_MODE", "boost", "auto", "1", "true"])
+@pytest.mark.parametrize("deger", ["smrt", "SMART_MODE", "boost", "1", "true", "otomatik"])
 def test_gs08_gecersiz_session_policy_configu_dusurur(deger: str) -> None:
     """SESSIZCE VARSAYILANA DUSMEK YASAK.
 
@@ -223,7 +223,7 @@ def test_gs08_gecersiz_session_policy_configu_dusurur(deger: str) -> None:
 
 
 def test_gs08b_kabul_edilen_degerler_kumesi() -> None:
-    assert SESSION_POLICIES == frozenset({"continuous", "smart"})
+    assert SESSION_POLICIES == frozenset({"continuous", "smart", "auto"})
 
 
 def test_gs08c_buyuk_harf_ve_bosluk_normalize() -> None:
@@ -352,7 +352,7 @@ def test_gs10d_cihaz_basina_health_alanlari() -> None:
         ),
         1,
     )
-    assert ozet["session_policies"] == {"continuous": 0, "smart": 1}
+    assert ozet["session_policies"] == {"continuous": 0, "smart": 1, "auto": 0}
     # `smart_lost`: smart politikali ama GERCEKTEN kopuk cihazlar.
     assert ozet["smart_lost"] == 0
 
@@ -508,6 +508,7 @@ def test_gs13b_backend_payloadinda_bilinmeyen_alan_configu_dusurmez() -> None:
                 _cihaz_item(
                     session_policy="smart",
                     ip_endpoint_type="initiating",
+                    master_ip_port=20100,
                     smart_max_silence_sec=93600,
                     gelecekteki_alan={"derin": [1, 2]},
                 )

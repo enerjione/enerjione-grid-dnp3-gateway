@@ -347,6 +347,10 @@ def _device_health_snapshot(reader: Any, configured_count: int) -> dict[str, Any
         # Horstmann Smart politikasi: SAGLIKLI uyuyan cihazlar. `lost` ile
         # karistirilmamalari sart — biri ariza, digeri tasarim davranisi.
         "smart_idle": 0,
+        # initiating dinleyicisi ACILAMAYAN cihazlar (port dolu/ayricalikli).
+        # Ayri sayilir: bu bir HABERLESME arizasi degil, KURULUM arizasidir
+        # ve operatorun yapacagi sey tamamen farklidir.
+        "listener_error": 0,
         "oldest_frame_age_sec": None,
     }
     if reader is None:
@@ -366,17 +370,21 @@ def _device_health_snapshot(reader: Any, configured_count: int) -> dict[str, Any
     oldest_age: float | None = None
     # Politika bazli kirilim: operator "cihazlarin cogu uyuyor, 3'u gercekten
     # kayip" ayrimini tek GET ile gorebilmeli.
-    politika_sayim = {"continuous": 0, "smart": 0}
+    politika_sayim = {"continuous": 0, "smart": 0, "auto": 0}
+    etkin_sayim = {"continuous": 0, "smart": 0, "unknown": 0}
     smart_lost = 0
     for info in per_device.values():
         state_name = str(info.get("state") or "unknown")
-        if state_name in ("online", "recovering", "lost", "smart_idle"):
+        if state_name in ("online", "recovering", "lost", "smart_idle", "listener_error"):
             summary[state_name] += 1
         else:
             summary["unknown"] += 1
-        politika = str(info.get("session_policy") or "continuous")
+        politika = str(info.get("configured_session_policy") or info.get("session_policy") or "continuous")
         if politika in politika_sayim:
             politika_sayim[politika] += 1
+        etkin = str(info.get("effective_session_policy") or info.get("session_policy") or "continuous")
+        if etkin in etkin_sayim:
+            etkin_sayim[etkin] += 1
         # Smart politikada olup GERCEKTEN kopuk olanlar (sessizlik penceresi
         # asilmis) — saglikli `smart_idle` ile KARISTIRILMAMALI.
         if politika == "smart" and state_name == "lost":
@@ -388,12 +396,14 @@ def _device_health_snapshot(reader: Any, configured_count: int) -> dict[str, Any
 
     summary["smart_lost"] = smart_lost
     summary["session_policies"] = politika_sayim
+    summary["effective_policies"] = etkin_sayim
 
     tracked = (
         summary["online"]
         + summary["recovering"]
         + summary["lost"]
         + summary["smart_idle"]
+        + summary["listener_error"]
         + summary["unknown"]
     )
     if summary["total"] < tracked:

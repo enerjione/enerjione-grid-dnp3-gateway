@@ -628,3 +628,68 @@ def test_recovery_grace_saat_sicramasindan_etkilenmez(monkeypatch) -> None:
     monkeypatch.setattr(time, "time", lambda: gercek_time() + 3600)
 
     assert c.recovery_age() < 5.0, "grace period duvar saati sicramasiyla tuketilmis"
+
+
+# ==========================================================================
+# G-QUALITY-PILOT (45-47) — pilot oncesi otomatik dogrulanabilirler
+# ==========================================================================
+
+
+def test_45_kalite_eslemesi_tipe_duyarli_kalmali() -> None:
+    """Ayni bayrak byte'i TIPE GORE farkli kalite uretmeli.
+
+    Pilot (`DNP3_PUBLISH_QUALITY_FLAGS=true`) acilmadan once bu ozelligin
+    KAYBOLMADIGINDAN emin olmak sart: tip-kor bir esleme, sahadaki HER ACIK
+    KESICIYI `invalid` yayinlardi.
+    """
+    # 0x41 = ONLINE | bit6
+    assert map_dnp3_quality(0x41, _G3_DOUBLE_BIT) == "good", "G3 durum biti kalite sanildi"
+    assert map_dnp3_quality(0x41, _G30_ANALOG) == "invalid", "G30 REFERENCE_ERR kacirildi"
+    # 0x81 = ONLINE | bit7
+    assert map_dnp3_quality(0x81, _G3_DOUBLE_BIT) == "good"
+    assert map_dnp3_quality(0x81, _G1_BINARY) == "good", "G1 STATE biti kalite sanildi"
+
+
+def test_46_g3_durum_bitleri_analog_referans_hatasi_degil() -> None:
+    """Cift-bit durum bitleri analog referans hatasiyla KARISTIRILAMAZ.
+
+    Saha kabul dokumaninda bu madde `otomatik dogrulanmistir` olarak
+    isaretli; bu test o iddianin dayanagidir.
+    """
+    for bayrak in (0x41, 0x81, 0xC1):
+        assert map_dnp3_quality(bayrak, _G3_DOUBLE_BIT) == "good", (
+            f"G3 {bayrak:#04x} kesici pozisyonudur, kalite hatasi DEGIL"
+        )
+    # Ayni bitler ANALOG'da gercekten kalite hatasidir.
+    assert map_dnp3_quality(0x41, _G30_ANALOG) == "invalid"
+    assert map_dnp3_quality(0x21, _G30_ANALOG) == "invalid"
+
+
+def test_47_ham_dnp3_flags_her_durumda_tasinir() -> None:
+    """`dnp3_flags` ham byte'i yayin bayragindan BAGIMSIZ tasinir.
+
+    Backend kapsam ayrimini (nokta mi cihaz mi) bu alanin VARLIGINDAN
+    turetiyor; pilot acildiginda alanin zaten akiyor olmasi gerekir.
+    """
+    import inspect
+
+    from dnp3_gateway.adapters.base import SignalReading
+
+    assert "dnp3_flags" in inspect.signature(SignalReading).parameters
+    from dnp3_gateway.adapters import dnp3_yadnp3_master as _mod
+
+    kaynak = Path(_mod.__file__).read_text(encoding="utf-8")
+    # Okuma yolu bayragi HER SignalReading'e koyuyor olmali.
+    assert "dnp3_flags=dnp3_flags" in kaynak
+
+
+def test_47b_pilot_ayarinin_kanonik_adi() -> None:
+    """Saha dokumaninin yazdigi env adi KODLA ayni olmali."""
+    from dnp3_gateway.config import Settings
+
+    assert "dnp3_publish_quality_flags" in Settings.model_fields
+    assert Settings.model_fields["dnp3_publish_quality_flags"].default is False, (
+        "pilot ayari varsayilan olarak KAPALI olmali"
+    )
+    saha = (Path(__file__).resolve().parents[1] / "docs/FIELD_ACCEPTANCE.md").read_text(encoding="utf-8")
+    assert "DNP3_PUBLISH_QUALITY_FLAGS" in saha

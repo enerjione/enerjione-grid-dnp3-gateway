@@ -147,6 +147,7 @@ def build_payload(
             "alive_no_data",
             "smart_idle",
             "smart_lost",
+            "listener_error",
         ):
             if anahtar in device_summary:
                 devices[anahtar] = device_summary[anahtar]

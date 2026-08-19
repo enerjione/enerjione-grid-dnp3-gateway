@@ -45,17 +45,17 @@ Her container:
 Image GitHub Container Registry'de yayinlanir:
 
 ```
-ghcr.io/enerjione/enerjione-grid-dnp3-gateway:0.4.6     # surume kilitli (URETIM)
+ghcr.io/enerjione/enerjione-grid-dnp3-gateway:1.13.0    # surume kilitli (URETIM)
 ghcr.io/enerjione/enerjione-grid-dnp3-gateway:main      # main'in son hali (DENEME)
 ```
 
-Production deploy'larda **semver tag** kullanin (`:0.4.6`). Etiket politikasi
+Production deploy'larda **semver tag** kullanin (`:1.13.0`). Etiket politikasi
 (`.github/workflows/release-image.yml`):
 
 | Trigger             | Etiketler                        | Kullanim          |
 |---------------------|----------------------------------|-------------------|
 | `main` push         | `:main`, `:sha-<short>`          | deneme / CI       |
-| `git tag v0.4.6`    | `:0.4.6`, `:0.4`, `:latest`      | **uretim**        |
+| `git tag v1.13.0`   | `:1.13.0`, `:1.13`, `:latest`    | **uretim**        |
 
 > **`:latest` artik main push'unda GUNCELLENMEZ.** Eskiden her main commit'i
 > `:latest`'i eziyordu ve test kapisi da yoktu; `docker compose pull` yapan
@@ -93,7 +93,7 @@ Operator/installer panelinde "Yeni Gateway Ekle":
      `https://api.enerjione.local/api/v1`).
    - `nats_url` (zorunlu): NATS JetStream URL (orn. `nats://nats.local:4222`).
    - `host_port` (varsayilan 8020): Bu instance icin host portu.
-   - `image` (varsayilan `ghcr.io/enerjione/enerjione-grid-dnp3-gateway:0.4.6`).
+   - `image` (varsayilan: `VERSION` dosyasindan EXACT semver turetilir).
    - `app_environment` (varsayilan `production`).
 3. Inen dosya `gw-<code>.yml`.
 4. Sunucuya kopyalanir + `docker compose -f gw-<code>.yml up -d`.
@@ -235,7 +235,7 @@ docker run --rm \
 
 ```bash
 # Tek tek (zero-downtime: cihaz polling 1sn, kabul edilebilir):
-sed -i 's/enerjionegrid-dnp3-gateway:0.4.5/enerjionegrid-dnp3-gateway:0.4.6/' gateways/gw-001.yml
+sed -i 's/enerjione-grid-dnp3-gateway:1.12.0/enerjione-grid-dnp3-gateway:1.13.0/' gateways/gw-001.yml
 docker compose -f gateways/gw-001.yml up -d
 ```
 

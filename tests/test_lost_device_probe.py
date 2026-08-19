@@ -150,8 +150,10 @@ class SahteMaster:
         self.shutdown_sayisi = 0
         self.last_command_at = 0.0
         # Bu dosyanin senaryolari KLASIK cihazlardir: varsayilan
-        # `continuous` politika, yani Smart dallarina hic girilmez.
+        # `continuous` politika, yani Smart/auto dallarina hic girilmez.
+        self.configured_session_policy = "continuous"
         self.session_policy = "continuous"
+        self.listen_port = None
 
     def request_integrity_poll(self) -> bool:
         self.poll_sayisi += 1
