@@ -344,6 +344,9 @@ def _device_health_snapshot(reader: Any, configured_count: int) -> dict[str, Any
         "recovering": 0,
         "lost": 0,
         "unknown": 0,
+        # Horstmann Smart politikasi: SAGLIKLI uyuyan cihazlar. `lost` ile
+        # karistirilmamalari sart — biri ariza, digeri tasarim davranisi.
+        "smart_idle": 0,
         "oldest_frame_age_sec": None,
     }
     if reader is None:
@@ -361,18 +364,38 @@ def _device_health_snapshot(reader: Any, configured_count: int) -> dict[str, Any
 
     now = time.time()
     oldest_age: float | None = None
+    # Politika bazli kirilim: operator "cihazlarin cogu uyuyor, 3'u gercekten
+    # kayip" ayrimini tek GET ile gorebilmeli.
+    politika_sayim = {"continuous": 0, "smart": 0}
+    smart_lost = 0
     for info in per_device.values():
         state_name = str(info.get("state") or "unknown")
-        if state_name in ("online", "recovering", "lost"):
+        if state_name in ("online", "recovering", "lost", "smart_idle"):
             summary[state_name] += 1
         else:
             summary["unknown"] += 1
+        politika = str(info.get("session_policy") or "continuous")
+        if politika in politika_sayim:
+            politika_sayim[politika] += 1
+        # Smart politikada olup GERCEKTEN kopuk olanlar (sessizlik penceresi
+        # asilmis) — saglikli `smart_idle` ile KARISTIRILMAMALI.
+        if politika == "smart" and state_name == "lost":
+            smart_lost += 1
         last_frame = info.get("last_frame_epoch")
         if last_frame:
             age = max(0.0, now - float(last_frame))
             oldest_age = age if oldest_age is None else max(oldest_age, age)
 
-    tracked = summary["online"] + summary["recovering"] + summary["lost"] + summary["unknown"]
+    summary["smart_lost"] = smart_lost
+    summary["session_policies"] = politika_sayim
+
+    tracked = (
+        summary["online"]
+        + summary["recovering"]
+        + summary["lost"]
+        + summary["smart_idle"]
+        + summary["unknown"]
+    )
     if summary["total"] < tracked:
         summary["total"] = tracked
     elif summary["total"] > tracked:

@@ -216,3 +216,70 @@ def test_fetch_config_ignores_missing_items() -> None:
     cfg = client.fetch_config()
     assert [d.code for d in cfg.devices] == ["OK"]
     assert [s.key for s in cfg.signals] == ["master.test"]
+
+
+# ==========================================================================
+# G-SMART-01 — session_policy / smart_max_silence_sec sozlesmesi
+# ==========================================================================
+
+
+def _session_payload(**device_extra: Any) -> dict[str, Any]:
+    return {
+        "config_version": "v9",
+        "devices": [{"code": "A", "ip_address": "192.168.0.1", "dnp3_address": 10, **device_extra}],
+        "signals": [],
+    }
+
+
+def _fetch(payload: dict[str, Any]):
+    session = _DummySession(_DummyResponse(200, payload))
+    client = BackendConfigClient(
+        base_url="http://api/api/v1",
+        identity=_dev_identity(),
+        session=session,  # type: ignore[arg-type]
+    )
+    return client.fetch_config()
+
+
+def test_session_policy_varsayilan_continuous() -> None:
+    """Backend alani GONDERMEZSE mevcut kurulumlarin davranisi DEGISMEZ."""
+    cfg = _fetch(_session_payload())
+    assert cfg.devices[0].session_policy == "continuous"
+    assert cfg.devices[0].smart_max_silence_sec is None
+
+
+def test_session_policy_smart_kabul_edilir() -> None:
+    cfg = _fetch(_session_payload(session_policy="smart", smart_max_silence_sec=7200))
+    assert cfg.devices[0].session_policy == "smart"
+    assert cfg.devices[0].smart_max_silence_sec == 7200
+
+
+def test_session_policy_buyuk_harf_ve_bosluk_normalize_edilir() -> None:
+    cfg = _fetch(_session_payload(session_policy="  SMART "))
+    assert cfg.devices[0].session_policy == "smart"
+
+
+def test_tanimsiz_session_policy_konfigurasyonu_dusurur() -> None:
+    """SESSIZCE VARSAYILANA DUSMEK YASAK.
+
+    `"smrt"` yazim hatasi sessizce "continuous"a duserse, Smart moda alinmasi
+    gereken bir cihaz periyodik taranmaya devam eder; modemi hicbir zaman
+    kapanmaz ve bunu kimse fark etmez. Konfigurasyonun basarisiz olmasi
+    GUVENLI taraftir: gateway son iyi config'iyle calismaya devam eder ve
+    /health hatayi acikca raporlar.
+    """
+    with pytest.raises(GatewayConfigError) as hata:
+        _fetch(_session_payload(session_policy="smrt"))
+    assert "session_policy" in str(hata.value)
+
+
+def test_gecersiz_smart_max_silence_konfigurasyonu_dusurmez() -> None:
+    """Bu alanin yanlis olmasi sessiz bir yanlis REJIM uretmez.
+
+    Yalnizca denetim eksik kalir (ve loglanir) — bu yuzden `session_policy`
+    ile ayni sertlikte davranilmaz.
+    """
+    for gecersiz in ("abc", -5, 10, 99 * 24 * 3600):
+        cfg = _fetch(_session_payload(session_policy="smart", smart_max_silence_sec=gecersiz))
+        assert cfg.devices[0].smart_max_silence_sec is None, gecersiz
+        assert cfg.devices[0].session_policy == "smart"

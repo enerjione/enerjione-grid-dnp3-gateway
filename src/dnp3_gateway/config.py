@@ -34,6 +34,15 @@ _PLACEHOLDER_TOKEN_PREFIXES: tuple[str, ...] = (
 )
 
 
+#: Smart sessizlik esiginin env yedegi icin kabul edilen aralik.
+#: `config_client._SMART_SILENCE_MIN/MAX_SEC` ile AYNI olmak ZORUNDA
+#: (tests/test_smart_session_contract.py parity testi kilitler): cihaz alani
+#: ile env yedegi farkli sinirlar kabul etseydi ayni deger bir yoldan gecip
+#: digerinden reddedilirdi.
+_SMART_SILENCE_ENV_MIN = 60
+_SMART_SILENCE_ENV_MAX = 30 * 24 * 3600
+
+
 def _is_placeholder_token(token: str) -> bool:
     """Token, bilinen bir placeholder prefix ile basliyor mu?
 
@@ -696,6 +705,28 @@ class Settings(BaseSettings):
         ),
     )
 
+    # ----- Horstmann Smart Mode oturum yasam dongusu ------------------------
+    # Politika CIHAZ BASINA ve ACIKCA yapilandirilir:
+    # `DeviceConfig.session_policy` = "continuous" (varsayilan) | "smart".
+    # Bu env yalnizca cihaz bazli deger GELMEDIGINDE kullanilan yedegi verir.
+    # Ayrintili anlatim: docs/HORSTMANN_SMART_MODE.md
+    dnp3_smart_max_silence_sec: int = Field(
+        default=0,
+        ge=0,
+        le=30 * 24 * 3600,
+        description=(
+            "session_policy=smart olan bir cihaz bu kadar saniye HIC gecerli DNP3 "
+            "kaniti gondermezse smart_idle -> lost gecisi yapilir ve normal "
+            "comm_lost mekanizmasi calisir. "
+            "KABUL EDILEN DEGERLER: 0 (denetim KAPALI, varsayilan) VEYA 60..2592000. "
+            "1..59 REDDEDILIR (boot'ta config hatasi): o araliktaki bir esik normal "
+            "bir Smart uykusunu bile kopuk ilan eder. "
+            "Bu ayar yalnizca cihaz bazli `smart_max_silence_sec` YOKKEN kullanilan "
+            "yedegi verir. Dogru deger cihazin Dial-In rapor programina baglidir; "
+            "gomulu bir varsayim YOKTUR."
+        ),
+    )
+
     dnp3_event_scan_interval_sec: int = Field(
         default=0,
         ge=0,
@@ -842,6 +873,28 @@ class Settings(BaseSettings):
     )
 
     # ----- Validators ---------------------------------------------------------
+    @field_validator("dnp3_smart_max_silence_sec")
+    @classmethod
+    def _validate_smart_max_silence(cls, v: int) -> int:
+        """0 (kapali) VEYA 60..2592000. 1..59 FAIL-CLOSED.
+
+        `ge=0` tek basina 1..59'u da kabul ederdi. Sozlesme cihaz alani icin
+        alt siniri 60 saniye yapiyor; env yedegi ayni sozlesmeye uymazsa
+        operator 30 sn yazar, kimse reddetmez ve NORMAL uyuyan her cihaz
+        kopuk ilan edilir. Boot'ta acik hata vermek, sahada sessizce yanlis
+        davranmaktan iyidir.
+        """
+        if v == 0:
+            return v
+        if _SMART_SILENCE_ENV_MIN <= v <= _SMART_SILENCE_ENV_MAX:
+            return v
+        raise ValueError(
+            f"DNP3_SMART_MAX_SILENCE_SEC={v} gecersiz. Kabul edilen: 0 (denetim kapali) "
+            f"veya {_SMART_SILENCE_ENV_MIN}..{_SMART_SILENCE_ENV_MAX} saniye. "
+            f"1..{_SMART_SILENCE_ENV_MIN - 1} araligi REDDEDILIR: bu kadar kisa bir esik "
+            "normal bir Smart uykusunu bile kopuk ilan eder."
+        )
+
     @field_validator("telemetry_publisher")
     @classmethod
     def _validate_telemetry_publisher(cls, v: str) -> str:

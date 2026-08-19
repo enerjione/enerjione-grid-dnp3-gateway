@@ -1,8 +1,8 @@
 # Backend Koordinasyonu Gereken Isler
 
-**Durum:** B2 ACIK; B1 tek env bayragina indi; B3 ve B4 kapandi
+**Durum:** B5 ACIK (yeni); B2 ACIK; B1 tek env bayragina indi; B3 ve B4 kapandi
 **Olusturulma:** 2026-07-31 (production hardening calismasi)
-**Son guncelleme:** 2026-08-02
+**Son guncelleme:** 2026-08-19
 **Neden ertelendi:** Bu maddeler gateway'i tek basina degistirerek cozulemez;
 backend'in `/gateways/{code}/config`, `/gateways/{code}/pending` ve
 `/telemetry/gateway/{code}` sozlesmelerini de degistirir. Gateway tarafindaki
@@ -286,6 +286,99 @@ Gateway tarafi 404/400'e toleransli yazilacak (eski backend'de sessizce atlar).
 
 ---
 
+## B5. Cihaz basina DNP3 oturum politikasi (Horstmann Smart Mode) — 🔴 BACKEND GEREKLI
+
+**Gateway durumu:** ✅ HAZIR (G-SMART-01, gateway 1.12.0). Alanlar okunuyor,
+dogrulaniyor ve uygulaniyor. Backend GONDERMEZSE davranis DEGISMEZ.
+
+### Neden gerekli
+
+Horstmann Smart Navigator 2.0 iki haberlesme rejiminde calisir:
+
+* **Boost** — hucresel modem surekli bagli; klasik, her zaman acik DNP3.
+* **Smart** — modem NORMALDE KAPALI. Cihaz raporunu gonderir ve DNP3 oturumu
+  **15 saniye** bosta kalinca modemi kapatir. Bu sure SABITTIR ve **her
+  TCP/DNP trafigi sayaci sifirlar**.
+
+Gateway her cihaza periyodik Class taramasi gonderdigi surece Smart moddaki
+bir cihaz modemini HICBIR ZAMAN kapatamaz. Ayrica beklenen kapanma
+`comm_lost` olarak yayinlanirsa saglikli bir saha arizali gorunur.
+
+Gateway bu rejimi cihazin DNP3 noktalarindan **CIKARMAZ** (otomatik
+`Operation Mode` tespiti bilincli olarak ayri bir istir); politikanin
+**ACIKCA yapilandirilmasi** gerekir.
+
+### Backend'in eklemesi gereken alanlar
+
+`GET /gateways/{code}/config` -> `devices[]` icinde, cihaz basina:
+
+```json
+{
+  "code": "SN2-001",
+  "ip_address": "10.20.5.11",
+  "ip_endpoint_type": "initiating",
+  "master_ip_port": 20100,
+
+  "session_policy": "smart",
+  "smart_max_silence_sec": 93600
+}
+```
+
+| Alan | Tip | Zorunlu | Varsayilan | Anlami |
+|---|---|---|---|---|
+| `session_policy` | string | hayir | `"continuous"` | `"continuous"` = bugunku davranis (periyodik Class 1/2/3 + Class 0 + acilis integrity). `"smart"` = hicbir tekrarlayan tarama YOK, acilis integrity YOK, beklenen kapanma `comm_lost` URETMEZ. |
+| `smart_max_silence_sec` | int \| null | hayir | `null` | `session_policy="smart"` iken: cihaz bu kadar saniye HIC gecerli DNP3 kaniti gondermezse `smart_idle -> lost` gecisi yapilir ve normal comm_lost calisir. `null`/eksik = **cihaz seviyesinde ezme yok** ("kapali" DEMEK DEGIL — bkz. cozum sirasi). Kabul araligi **60 .. 2592000** (30 gun). |
+
+**Sessizlik esiginin kanonik cozum sirasi**
+
+1. gecerli cihaz degeri (`smart_max_silence_sec`, 60..2592000)
+2. `DNP3_SMART_MAX_SILENCE_SEC` (`0` = kapali, `60..2592000` = gecerli)
+3. kapali
+
+Gecersiz bir cihaz degeri 1. adimi atlar ve ayni siradan devam eder.
+
+### Dogrulama kurallari (gateway tarafinda ZATEN uygulaniyor)
+
+* `session_policy` **tanimsiz bir deger** tasirsa gateway TUM config'i
+  reddeder (`GatewayConfigError`) ve son iyi config'iyle calismaya devam eder.
+  Sessizce varsayilana DUSMEZ — `"smrt"` yazim hatasi, Smart moda alinmasi
+  gereken bir cihazi sessizce periyodik taramada birakirdi ve bunu kimse fark
+  etmezdi.
+* `smart_max_silence_sec` gecersiz/aralik disi ise **yok sayilir** (config
+  dusmez), uyari loglanir ve denetim kapali kalir. Bu alanin yanlis olmasi
+  sessiz bir yanlis rejim uretmez — yalnizca denetim eksik kalir.
+
+### Onerilen frontend davranisi
+
+* Cihaz duzenleme ekraninda `session_policy` icin iki secenekli bir alan
+  ("Surekli baglanti" / "Smart Mode"), varsayilan **Surekli baglanti**.
+* `smart_max_silence_sec` yalnizca Smart secildiginde gorunur; bos
+  birakilabilir. Yardim metni: *"Cihazin Dial-In rapor programina gore
+  ayarlayin. Gunluk rapor veren bir cihaz icin 26 saat (93600 sn) makul bir
+  baslangictir."*
+* **Uyari metni:** Smart Mode YALNIZCA cihazin kendisi de Smart Mode'a
+  alinmissa secilmelidir. Cihaz Boost'ta iken gateway'de Smart secilirse
+  cihaz surekli bagli kalir ama gateway onu periyodik yoklamaz.
+
+### Deploy sirasi
+
+**SERBEST — kirilma riski YOK.** Gateway alanlari opsiyonel okuyor; backend
+gondermezse tum cihazlar `continuous` kalir (bugunku davranis). Backend once
+deploy edilirse de gateway eski surumu bu alanlari yok sayar.
+
+### Gateway'in geri bildirdigi durum
+
+`X-E1-Gateway-Health` basliginda:
+
+* `devices.smart_idle` — saglikli uyuyan cihaz sayisi (YENI anahtar).
+* `devices.states` — `smart_idle` **sorun sayilmaz** ve bu listeye GIRMEZ;
+  cihaz sessizlik penceresini asarsa durumu `lost` olur ve normal sekilde
+  raporlanir.
+
+Backend tanimadigi anahtarlari `raw_json`e yaziyor; **migration gerekmez.**
+
+---
+
 ## Ozet tablo
 
 | # | Konu | Gateway hazir mi | Deploy sirasi | Onceligi |
@@ -294,11 +387,17 @@ Gateway tarafi 404/400'e toleransli yazilacak (eski backend'de sessizce atlar).
 | B2 | Cihaz zaman damgasi | ⚙️ **gateway gonderiyor, backend yok sayiyor** | serbest (kirilma yok) | Yuksek — SOE/ariza analizi |
 | B3 | Per-device katalog | ✅ **GATEWAY TARAFI KAPANDI** | serbest | Dusuk — yalnizca esneklik kaldi |
 | B4 | Saglik heartbeat + filo uyarisi | ✅ **TAMAMLANDI** | — | ~~Yuksek — kor nokta~~ |
+| B5 | Cihaz basina oturum politikasi (Smart Mode) | ✅ **GATEWAY HAZIR** | serbest (kirilma yok) | Yuksek — Horstmann Smart Mode sahasi |
 
-**Gateway tarafinda kalan is YOK.** Dordunun de gateway yarisi bitti.
+**Gateway tarafinda kalan is YOK.** Besinin de gateway yarisi bitti.
 
-Kalan iki is BACKEND'de ve ikisi de **kirilma riski tasimiyor** — gateway
-gerekli veriyi zaten gonderiyor, backend hazir oldugunda anlam kazaniyor:
+Kalan uc is BACKEND'de ve ucu de **kirilma riski tasimiyor** — gateway
+gerekli veriyi zaten gonderiyor/okuyor, backend hazir oldugunda anlam
+kazaniyor:
+
+0. **B5** — `session_policy` + `smart_max_silence_sec` alanlarini cihaz
+   kaydina ekle. Bunlar OLMADAN Horstmann Smart Mode sahada
+   ETKINLESTIRILEMEZ (gateway tum cihazlari `continuous` kabul eder).
 
 1. **B2** — `device_event_at` + `timestamp_quality` alanlarini kabul et.
    SOE/ariza analizi icin en degerli kazanim.

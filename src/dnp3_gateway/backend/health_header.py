@@ -81,7 +81,13 @@ MAX_STATE_ENTRIES = 40
 
 #: Bu durumdaki cihazlar `states`e GIRMEZ — backend'in varsayilan davranisi
 #: onlar icin zaten dogru.
-_NORMAL_STATE = "online"
+#:
+#: `smart_idle` BILEREK bu kumededir: Horstmann Smart modda modemini kapatmak
+#: cihazin TASARIM davranisidir, ariza degil. Sorun olarak raporlansaydi
+#: saglikli uyuyan filo backend'de arizali gorunurdu — duzeltmeye calistigimiz
+#: hatanin ta kendisi. Cihaz izin verilen sessizlik penceresinde haber
+#: vermezse durumu zaten `lost`a doner ve BURADAN raporlanir.
+_NORMAL_STATES: frozenset[str] = frozenset({"online", "smart_idle"})
 
 
 def _problem_states(per_device: dict[str, dict[str, Any]]) -> tuple[dict[str, str], bool]:
@@ -94,7 +100,7 @@ def _problem_states(per_device: dict[str, dict[str, Any]]) -> tuple[dict[str, st
     for kod in sorted(per_device):
         bilgi = per_device.get(kod) or {}
         durum = str(bilgi.get("state") or "unknown").strip().lower()
-        if durum == _NORMAL_STATE:
+        if durum in _NORMAL_STATES:
             continue
         sorunlu[str(kod)] = durum
 
@@ -123,7 +129,25 @@ def build_payload(
         # sayim eskiden sahte comm_lost'a donusuyordu; artik ayri bir gozlem
         # ve merkezden gorulebilmesi gerekiyor. Yayindaki backend tanimadigi
         # anahtarlari `raw_json`e yaziyor — ek kolon/migration GEREKMEZ.
-        for anahtar in ("total", "online", "recovering", "lost", "unknown", "alive_no_data"):
+        # `smart_idle` : Smart politikadaki SAGLIKLI uyuyan cihaz sayisi.
+        # `smart_lost`  : Smart politikali ama GERCEKTEN kopuk cihaz sayisi
+        #                 (sessizlik penceresi asilmis). Ikisi ayri sayilir;
+        #                 karistirilirlarsa uyuyan filo arizali gorunur.
+        #
+        # `smart_lost` sayac olarak GIDER ama `states` haritasini DEGISTIRMEZ:
+        # o cihazlar zaten `lost` durumundadir ve oraya `lost` olarak girer.
+        # Yayindaki backend tanimadigi anahtarlari `raw_json`e yaziyor —
+        # migration GEREKMEZ, eski backend KIRILMAZ.
+        for anahtar in (
+            "total",
+            "online",
+            "recovering",
+            "lost",
+            "unknown",
+            "alive_no_data",
+            "smart_idle",
+            "smart_lost",
+        ):
             if anahtar in device_summary:
                 devices[anahtar] = device_summary[anahtar]
 

@@ -381,6 +381,9 @@ def test_baglanti_imzasi_ip_degisince_farklidir() -> None:
         _local_address = 1
         _resolve_tcp_port = staticmethod(Yadnp3TelemetryReader._resolve_tcp_port)
         _resolve_local_address = staticmethod(Yadnp3TelemetryReader._resolve_local_address)
+        # Oturum politikasi da imzanin parcasi (G-SMART-01): degisirse
+        # master'in yeniden kurulmasi GEREKIR.
+        _session_policy = staticmethod(Yadnp3TelemetryReader._session_policy)
 
     r = _R()
     eski = DeviceConfig(code="D1", name="d", ip_address="10.20.5.11", dnp3_address=4)

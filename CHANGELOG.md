@@ -2,7 +2,193 @@
 
 Semver'a gore tutulur. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [1.11.4] - 2026-08-18
+## [1.12.0] - 2026-08-19
+
+**G-SMART-01** — Horstmann Smart Navigator 2.0 **Smart Mode / Initiating
+Endpoint** oturum yasam dongusu. Politika **CIHAZ BASINA ve ACIKCA**
+yapilandirilir; varsayilan `continuous` oldugu icin **mevcut kurulumlarin
+davranisi DEGISMEZ**.
+
+**KOMUT DUZLEMI DEGISMEDI.** F1/F2/F3/F3C/F4/F5/F6/F7, DirectOperate, SBO,
+`/pending` semantigi, CROB parametreleri ve yetkilendirme AYNEN duruyor.
+Komut kuyruklama BU GOREVDE YOK: uyuyan cihaz `reachable=false` doner ve
+`operate_crob` mevcut fail-safe kapisindan `status="offline"` verir —
+**sahte basari URETILMEZ**, olmayan bir baglanti uzerinden komut denenmez.
+
+Ayrintili anlatim: [docs/HORSTMANN_SMART_MODE.md](docs/HORSTMANN_SMART_MODE.md)
+Backend sozlesmesi: [docs/BACKEND_TODO.md](docs/BACKEND_TODO.md) — **B5**
+
+### Fixed
+- **GATEWAY MODEMIN KAPANMASINI ENGELLIYORDU.** Smart Navigator 2.0'in
+  Initiating Endpoint hareketsizlik zaman asimi **15 saniye SABITTIR** ve
+  **her TCP/DNP trafigi bu sayaci sifirlar**. Gateway her cihaz icin
+  periyodik Class 1/2/3 + Class 0 taramasi kuruyor ve baglantida integrity
+  poll'u yapiyordu:
+
+      0s scan -> 5s scan -> 10s scan -> ...  sayac 15sn'ye ULASMAZ
+
+  Yani gateway, cihazin en temel enerji tasarrufu davranisini kiriyor ve
+  pilini tuketiyordu. `session_policy="smart"` olan cihazlarda artik
+  **hicbir tekrarlayan tarama kurulmaz** ve **acilis integrity poll'u
+  yapilmaz**.
+
+  **Olculdu** (gercek DNP3 loopback + arada bayt sayan seffaf TCP proxy):
+  baglantidan sonra 20 saniyede gateway -> cihaz yonunde **0 bayt**. Ayni
+  kosulda `continuous` politikada trafik DEVAM ediyor (kontrol testi).
+
+- **BEKLENEN KAPANMA `comm_lost` OLUYORDU.** `OnClose` kosulsuz `lost`
+  yaziyordu. Smart Mode'da BASARILI bir oturumun ardindan gelen TCP
+  kapanmasi cihazin TASARIM davranisidir. Artik bu durum yeni `smart_idle`
+  durumuna gecer; **cihaz seviyesinde comm_lost YAYINLANMAZ** ve son bilinen
+  degerler KORUNUR.
+
+### Added
+- **`DeviceConfig.session_policy`** (`"continuous"` VARSAYILAN | `"smart"`).
+  Rejim cihazin DNP3 noktalarindan CIKARILMAZ — Horstmann `Operation Mode`
+  (G1/15) noktasindan otomatik tespit BILINCLI olarak AYRI bir istir.
+
+  **Tanimsiz bir deger konfigurasyonu DUSURUR** (`GatewayConfigError`);
+  sessizce varsayilana DUSMEZ. Gerekce: `"smrt"` yazim hatasi sessizce
+  `continuous`a duserse, Smart moda alinmasi gereken bir cihaz periyodik
+  taranmaya devam eder, modemi hicbir zaman kapanmaz ve bunu kimse fark
+  etmez. Config'in reddedilmesi GUVENLI taraftir — gateway son iyi
+  config'iyle calisir ve /health hatayi acikca raporlar.
+
+- **`DeviceConfig.smart_max_silence_sec`** (opsiyonel) — `smart` cihaz bu
+  kadar saniye HIC gecerli DNP3 kaniti gondermezse `smart_idle -> lost` ve
+  normal comm_lost calisir. **Adapter'da gomulu bir "24/26 saat" YOKTUR:**
+  dogru deger cihazin Dial-In rapor programina baglidir ve yalnizca kurulumu
+  yapan bilir. Kurulum geneli yedek: `DNP3_SMART_MAX_SILENCE_SEC` (0 =
+  denetim kapali, varsayilan). Sure **monotonic** olculur — duvar saatiyle
+  olculse tek bir NTP siçramasi uyuyan tum filoyu `lost` yapardi.
+
+- **`smart_idle` durumu.** Mevcut `lost` / `recovering` / `online` makinesine
+  eklendi; ucunun de anlami DEGISMEDI. Gecisler:
+
+  | Gecis | Kosul |
+  |---|---|
+  | `* -> recovering` | TCP acildi |
+  | `recovering -> online` | Gecerli DNP3 kaniti geldi |
+  | `-> lost` | TCP kapandi + `continuous` |
+  | `online -> smart_idle` | TCP kapandi + `smart` + **oturumda KANIT VAR** |
+  | `-> lost` | TCP kapandi + `smart` + **KANIT YOK** |
+  | `smart_idle -> lost` | Sessizlik esigi asildi |
+
+- **"Gecerli DNP3 kaniti" tanimi** — olcum, gecerli IIN ya da BASARILI bir
+  DNP3 gorevi. **Salt TCP baglantisi YETMEZ:** 4G'de soket kurulup DNP3
+  katmani hic konusmadan da dusebilir; bunu "basarili oturum" sayip
+  `smart_idle`e gecmek GERCEK bir arizayi saglikli uyku gibi gosterirdi.
+  Kanitsiz oturumun kapanmasi `lost` uretir.
+
+- **Kalicilik.** Uyuyan cihazlar varken container yeniden baslarsa hepsi bir
+  sonraki rapora kadar `comm_lost` gorunurdu. Cihaz basina son oturum durumu
+  ve son gecerli temas ani
+  `<STATE_DIR>/session_state_<GW>.json` dosyasina yazilir (surumlu, atomik,
+  hiz sinirli, kapanista zorla flush). Bozuk/eski/eksik dosya **sessizce yok
+  sayilir** — sonuc, ozelligin hic olmadigi davranistir. Yeni veritabani ya
+  da bagimlilik YOK.
+
+- **Gozlemlenebilirlik.** `device_health()` artik `session_policy`,
+  `last_valid_contact_epoch`, `smart_idle_age_sec`, `smart_max_silence_sec`,
+  `smart_silence_deadline_epoch`, `smart_silence_remaining_sec` tasiyor
+  (mevcut `state`, `connected`, `reachable`, `last_frame_epoch`,
+  `evidence_age_sec` alanlarinin yaninda). `/health` ozetine `smart_idle`,
+  `smart_lost` ve `session_policies` sayimlari eklendi. Sayaclar:
+  `smart_idle_wakeup_total`, `smart_silence_lost_total`.
+
+  Loglar **KENAR-TETIKLI**: `smart_idle_wakeup`,
+  `smart_idle_silence_exceeded`, `smart_idle_restored`. Her poll cycle'inda
+  tekrarlanmaz.
+
+### Changed
+- **`connection_fingerprint` artik `session_policy` iceriyor.** Imzada
+  olmasaydi, backend'de politikayi degistiren operator HICBIR etki gormezdi;
+  cihaz eski rejimde calismaya devam eder ve bu yalnizca sahada fark
+  edilirdi. Politika degisince **yalnizca o cihazin** master'i yeniden
+  kurulur.
+- **`AssignClassDuringStartup`** artik politikaya bagli: `continuous` -> True
+  (bugunku davranis), `smart` -> False. Smart Navigator'da ad-hoc Class 0
+  yoklamasi zaten YALNIZCA Boost Mode'da mumkundur.
+- `smart` politikada yoklama (`lost probe`), veri-sessizligi integrity
+  poll'u ve zorla relink **GONDERILMEZ** — hepsi hareketsizlik sayacini
+  sifirlardi. `continuous` cihazlarda bu mekanizmalar AYNEN calisir.
+- `health_header`: `smart_idle` **sorun durumu sayilmaz** (`online` ile ayni
+  kefede) — aksi halde saglikli uyuyan filo backend'de arizali gorunurdu.
+  Cihaz sessizlik penceresini asarsa durumu zaten `lost`a doner ve oradan
+  raporlanir.
+- `Yadnp3TelemetryReader._init_runtime_state()` (**yeni**): native olmayan
+  calisma-zamani alanlari tek kaynaktan kurulur. Bazi testler `__new__` ile
+  ornek uretip bu alanlari ELLE set ediyordu; o liste her yeni alanda
+  sessizce eskiyor ve testler gercek nesneden AYRISIYORDU.
+
+### Backward compatibility
+Davranis su durumlarda **degismedi**: mock adapter, `continuous` politikali
+TUM cihazlar (varsayilan), `listening` ve `initiating` uclu geleneksel
+surekli bagli DNP3 cihazlari, ve `session_policy` gondermeyen backend'ler.
+`smart_idle` YALNIZCA politikaya baglidir; uc tipinden (`initiating`)
+CIKARILMAZ.
+
+### Smart Session sozlesmesi (Grid B5 girdisi)
+
+Grid backend bu degerleri **birebir** uygulayacak; tahmin YOK.
+Makine-okur kopya: `docker/gateway-deployment-contract.json` -> `smart_session`.
+Testlerle kilitli: `tests/test_smart_session_contract.py` (GS01..GS14).
+
+**Cihaz config alanlari**
+
+| Alan | Tip | Varsayilan | Kural |
+|---|---|---|---|
+| `session_policy` | string | `"continuous"` | `"continuous"` \| `"smart"`. Tanimsiz deger -> **TUM config reddedilir** (`GatewayConfigError`); sessizce varsayilana DUSMEZ. |
+| `smart_max_silence_sec` | int \| null | `null` | `null`/eksik = **cihaz seviyesinde ezme yok** ("kapali" DEMEK DEGIL). Kabul araligi **60 .. 2592000** (30 gun). Aralik disi (0 ve negatifler dahil) ya da bozuk tip -> **cihaz ezmesi yok sayilir + WARNING**, env yedegine dusulur, config DUSMEZ. |
+
+**Sessizlik esiginin KANONIK cozum sirasi**
+
+1. **gecerli cihaz degeri** (`smart_max_silence_sec`, 60..2592000)
+2. **`DNP3_SMART_MAX_SILENCE_SEC`** (`0` = kapali, `60..2592000` = gecerli)
+3. **kapali**
+
+Gecersiz bir cihaz degeri 1. adimi atlar ve ayni siradan devam eder.
+Env yedegi **fail-closed** dogrulanir: `1..59` ve `2592000` ustu **boot'ta
+config hatasi** uretir — o araliktaki bir esik normal bir Smart uykusunu bile
+kopuk ilan ederdi.
+
+**Uc tipi kisiti:** `session_policy="smart"` YALNIZCA
+`ip_endpoint_type="initiating"` ile gecerlidir (baglantiyi cihaz baslatir).
+`smart` + `listening` kombinasyonunda cihaz **guvenli tarafa `continuous`**
+calistirilir ve ERROR loglanir — config TUMDEN reddedilmez, cunku tek bir
+yanlis cihaz yuzunden tum filonun config yenilemesini bloke etmek daha kotu
+bir uretim sonucudur.
+
+**Gateway varsayilani:** adapter'da GOMULU bir sessizlik suresi YOKTUR;
+`DNP3_SMART_MAX_SILENCE_SEC` varsayilani `0` (kapali).
+
+**Health sozlesmesi**
+
+| Alan | Deger |
+|---|---|
+| `smart_idle` health state | `"smart_idle"` |
+| `devices.lost` icine dahil mi | **HAYIR** |
+| `devices.states` haritasina girer mi | **HAYIR** (saglikli durum) |
+| Yeni sayaclar | `devices.smart_idle`, `devices.smart_lost` (ikisi de saglik basligina TASINIR) |
+| Mevcut sayaclar | `total`/`online`/`recovering`/`lost`/`unknown` **DEGISMEDI** |
+
+> `smart_idle`in `lost` sayilmasi bir URETIM HATASI uretirdi: Grid'in
+> staleness watchdog'u `devices_lost > 0 && devices_online == 0` kosulunda
+> gateway'in TUM cihazlarini offline yapabiliyor. Uyuyan bir Smart filosu tam
+> da sagliklI oldugu anda tum sahayi offline gosterirdi. `test_gs10_*` bunu
+> kilitler.
+
+**Bilinmeyen cihaz alanlari:** yok sayilir (`ignored`). 1.11.4 parser'i yeni
+alanlari gordugunde parse etmeyi surdurur ve `continuous` davranisini korur —
+`tests/test_smart_session_contract.py::test_gs12_*` bunu kilitler.
+
+### Bu surumde BILEREK YAPILMAYANLAR
+- **Otomatik mod tespiti** (`Operation Mode` G1/15 -> politika). Ayri gorev;
+  gerekceleri ve dikkat edilecekler dokumante edildi.
+- **Komut kuyruklama** (uyuyan cihazin komutunu bir sonraki uyanmada
+  calistirma). Ayri gorev.
+
+## [1.11.4] - 2026-08-18## [1.11.4] - 2026-08-18
 
 Gateway uretim kapanis surumu. **Tek gercek kod degisikligi ClockGuard
 soguk-acilis fail-safe'i**; geri kalani stale dokumantasyon ve deployment

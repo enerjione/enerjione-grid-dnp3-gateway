@@ -41,7 +41,18 @@ from tests.conftest import make_device, make_signal
 
 
 class SahteCache:
-    """`_DeviceCache` yerine gecen, durumu testin kontrol ettigi taklit."""
+    """`_DeviceCache` yerine gecen, durumu testin kontrol ettigi taklit.
+
+    YALNIZCA bu dosyanin senaryosunu ilgilendiren yuzey (durum makinesi,
+    baglanti, bayatlik) burada EZILIR; geri kalan her sey gercek
+    `_DeviceCache`e DELEGE EDILIR (`__getattr__`). Boylece taklit, gercek
+    sinif buyudukce sessizce ondan ayrismaz — elle tutulan bir metot listesi
+    tam da boyle eskiyor ve testi gercekten test edilen seyden koparaiyordu.
+
+    Delege edilen ornek varsayilanlarla gelir (`continuous` politika, idle
+    yok), yani bu dosyadaki senaryolar Smart dallarina HIC girmez — kasitli:
+    burada olculen sey klasik, surekli bagli cihaz davranisidir.
+    """
 
     def __init__(
         self,
@@ -51,6 +62,7 @@ class SahteCache:
         stale: bool,
         kanit_taze: bool | None = None,
     ) -> None:
+        self._gercek = mod._DeviceCache()
         self._state = state
         self._connected = connected
         self._stale = stale
@@ -64,6 +76,11 @@ class SahteCache:
         self._kanit_override = kanit_taze
         self.link_yasi = 9999.0
         self.integrity_istekleri = 0
+
+    def __getattr__(self, ad: str) -> Any:
+        # Yalnizca YUKARIDA tanimlanmayanlar buraya duser (Python normal
+        # oznitelik aramasi basarisiz olunca cagirir).
+        return getattr(self._gercek, ad)
 
     # --- adapter'in kullandigi yuzey ---
     def is_connected(self) -> bool:
@@ -132,6 +149,9 @@ class SahteMaster:
         self.poll_sayisi = 0
         self.shutdown_sayisi = 0
         self.last_command_at = 0.0
+        # Bu dosyanin senaryolari KLASIK cihazlardir: varsayilan
+        # `continuous` politika, yani Smart dallarina hic girilmez.
+        self.session_policy = "continuous"
 
     def request_integrity_poll(self) -> bool:
         self.poll_sayisi += 1
@@ -146,25 +166,17 @@ class SahteMaster:
 def okuyucu(monkeypatch: pytest.MonkeyPatch):
     """Gercek native master kurmadan `Yadnp3TelemetryReader` ornegi."""
     r = mod.Yadnp3TelemetryReader.__new__(mod.Yadnp3TelemetryReader)
-    # __init__'i atliyoruz (native manager kurar); testin dokundugu alanlari
-    # elle hazirliyoruz.
-    import threading
-
-    r._lock = threading.RLock()
-    r._masters = {}
+    # __init__'i atliyoruz (native manager kurar); calisma-zamani alanlarini
+    # gercek nesnenin kullandigi TEK kaynaktan hazirliyoruz. Elle liste
+    # tutulsaydi yeni bir alan eklendiginde test sessizce gercek nesneden
+    # ayrisirdi.
+    r._init_runtime_state()
     r._scan_interval_sec = 5
     r._baseline_interval_sec = 30
     r._local_address = 1
     r._default_dnp3_tcp_port = 20000
     r._time_sync = "lan"
     r._manager = None
-    r._lost_probe_lock = threading.Lock()
-    r._lost_probe = {}
-    r._lost_probe_total = 0
-    r._forced_relink_total = 0
-    r._veri_sessizligi = {}
-    r._veri_sessizligi_poll_total = 0
-    r._g110_uyarilan = set()
     return r
 
 

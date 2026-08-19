@@ -173,7 +173,8 @@ olanin seviyesidir.
 
 ```powershell
 (Invoke-RestMethod http://127.0.0.1:8020/health).devices
-# total / online / recovering / lost / unknown / oldest_frame_age_sec
+# total / online / recovering / lost / smart_idle / smart_lost / unknown
+# + session_policies / oldest_frame_age_sec
 ```
 
 | Durum | Anlami |
@@ -181,7 +182,14 @@ olanin seviyesidir.
 | `online` | DNP3 frame'leri taze geliyor. |
 | `recovering` | Link acildi ama henuz frame gelmedi. 15sn icinde `online` olmali; olmazsa `lost`. |
 | `lost` | Haberlesme yok. SCADA `comm_lost` goruyor. |
+| `smart_idle` | **SAGLIKLI.** `session_policy=smart` olan cihaz basarili bir oturumun ardindan modemini kapatti. Ariza DEGILDIR; comm_lost URETILMEZ. |
 | `unknown` | Config'te tanimli ama adapter henuz master acmamis (ilk baglanti) **veya** sinyal profili eslesmedi. |
+
+> **`smart_idle` bir alarm degildir.** Horstmann Smart Mode'da modemin kapali
+> olmasi cihazin tasarim davranisidir. Cihaz izin verilen sessizlik
+> penceresini asarsa durumu `lost` olur ve normal comm_lost akisi calisir
+> (`smart_lost` sayaci bunlari ayrica gosterir).
+> Tam anlatim: [HORSTMANN_SMART_MODE.md](./HORSTMANN_SMART_MODE.md)
 
 > `/health` cihaz KODU ve IP'si icermez (auth-suz endpoint, recon malzemesi
 > vermiyoruz). Cihaz bazinda detay icin auth'lu `/metrics` kullanin.
@@ -346,6 +354,26 @@ araligi kisaltabilirsiniz; her cihaz basina saatte `3600/aralik` istek eder.
 `devices_probing` cihazi sayiyorsa gateway aktif olarak deniyor demektir.
 Sunucudan `nc -zv <cihaz-ip> 20000` ile hattı dogrulayin; kapaliysa saha
 tarafinda modem/anten/besleme kontrolu gerekir.
+
+### Smart Mode cihazi `smart_idle`de takildi / hic uyanmiyor
+
+`session_policy=smart` olan bir cihaz beklenen sekilde uyur; sorun ancak
+**hic geri gelmiyorsa** vardir.
+
+```powershell
+# Cihaz bazinda detay (auth'lu)
+(Invoke-RestMethod http://127.0.0.1:8020/metrics -Headers $h).devices
+```
+
+1. `smart_silence_remaining_sec` azaliyor mu? Sifirlanirsa cihaz `lost` olur
+   ve comm_lost yayinlanir — yani sessiz kalmaz.
+2. `smart_max_silence_sec` `null` ise denetim KAPALIDIR: cihaz suresiz
+   `smart_idle` kalabilir. Backend cihaz kaydinda deger verin ya da
+   `DNP3_SMART_MAX_SILENCE_SEC` yedegini ayarlayin.
+3. Log'da `smart_idle_wakeup` satirlari var mi? Varsa cihaz duzenli
+   uyaniyor demektir; sorun yok.
+4. Cihaz `session_policy=smart` olmamali AMA oyleyse: `/health` ->
+   `session_policy` alanini kontrol edin, backend'de `continuous` yapin.
 
 ### "Cihaz kopuk gorunuyor ama aslinda sadece degeri degismiyor" (1.7.0'dan once)
 
