@@ -232,7 +232,9 @@
       "cancelled_total",
       "completed_total"
     ],
-    "diagnostics_counters_semantics": "dropped_total = kuyruk DOYGUNLUGU nedeniyle kabul edilmeyen is. cancelled_total = KAPANISTA iptal edilen (baslamamis) is. completed_total = fiilen CALISTIRILAN is. Uc sayac AYRI tutulur: doygunluk ile kapanis farkli seyler soyler ve karistirilirlarsa operator yanlis yere bakar."
+    "diagnostics_counters_semantics": "dropped_total = kuyruk DOYGUNLUGU nedeniyle kabul edilmeyen is. cancelled_total = KAPANISTA iptal edilen (baslamamis) is. completed_total = fiilen CALISTIRILAN is. Uc sayac AYRI tutulur: doygunluk ile kapanis farkli seyler soyler ve karistirilirlarsa operator yanlis yere bakar.",
+    "diagnostics_shutdown_failure_behavior": "fail_closed_abort_teardown",
+    "diagnostics_shutdown_failure_semantics": "Tanilama iscileri sure icinde cikmazsa (shutdown() False doner ya da kendisi patlarsa) master/kanal yikimina DEVAM EDILMEZ: ERROR loglanir ve Yadnp3ShutdownError firlatilir. Loglayip devam etmek, ihlal edilen degismezi bir log satirina indirger ve use-after-free yarisini fiilen KABUL ederdi. Yikimi yarida birakmanin maliyeti daha dusuktur: proses zaten kapaniyor ve soketleri isletim sistemi kapatir. Oturum durumu (session store) bu kapidan ONCE diske yazilir, boylece yarida kalan bir kapanis restart'ta sahte comm_lost firtinasi uretmez. Yadnp3ShutdownError, Yadnp3AdapterError'den turer (mevcut genis except bloklari kirilmaz) ve main kapanis yolunda AYRI yakalanip ERROR loglanir - genel except onu DEBUG'a gomerdi."
   },
   "initiating_endpoint": {
     "why": "ip_endpoint_type=initiating cihazlarda baglantiyi CIHAZ baslatir. Gateway container ICINDE cihazin master_ip_port degerini dinler; bridge ag modunda o port host'a acilmazsa cihaz baglanamaz.",

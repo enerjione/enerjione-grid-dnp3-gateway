@@ -191,6 +191,25 @@ Mimari kabul edildi; asagidaki maddeler merge oncesi kapatildi.
   (kuyruk doygunlugu) **ayri** tutulur — karistirilirlarsa operator yanlis
   yere bakar.
 
+- **Kapanis artik FAIL-CLOSED.** `shutdown()` `False` donuyordu ama `close()`
+  yalnizca ERROR loglayip **master/kanal yikimina devam ediyordu** — yani
+  ihlal edilen degismezi bir log satirina indirgeyip use-after-free yarisini
+  fiilen KABUL ediyordu.
+
+  Artik yikim **iptal edilir** ve `Yadnp3ShutdownError` firlatilir. Yarida
+  birakmanin maliyeti daha dusuktur: proses zaten kapaniyor ve soketleri
+  isletim sistemi kapatir. `shutdown()` kendisi patlarsa da fail-closed
+  davranilir — kapanisin basarili oldugu VARSAYILAMAZ.
+
+  Oturum durumu (`session_store.flush`) bu kapidan **once** diske yazilir;
+  boylece yarida kalan bir kapanis restart'ta tam olarak onlemeye
+  calistigimiz comm_lost firtinasini uretmez.
+
+  `Yadnp3ShutdownError`, `Yadnp3AdapterError`den turer (mevcut genis
+  `except` bloklari kirilmaz). `main` kapanis yolunda **ayri** yakalanip
+  ERROR loglanir: oradaki genel `except ... logger.debug` onu DEBUG'a
+  gomer ve kosul fiilen sessizce kaybolurdu.
+
 - **Saha kabulu trafik beklentisi duzeltildi.** `gateway -> cihaz 0 bayt`
   olcutu `listening` icin **YANLISTI** ve saglikli bir kurulumu FAIL
   gosterirdi: orada baglantiyi gateway acar ve cihaz uyurken `ChannelRetry`

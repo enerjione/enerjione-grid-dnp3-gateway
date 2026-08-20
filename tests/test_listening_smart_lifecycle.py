@@ -1321,3 +1321,142 @@ class _SahteManager:
 
     def Shutdown(self) -> None:  # noqa: N802 — kutuphane imzasi
         self.shutdown_sayisi += 1
+
+
+# ==========================================================================
+# L36 — FAIL-CLOSED: isciler cikmadiysa master/kanal YIKILMAZ
+# ==========================================================================
+
+
+class _CikmayanYurutucu:
+    """`shutdown()` HER ZAMAN False doner, isciler hayatta kalir.
+
+    Gercek `DiagnosticExecutor`in patolojik halini taklit eder: bir is
+    (orn. asilmis bir `ping` alt sureci) zaman asimi icinde bitmemistir.
+    """
+
+    def __init__(self, alive: int = 2) -> None:
+        self._alive = alive
+        self.shutdown_cagrisi = 0
+
+    def shutdown(self, *, timeout: float = 10.0) -> bool:
+        self.shutdown_cagrisi += 1
+        return False
+
+    def alive_workers(self) -> int:
+        return self._alive
+
+    def is_shutdown(self) -> bool:
+        return True
+
+    def submit(self, key: str, fn: Any) -> bool:  # pragma: no cover
+        return False
+
+    def stats(self) -> dict[str, int]:  # pragma: no cover
+        return {"in_flight": self._alive, "queued": 0}
+
+
+class _PatlayanYurutucu(_CikmayanYurutucu):
+    """`shutdown()` ISTISNA firlatir.
+
+    Kapanisin BASARILI oldugu VARSAYILAMAZ — istisna da fail-closed
+    sayilmali, aksi halde "patladi ama devam ettik" sessiz bir yarisa doner.
+    """
+
+    def shutdown(self, *, timeout: float = 10.0) -> bool:
+        self.shutdown_cagrisi += 1
+        raise RuntimeError("yurutucu kapanisi patladi")
+
+
+@pytest.mark.parametrize("yurutucu_tipi", [_CikmayanYurutucu, _PatlayanYurutucu])
+def test_l36_isciler_cikmadiysa_master_yikimi_iptal_edilir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, yurutucu_tipi: type
+) -> None:
+    """DEGISMEZ: yasayan tanilama iscisi varken master/kanal YIKILMAZ.
+
+    Onceki hal yalnizca ERROR loglayip yikima DEVAM EDIYORDU — yani ihlal
+    edilen degismezi bir log satirina indirgeyip use-after-free yarisini
+    fiilen KABUL ediyordu. Yikimi yarida birakmanin maliyeti daha dusuktur:
+    proses zaten kapaniyor ve soketleri isletim sistemi kapatir.
+    """
+    r = _reader(tmp_path, diagnostics=False)
+    s = ListeningSaha(r)
+    monkeypatch.setattr(r, "_ensure_master", lambda d, sig=None: s._ensure(d))
+
+    d = s.cihaz("FC-1", session_policy="smart", smart_max_silence_sec=86400)
+    mm = s.master("FC-1")
+    mgr = _SahteManager()
+    r._manager = mgr
+    yur = yurutucu_tipi()
+    r._tanilama_yurutucu = yur
+
+    # Oturum durumu kalicilastirmasi kapanistan ONCE olmali: yarida kalan
+    # bir kapanis bile restart'ta sahte comm_lost firtinasi uretmemeli.
+    yazim = {"n": 0}
+    gercek_flush = r._session_store.flush
+    monkeypatch.setattr(
+        r._session_store,
+        "flush",
+        lambda **kw: (yazim.__setitem__("n", yazim["n"] + 1), gercek_flush(**kw))[1],
+    )
+
+    with pytest.raises(mod.Yadnp3ShutdownError) as hata:
+        r.close()
+
+    # Hata ISCI SAYISINI tasimali — operator neye baktigini bilmeli.
+    assert "alive=2" in str(hata.value)
+
+    assert yur.shutdown_cagrisi == 1
+    assert mm.shutdown_sayisi == 0, "yasayan iscilere RAGMEN mm.shutdown() cagrildi"
+    assert mgr.shutdown_sayisi == 0, "yasayan iscilere RAGMEN manager.Shutdown() cagrildi"
+    # Master kaydi da DURUYOR: yikim hic baslamadi.
+    assert "FC-1" in r._masters
+    assert yazim["n"] == 1, "oturum durumu diske yazilmadi"
+    assert d.code == "FC-1"
+
+
+def test_l36b_fail_closed_error_loglar_ve_sessizce_gecmez(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Kosul SESSIZCE SIZDIRILMAZ: hem ERROR log hem istisna."""
+    r = _reader(tmp_path, diagnostics=False)
+    s = ListeningSaha(r)
+    monkeypatch.setattr(r, "_ensure_master", lambda d, sig=None: s._ensure(d))
+    s.cihaz("FC-2", session_policy="smart")
+    r._manager = _SahteManager()
+    r._tanilama_yurutucu = _CikmayanYurutucu(alive=3)
+
+    with caplog.at_level("ERROR"), pytest.raises(mod.Yadnp3ShutdownError):
+        r.close()
+
+    kayit = [x for x in caplog.records if "diagnostic_workers_still_alive" in x.getMessage()]
+    assert kayit, "fail-closed ERROR loglanmadi"
+    assert "IPTAL EDILDI" in kayit[0].getMessage()
+
+
+def test_l36c_hata_tipi_mevcut_except_bloklarini_kirmaz() -> None:
+    """`Yadnp3AdapterError`den turer: genis `except` bloklari kirilmaz,
+    ama cagiran taraf isterse bu kosulu AYIRT EDEBILIR."""
+    assert issubclass(mod.Yadnp3ShutdownError, mod.Yadnp3AdapterError)
+    assert issubclass(mod.Yadnp3ShutdownError, RuntimeError)
+
+
+def test_l36d_main_kapanis_yolu_bu_kosulu_error_ile_yuzeye_cikarir() -> None:
+    """Cagri yeri `reader.close()`u genis `except ... logger.debug` ile
+    sariyordu; bu kosul oraya dusseydi DEBUG'a gomulur ve fiilen sessizce
+    kaybolurdu. `main` artik onu AYRI yakalayip ERROR logluyor.
+    """
+    import inspect
+
+    from dnp3_gateway import main as main_mod
+
+    kaynak = inspect.getsource(main_mod)
+    # GERCEK kapanis blogu — dosyada baska yerde yorum icinde de
+    # "reader.close()" geciyor ve ona capalanmak testi korlestirirdi.
+    i = kaynak.index("# 2) Reader:")
+    pencere = kaynak[i : i + 900]
+    assert "reader.close()" in pencere, "kapanis blogu bulunamadi"
+    assert "except Yadnp3ShutdownError" in pencere, "fail-closed kosulu ayri yakalanmiyor"
+    assert "reader_close_aborted" in pencere
+    # DEBUG'a dusen genel dal HALA var olmali (diger hatalar icin).
+    assert "reader_close_error" in pencere

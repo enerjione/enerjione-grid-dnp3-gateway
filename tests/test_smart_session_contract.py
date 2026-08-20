@@ -679,6 +679,10 @@ def test_deployment_contract_1_14_0_alanlari() -> None:
     # Bu bir siralama tercihi degil, DOGRULUK SARTIDIR.
     assert smart["diagnostics_shutdown_before_master_teardown"] is True
     assert smart["diagnostics_shutdown_semantics"].startswith("best_effort_cancel_then_join")
+    # Isciler cikmazsa yikim DEVAM ETMEZ. "Logla ve devam et", ihlal edilen
+    # degismezi bir log satirina indirger ve use-after-free yarisini KABUL
+    # ederdi.
+    assert smart["diagnostics_shutdown_failure_behavior"] == "fail_closed_abort_teardown"
     assert smart["diagnostics_counters"] == [
         "dropped_total",
         "cancelled_total",

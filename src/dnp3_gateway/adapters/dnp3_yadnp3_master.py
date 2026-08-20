@@ -628,6 +628,18 @@ class Yadnp3AdapterError(RuntimeError):
     """yadnp3 adapter'inda olusan hata."""
 
 
+class Yadnp3ShutdownError(Yadnp3AdapterError):
+    """Kapanis GUVENLI sekilde tamamlanamadi; yikim BILEREK YARIDA BIRAKILDI.
+
+    Tek kullanim yeri: tanilama iscileri sure icinde cikmadi. O durumda
+    master/kanal yikimina DEVAM EDILMEZ (fail-closed), cunku kuyruktaki
+    kapanmalar `mm.ip_probe`, `mm.sonda_son_wall` ve `mm.kanal_durumu()`
+    uzerinden yikilmakta olan master nesnelerine dokunur.
+
+    `Yadnp3AdapterError`den TURETILIR: mevcut genis `except` bloklari
+    kirilmaz, ama cagiran taraf isterse bu kosulu AYIRT EDEBILIR."""
+
+
 class _DeviceCache:
     """Cihaz basina son-okunan degerler. ISOEHandler yazar, read_device okur.
 
@@ -4674,6 +4686,19 @@ class Yadnp3TelemetryReader(TelemetryReader):
         return ok, total
 
     def close(self) -> None:
+        # KAPANISTA ZORLA YAZ: hiz siniri yuzunden son birkac saniyenin uyku
+        # durumu diske gitmemis olabilir. Tam da bu bilgi restart sonrasi
+        # sahte comm_lost firtinasini onleyen sey.
+        #
+        # EN BASTA YAPILIR ve master'lara DOKUNMAZ: asagidaki tanilama kapisi
+        # yikimi iptal etse bile uyku durumu diske YAZILMIS olur. Aksi halde
+        # yarida kalan bir kapanis, restart'ta tam olarak onlemeye calistigimiz
+        # comm_lost firtinasini uretirdi.
+        try:
+            self._session_store.flush(force=True)
+        except Exception:  # noqa: BLE001
+            logger.debug("session_store_flush_error", exc_info=True)
+
         # TANILAMA HAVUZU MASTER'LARDAN ONCE VE TAMAMEN KAPANIR.
         #
         # Bu bir SIRALAMA TERCIHI DEGIL, DOGRULUK SARTIDIR: kuyruktaki
@@ -4681,29 +4706,31 @@ class Yadnp3TelemetryReader(TelemetryReader):
         # uzerinden MASTER nesnelerine dokunur. Isciler hala calisirken
         # master/kanal yikilirsa bu erisimler yikilmis nesnelere gider.
         #
-        # `shutdown()` bekleyen isleri IPTAL eder (akitmaz) ve TUM isci
-        # thread'leri cikana kadar bekler. `False` donerse SESSIZ GECILMEZ:
-        # bu, yikimin hala yasayan thread'lerle yarisacagi anlamina gelir ve
-        # sonraki bir crash'in tek ipucu bu satir olur.
+        # FAIL-CLOSED: `shutdown()` False donerse (ya da kendisi patlarsa)
+        # yikima DEVAM EDILMEZ. Loglayip devam etmek, ihlal edilen degismezi
+        # bir log satirina indirger ve use-after-free yarisini fiilen KABUL
+        # ederdi. Yikimi yarida birakmanin maliyeti daha dusuktur: proses
+        # zaten kapaniyor ve isletim sistemi soketleri kapatir.
         if self._tanilama_yurutucu is not None:
             try:
-                if not self._tanilama_yurutucu.shutdown():
-                    logger.error(
-                        "diagnostic_workers_still_alive count=%d — master yikimina "
-                        "RAGMEN devam ediliyor; tanilama thread'leri yikilmis "
-                        "nesnelere dokunabilir",
-                        self._tanilama_yurutucu.alive_workers(),
-                    )
+                temiz = self._tanilama_yurutucu.shutdown()
             except Exception:  # noqa: BLE001
                 logger.debug("diagnostic_executor_shutdown_error", exc_info=True)
+                # Kapanisin BASARILI oldugunu VARSAYAMAYIZ -> fail-closed.
+                temiz = False
+            if not temiz:
+                yasayan = self._tanilama_yurutucu.alive_workers()
+                logger.error(
+                    "diagnostic_workers_still_alive count=%d — master/kanal yikimi "
+                    "IPTAL EDILDI (fail-closed). Yasayan tanilama thread'leri "
+                    "yikilmis nesnelere dokunabilirdi; soketleri isletim sistemi "
+                    "kapatacak.",
+                    yasayan,
+                )
+                raise Yadnp3ShutdownError(
+                    f"tanilama iscileri cikmadi (alive={yasayan}); master/kanal yikimi guvenli degil"
+                )
 
-        # KAPANISTA ZORLA YAZ: hiz siniri yuzunden son birkac saniyenin uyku
-        # durumu diske gitmemis olabilir. Tam da bu bilgi restart sonrasi
-        # sahte comm_lost firtinasini onleyen sey.
-        try:
-            self._session_store.flush(force=True)
-        except Exception:  # noqa: BLE001
-            logger.debug("session_store_flush_error", exc_info=True)
         with self._lock:
             for mm in list(self._masters.values()):
                 try:
