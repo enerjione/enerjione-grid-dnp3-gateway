@@ -8,7 +8,7 @@
 #   {{BACKEND_API_URL}} — backend public URL (orn. https://api.enerjione.local/api/v1)
 #   {{NATS_URL}}        — JetStream URL (orn. nats://enerjione-nats:4222)
 #   {{HOST_HEALTH_PORT}}— host tarafinda exposed port (her instance icin farkli)
-#   {{IMAGE}}           — docker image tag (orn. ghcr.io/enerjione/enerjione-grid-dnp3-gateway:0.4.6)
+#   {{IMAGE}}           — docker image tag (orn. ghcr.io/enerjione/enerjione-grid-dnp3-gateway:1.13.0)
 #   {{APP_ENVIRONMENT}} — production | staging | development
 #   {{INSTALL_MODE}}    — local | remote. NATS ERISILEMEDIGINDE ne olacagini
 #                         BELIRLER: `local` (gateway backend ile ayni makinede)
@@ -120,6 +120,27 @@ services:
     ports:
       # Sadece host'a aciliyor; container ici sabit 8020.
       - "127.0.0.1:{{HOST_HEALTH_PORT}}:8020"
+      # --- INITIATING DINLEYICI PORTLARI -----------------------------------
+      # `ip_endpoint_type=initiating` cihazlarda baglantiyi CIHAZ baslatir
+      # (4G/SIM arkasindaki Horstmann). Gateway container ICINDE cihazin
+      # `master_ip_port` degerini dinler; bridge ag modunda o port host'a
+      # acilmazsa cihaz HICBIR ZAMAN baglanamaz.
+      #
+      # Esleme KIMLIKTIR (host == container): cihaz `master_ip_port`a
+      # baglanir ve gateway ayni portu dinler.
+      #
+      # Blok gateway BASINA ayrilir; ayni host'ta N gateway varsa bloklar
+      # AYRIK olmak zorundadir (iki container ayni host portunu bind edemez).
+      # Ayirma sorumlulugu deployment/orkestrasyon tarafindadir —
+      # bkz. docs/BACKEND_TODO.md#B6.
+      #
+      # Health portunun aksine bu portlar 127.0.0.1'e DEGIL saha agina
+      # bakan arayuze acilir; erisimi APN/guvenlik duvari ile sinirlayin.
+      #
+      # Asagidaki satir render sirasinda ya gercek eslemelerle DEGISTIRILIR
+      # ya da (blok ayrilmadiysa) TAMAMEN SILINIR. Sablonun kendisi gecerli
+      # YAML kalsin diye bir liste ogesi olarak duruyor.
+      - "{{INITIATING_PORT_MAPPINGS}}"
     volumes:
       # Persistent state: instance_id + outbox SQLite. Volume kaybolursa
       # at-most-once garanti yerine duplicate mesaj gelebilir (tag-engine

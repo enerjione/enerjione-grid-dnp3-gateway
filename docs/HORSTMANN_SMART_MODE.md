@@ -33,7 +33,8 @@ Gateway rejimi cihazin DNP3 noktalarindan **CIKARMAZ**. Karar tek bir
 alandan gelir:
 
 ```
-DeviceConfig.session_policy = "continuous"   (VARSAYILAN)  |  "smart"
+DeviceConfig.session_policy = "continuous" (VARSAYILAN) | "smart" | "auto"
+DeviceConfig.ip_endpoint_type = "listening" (VARSAYILAN) | "initiating"
 ```
 
 * **`continuous`** — bugunku davranis, birebir. Periyodik Class 1/2/3 event
@@ -41,6 +42,27 @@ DeviceConfig.session_policy = "continuous"   (VARSAYILAN)  |  "smart"
   zaman bagli DNP3 ekipmani icin dogru olan budur.
 * **`smart`** — hicbir tekrarlayan tarama gorevi kurulmaz, acilis integrity
   poll'u yapilmaz, beklenen kapanma `comm_lost` uretmez.
+* **`auto`** (1.13.0) — rejim cihazin **Master `Operation Mode`** noktasindan
+  CALISMA ANINDA turetilir. Mod gozlenene kadar gateway **sessiz** kalir.
+
+### Gecerli kombinasyonlar
+
+| `ip_endpoint_type` | `session_policy` | Gecerli mi |
+|---|---|---|
+| `listening` | `continuous` | ✅ |
+| `initiating` | `continuous` | ✅ |
+| `initiating` | `smart` | ✅ |
+| `initiating` | `auto` | ✅ |
+| `listening` | `smart` / `auto` | ❌ **config REDDEDILIR** |
+
+`listening` uc gateway'in TCP **client** olarak cihaza baglanmasi demektir;
+Smart Mode'da baglantiyi CIHAZ baslatir. Bu kombinasyon istenen yasam
+dongusunu HICBIR ZAMAN gerceklestiremez.
+
+> **1.12.0'dan davranis degisikligi.** 1.12.0 bu kombinasyonu sessizce
+> `continuous`a dusuruyordu. Artik reddediliyor: operatorun acik niyetini
+> sessizce baska bir seye cevirmek, reddetmekten daha kotudur. Kirilma
+> riski yok — `session_policy` gonderen bir backend surumu sahaya cikmadi.
 
 Varsayilan `continuous` oldugu icin **mevcut kurulumlarin davranisi
 degismez**. Backend sozlesmesi: [BACKEND_TODO.md](./BACKEND_TODO.md#b5)
@@ -68,6 +90,85 @@ Mode** raporlar (`0x01` = Boost, `0x81` = Smart). Bundan otomatik tespit
 Bkz. bolum 10 — sonraki gorev.
 
 ---
+
+## 2b. `auto` — Master Operation Mode'dan turetme
+
+### Kaynak: YALNIZCA Master
+
+Karar **yalnizca** hucresel Master/PoleMaster'in `Operation Mode` noktasindan
+verilir. Su kaynaklar KATILMAZ:
+
+* `Satellite N Operation Mode` — telemetri olarak yayinlanir, politikaya girmez
+* `Boost Mode Enabled` — KONFIGURASYON (yetenek), calisma anindaki durum degil
+* `Boost Mode` (G10 komut noktasi)
+* uc tipi tek basina
+
+Sinyal cihazin KENDI katalogundan **semantik** kimlikle bulunur:
+`data_type=binary` **ve** `dnp3_object_group=1` **ve** anahtarin son bileseni
+`operation_mode` **ve** `source` master. **DNP3 index SABITLENMEZ** (SN 2.0
+G1/15, Pole Master farkli).
+
+### Deger yorumu — DEGER mi BAYRAK mi
+
+Dokumantasyon `0x01 = Boost`, `0x81 = Smart` der. **Bunlar noktanin degeri
+DEGIL, tam DNP3 bayrak oktetidir.** Group 1 bayrak byte'inin 0x80 biti
+DURUM (STATE) bitidir — yani degerin kendisi:
+
+| Bayrak okteti | STATE biti | Deger | Mod |
+|---|---|---|---|
+| `0x01` | 0 | `0` | **Boost** |
+| `0x81` | 1 | `1` | **Smart** |
+
+Kutuphaneyle dogrulandi (yadnp3 3.2.1.1):
+`Binary(True, Flags(0x01))` -> `flags=0x81`.
+
+Naif "1 = Boost" varsayimi tersine cevirirdi. Esleme
+`operation_mode.normalize_operation_mode(..., smart_raw_value=...)` ile ters
+cevrilebilir ve `tests/test_auto_session_policy.py` turetmeyi adim adim pinler.
+
+### Baslangic durumu (mod henuz bilinmiyor)
+
+`auto` **sessiz** baslar: tarama yok, acilis integrity poll'u yok.
+
+> Siniflandirma ugruna tarama kurmak, cihaz gercekten Smart ise 15 saniyelik
+> idle sayacini surekli sifirlardi — yani duzeltmeye calistigimiz hata.
+
+Ayrica **siniflandirma icin taze bir baglanti YIKILMAZ**.
+
+`/health` bu belirsizligi gosterir: `effective_session_policy="unknown"`,
+`operation_mode="unknown"`.
+
+### Fallback (mod hic gelmezse)
+
+**BAGLANTILI** gecen 120 saniyede mod gozlenemezse `continuous` uygulanir.
+Sayac yalnizca cihaz BAGLIYKEN isler (baglanti yokken tarama kurmak anlamsiz
+olurdu ve cihaz sonradan baglandiginda taramalar hazir beklerdi).
+
+**Iki risk de gercek, secim bilincli:**
+
+| Fallback | Risk |
+|---|---|
+| `continuous` (SECILEN) | Cihaz gercekten Smart ise modemi acik kalir — pil tuketimi, YAVAS zarar |
+| `smart` | Cihaz gercekten Boost ise yoklama durur — telemetri bayatlar, VERI DOGRULUGU zarari; gercek kopma da gecikir |
+
+Veri dogrulugunu pil tasarrufunun onune koyuyoruz; ayrica `continuous`
+1.11.x'ten beri suregelen davranistir. Karar **sessiz degil**:
+`auto_policy_fallback` WARNING loglanir ve `/health` `auto_fallback=true`
+gosterir.
+
+### Calisma anindaki gecisler
+
+| Gecis | Yapilan | Oturum yikilir mi |
+|---|---|---|
+| (auto) ilk mod = Smart | zaten sessiz | **HAYIR** |
+| (auto) ilk mod = Boost | `AddClassScan` calisma aninda | **HAYIR** |
+| Smart -> Boost | `AddClassScan` calisma aninda | **HAYIR** |
+| Boost -> Smart | **yalnizca o cihazin** master'i yeniden kurulur | evet (tek cihaz) |
+| Ayni mod tekrar | hicbir sey | hayir (flap YOK) |
+
+Boost -> Smart'ta rebuild ZORUNLU: pinlenmis yadnp3 3.2.1.1 bir taramayi
+kaldirmayi/durdurmayi SUNMUYOR (`IMasterScan` yalnizca `Demand()` tasiyor).
+`DNP3Manager` ya da diger cihazlarin master'lari ETKILENMEZ.
 
 ## 3. Durum makinesi
 
@@ -182,7 +283,9 @@ Esik asildiktan sonra cihaz, **yeni ve kanitli bir oturum** kurmadan tekrar
 
 | Anahtar | Yer | Varsayilan | Aciklama |
 |---|---|---|---|
-| `session_policy` | backend, cihaz basina | `continuous` | `continuous` \| `smart` |
+| `session_policy` | backend, cihaz basina | `continuous` | `continuous` \| `smart` \| `auto` |
+| `ip_endpoint_type` | backend, cihaz basina | `listening` | `listening` \| `initiating`. `smart`/`auto` icin **`initiating` zorunlu** |
+| `master_ip_port` | backend, cihaz basina | — | `initiating` icin **ZORUNLU**, 1024..65535, gateway icinde TEKIL |
 | `smart_max_silence_sec` | backend, cihaz basina | `null` (= ezme yok) | Sessizlik esigi, **60..2592000** sn. Gecersizse yok sayilir, env yedegine dusulur. |
 | `DNP3_SMART_MAX_SILENCE_SEC` | gateway `.env` | `0` (kapali) | Cihaz ezmesi yokken kullanilan yedek. Kabul: **`0` veya `60..2592000`**; `1..59` boot'ta REDDEDILIR. |
 
@@ -209,14 +312,29 @@ Cihaz basina (`device_health()`):
     "smart_idle_age_sec": 400.0,
     "smart_max_silence_sec": 93600,
     "smart_silence_deadline_epoch": 1755693600.0,
-    "smart_silence_remaining_sec": 93180.0
+    "smart_silence_remaining_sec": 93180.0,
+    "configured_session_policy": "auto",
+    "effective_session_policy": "smart",
+    "operation_mode": "smart",
+    "operation_mode_raw": 1.0,
+    "operation_mode_last_seen_epoch": 1755600000.0,
+    "auto_fallback": false,
+    "ip_endpoint_type": "initiating",
+    "master_ip_port": 20100,
+    "listener_expected": true,
+    "listener_port": 20100
   }
 }
 ```
 
+`initiating` dinleyicisi acilamayan cihazlar `state="listener_error"` ile
+raporlanir (port dolu/ayricalikli). Bu bir **kurulum** arizasidir, haberlesme
+arizasi degil — `devices.listener_error` sayacinda ayri tutulur.
+
 Ozet sayimlar (`/health` -> `devices`): `online`, `recovering`, `lost`,
-**`smart_idle`**, `smart_lost`, `unknown` ve
-`session_policies: {continuous, smart}`.
+**`smart_idle`**, `smart_lost`, `listener_error`, `unknown`,
+`session_policies: {continuous, smart, auto}` ve
+`effective_policies: {continuous, smart, unknown}`.
 
 Sayaclar (`devices.recovery`): `smart_idle_wakeup_total`,
 `smart_silence_lost_total`.
@@ -379,6 +497,9 @@ smart_idle_restored device=SN2-001 last_contact=2026-08-19T09:14:31Z — \
 ---
 
 ## 13. Saha kabul proseduru (GERCEK CIHAZ GEREKTIRIR)
+
+> **Tam prosedur, komutlar ve isaretleme sablonu:**
+> [FIELD_ACCEPTANCE.md](./FIELD_ACCEPTANCE.md)
 
 Birim ve loopback testleri bunu uretime hazir ilan etmez. Asagidakiler
 **gercek bir Smart Navigator 2.0 ile** dogrulanmalidir:

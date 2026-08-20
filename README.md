@@ -1,6 +1,6 @@
 # EnerjiOne DNP3 Gateway
 
-**Version:** 0.5.0
+**Version:** 1.13.0
 **Hedef platform:** Windows Server / Windows 10+ (Linux Docker da desteklenir)
 **Python:** 3.10 - 3.12
 
@@ -127,7 +127,7 @@ Yanit ornegi:
 {
   "status": "ok",
   "service": "dnp3-gateway",
-  "version": "0.5.0",
+  "version": "1.13.0",
   "gateway_code": "GW-001",
   "gateway_instance_id": "8f2b...",
   "app_environment": "production",
@@ -209,6 +209,16 @@ EnerjiOne Grid DNP3 Gateway/
     `-- DOCKER.md
 ```
 
+### DNP3 uc tipi (kim baglanti aciyor?)
+
+| `ip_endpoint_type` | Kim baglanir | Kullanim |
+|---|---|---|
+| `listening` (VARSAYILAN) | **Gateway** cihaza baglanir (TCP client) | Klasik saha RTU'su, sabit IP |
+| `initiating` | **Cihaz** gateway'e baglanir (TCP server) | 4G/SIM arkasindaki Horstmann; `master_ip_port` zorunlu |
+
+`initiating` kurulumlarda o portun host'a acilmasi gerekir —
+`render_compose.py --initiating-ports` (bkz. [docs/DOCKER.md](./docs/DOCKER.md)).
+
 ### Horstmann Smart Mode
 
 Smart Navigator 2.0 **Smart Mode** kullanan sahalar icin cihaz basina bir
@@ -218,6 +228,9 @@ oturum politikasi vardir:
 |---|---|
 | `continuous` (VARSAYILAN) | Bugunku davranis: periyodik Class 1/2/3 event + Class 0 integrity taramasi, acilis integrity poll'u. Her zaman bagli DNP3 ekipmani icin dogrudur. |
 | `smart` | Hicbir tekrarlayan tarama YOK, acilis integrity poll'u YOK. Cihaz raporunu kendisi gonderir; DNP3 oturumu 15 saniye bosta kalinca modemini kapatir ve bu **beklenen kapanma `comm_lost` URETMEZ** (`smart_idle` durumu). |
+| `auto` | Rejim cihazin **Master `Operation Mode`** noktasindan calisma aninda turetilir (Smart -> `smart`, Boost -> `continuous`). Mod gozlenene kadar gateway **sessiz** kalir. |
+
+`smart` ve `auto` YALNIZCA `ip_endpoint_type=initiating` ile gecerlidir.
 
 Politika backend'den cihaz basina gelir; varsayilan `continuous` oldugu icin
 **mevcut kurulumlar etkilenmez**.
@@ -245,8 +258,8 @@ Tam detay: [docs/SECURITY.md "Checklist"](./docs/SECURITY.md#checklist-yeni-sunu
 ## Versiyonlama
 
 Versiyon `MAJOR.MINOR.PATCH`:
-- **Patch** (`0.4.6`): bugfix, kucuk yama, doc temizligi
-- **Minor** (`0.5.0`): yeni ozellik, geri-uyumlu genisleme
+- **Patch** (`1.12.1`): bugfix, kucuk yama, doc temizligi
+- **Minor** (`1.13.0`): yeni ozellik, geri-uyumlu genisleme
 - **Major** (`1.0.0`): kirici degisiklik
 
 `VERSION` dosyasi + `pyproject.toml` daima birlikte guncellenir.

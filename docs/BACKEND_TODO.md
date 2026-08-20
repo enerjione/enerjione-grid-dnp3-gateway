@@ -272,7 +272,7 @@ ogreniyor.
   "outbox_dead_letter": 0,
   "devices": {"total": 300, "online": 287, "recovering": 3, "lost": 10},
   "uptime_sec": 86400,
-  "version": "0.5.0"
+  "version": "1.13.0"
 }
 ```
 
@@ -379,6 +379,75 @@ Backend tanimadigi anahtarlari `raw_json`e yaziyor; **migration gerekmez.**
 
 ---
 
+## B6. Initiating host-port ayirma + `session_policy=auto` — 🔴 BACKEND/ORKESTRASYON
+
+**Gateway durumu:** ✅ HAZIR (G-INIT-02 + G-SMART-02, gateway 1.13.0).
+
+### B6.1 — Cihaz alanlari (B5'in genislemesi)
+
+`GET /gateways/{code}/config` -> `devices[]`:
+
+| Alan | Tip | Kural |
+|---|---|---|
+| `ip_endpoint_type` | string | `listening` (varsayilan) \| `initiating`. **Tanimsiz deger config'i REDDETTIRIR** — sessizce `listening`e DUSMEZ. |
+| `master_ip_port` | int | `initiating` icin **ZORUNLU**, `1024..65535`. Eksik/0/aralik disi -> config reddedilir. Ayni gateway icinde **TEKIL** olmali. |
+| `session_policy` | string | `continuous` (varsayilan) \| `smart` \| **`auto`** (YENI) |
+| `smart_max_silence_sec` | int \| null | 60..2592000 (bkz. B5) |
+
+**YENI KISIT (1.13.0):** `session_policy` `smart` VEYA `auto` ise
+`ip_endpoint_type` **`initiating` OLMAK ZORUNDA**. Aksi halde config
+reddedilir.
+
+> **1.12.0'DAN DAVRANIS DEGISIKLIGI.** 1.12.0 bu kombinasyonu sessizce
+> `continuous`a dusuruyordu (`fail_safe_continuous`). Artik REDDEDILIYOR.
+> Kirilma riski YOK: `session_policy` gonderen bir backend surumu henuz
+> sahaya cikmadi. **Frontend bu kombinasyonu KAYDETMEDEN engellemeli.**
+
+`auto` semantigi: gateway rejimi cihazin **Master `Operation Mode`**
+noktasindan turetir. Backend'in ek bir sey yapmasi GEREKMEZ — yalnizca
+degeri kabul edip iletmesi yeter.
+
+### B6.2 — Host port ayirma (ORKESTRASYON SORUMLULUGU)
+
+`initiating` cihazlarda Horstmann `GATEWAY_HOST_IP:master_ip_port`a
+baglanir. Bridge ag modunda o port host'a **acilmis olmali**.
+
+Gateway prosesi ayni host'taki **kardes gateway instance'larini GOREMEZ**.
+Dagitik bir port ayirici gateway icinde UYDURULMAZ. Garanti edilmesi
+gerekenler:
+
+1. **Gateway basina AYRIK blok.** Ornek politika:
+
+   | Gateway | Blok |
+   |---|---|
+   | GW-001 | 20100-20199 |
+   | GW-002 | 20200-20299 |
+
+2. **`master_ip_port` cihazin gateway'inin blogu ICINDE olmali.**
+   Disinda kalirsa cihaz baglanamaz (gateway dinler ama host'a acik degil).
+
+3. **Ayni host'ta iki gateway ayni host portunu bind EDEMEZ.** Bloklar
+   ayrik degilse ikinci container baslatilamaz.
+
+4. Blok, compose render'ina **parametre olarak** verilir:
+
+   ```
+   render_compose.py ... --initiating-ports 20100-20199                          [--initiating-bind-host <saha-agina-bakan-IP>]
+   ```
+
+   Renderlayici dogrular: sayisal, `bas<=son`, `1024..65535`, cakisma yok,
+   toplam <= 512 port, health portuyla cakisma yok.
+
+5. **Blok boyutu = gercek initiating cihaz sayisi.** Docker varsayilan
+   `userland-proxy` ile yayinlanan HER port icin bir surec baslatir.
+
+### Deploy sirasi
+
+**SERBEST.** Alanlar opsiyonel okunuyor; `--initiating-ports` verilmezse
+port yayinlanmaz ve `listening`-only kurulumlar 1.12.0 ile ayni calisir.
+
+---
+
 ## Ozet tablo
 
 | # | Konu | Gateway hazir mi | Deploy sirasi | Onceligi |
@@ -388,6 +457,7 @@ Backend tanimadigi anahtarlari `raw_json`e yaziyor; **migration gerekmez.**
 | B3 | Per-device katalog | ✅ **GATEWAY TARAFI KAPANDI** | serbest | Dusuk — yalnizca esneklik kaldi |
 | B4 | Saglik heartbeat + filo uyarisi | ✅ **TAMAMLANDI** | — | ~~Yuksek — kor nokta~~ |
 | B5 | Cihaz basina oturum politikasi (Smart Mode) | ✅ **GATEWAY HAZIR** | serbest (kirilma yok) | Yuksek — Horstmann Smart Mode sahasi |
+| B6 | Initiating host-port ayirma + `auto` politikasi | ✅ **GATEWAY HAZIR** | serbest (kirilma yok) | Yuksek — initiating cihaz HIC baglanamaz |
 
 **Gateway tarafinda kalan is YOK.** Besinin de gateway yarisi bitti.
 

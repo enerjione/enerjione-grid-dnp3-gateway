@@ -98,6 +98,11 @@ class DeviceConfig:
     #:       event scan + Class 0 integrity scan + acilis integrity poll'u.
     #:       Her zaman bagli DNP3 ekipmani icin dogru olan budur.
     #:
+    #:   "auto": rejim cihazin MASTER `Operation Mode` noktasindan CALISMA
+    #:       ANINDA turetilir (Smart -> smart, Boost -> continuous). Mod
+    #:       gozlenene kadar gateway SESSIZ kalir (bkz. docs). `smart` gibi
+    #:       YALNIZCA `initiating` uc ile gecerlidir.
+    #:
     #:   "smart": Horstmann Smart Navigator 2.0 Smart Mode. Cihaz raporunu
     #:       gonderir ve DNP3 oturumu 15 SANIYE bosta kalinca hucresel modemi
     #:       kapatir. Gateway periyodik tarama gonderirse bu sayac hicbir zaman
@@ -375,8 +380,84 @@ def _parse_optional_master_address(item: dict[str, Any]) -> int | None:
     return None
 
 
+#: Desteklenen TCP uc tipleri.
+#:
+#:   listening  — GATEWAY baglanir (TCP client). Klasik saha RTU'su.
+#:   initiating — CIHAZ baglanir (TCP server, `master_ip_port` dinlenir).
+#:                4G/SIM arkasindaki Horstmann'lar boyle calisir.
+#:
+#: Bu iki degerin anlami BIRBIRININ TERSI: kimin baglanti actigini belirler.
+IP_ENDPOINT_TYPES: frozenset[str] = frozenset({"listening", "initiating"})
+
+#: Initiating dinleyici portunun protokol seviyesindeki araligi.
+#: Ayricalikli portlar (<1024) uretim politikasi geregi REDDEDILIR: container
+#: root olmayan kullanici ile kosuyor ve o araligi zaten bind EDEMEZ; kabul
+#: etmek, calisma zamaninda anlasilamayan bir bind hatasina donusurdu.
+MASTER_IP_PORT_MIN = 1024
+MASTER_IP_PORT_MAX = 65535
+
+
+def _parse_ip_endpoint_type(item: dict[str, Any]) -> str:
+    """Cihazin TCP uc tipi. Alan yoksa "listening" (bugunku varsayilan).
+
+    TANIMSIZ DEGER SESSIZCE VARSAYILANA DUSMEZ — `GatewayConfigError` atar.
+
+    Gerekce somut: `"initating"` yazim hatasi sessizce `"listening"`e
+    duserse, KIMIN BAGLANTI ACTIGI tersine doner. Gateway uyuyan bir
+    Horstmann'a TCP client olarak baglanmaya calisir, cihaz hicbir zaman
+    baglanamaz ve saha bunu yalnizca "cihaz hic gelmedi" olarak gorur.
+    Sessiz ters cevirme, config'i reddetmekten cok daha pahalidir.
+    """
+    ham = item.get("ip_endpoint_type")
+    if ham is None or ham == "":
+        return "listening"
+    deger = str(ham).strip().lower()
+    if deger not in IP_ENDPOINT_TYPES:
+        raise GatewayConfigError(
+            f"gecersiz ip_endpoint_type={ham!r} (cihaz={item.get('code')!r}); "
+            f"izin verilenler: {sorted(IP_ENDPOINT_TYPES)}"
+        )
+    return deger
+
+
+def _parse_master_ip_port(item: dict[str, Any], *, endpoint_type: str) -> int | None:
+    """Initiating dinleyici portu.
+
+    `listening` cihaz icin alan ANLAMSIZDIR ve None doner (varsa yok sayilir).
+
+    `initiating` cihaz icin ZORUNLUDUR: eksik/0/aralik disi/bozuk deger
+    `GatewayConfigError` uretir. Eskiden sessizce `None` olup adapter'da
+    `DNP3_TCP_PORT`e (20000) dusuyordu — yani TUM initiating cihazlar ayni
+    portu bind etmeye calisir, ilki disindakiler anlasilmaz bir soket
+    hatasiyla dusuyordu.
+    """
+    ham = item.get("master_ip_port")
+    if endpoint_type != "initiating":
+        return None
+    if ham is None or ham == "" or ham is False:
+        raise GatewayConfigError(
+            f"ip_endpoint_type=initiating icin master_ip_port ZORUNLU "
+            f"(cihaz={item.get('code')!r}); cihaz gateway'e baglanacagi icin "
+            f"dinlenecek port bilinmek zorunda"
+        )
+    try:
+        port = int(ham)
+    except (TypeError, ValueError):
+        raise GatewayConfigError(
+            f"master_ip_port sayisal degil: {ham!r} (cihaz={item.get('code')!r})"
+        ) from None
+    if not (MASTER_IP_PORT_MIN <= port <= MASTER_IP_PORT_MAX):
+        raise GatewayConfigError(
+            f"master_ip_port aralik disi: {port} (cihaz={item.get('code')!r}); "
+            f"izin verilen: {MASTER_IP_PORT_MIN}..{MASTER_IP_PORT_MAX}. "
+            "Ayricalikli portlar (<1024) uretim politikasi geregi reddedilir: "
+            "container root olmayan kullaniciyla kosar ve o araligi bind edemez."
+        )
+    return port
+
+
 #: Desteklenen DNP3 oturum yasam dongusu politikalari.
-SESSION_POLICIES: frozenset[str] = frozenset({"continuous", "smart"})
+SESSION_POLICIES: frozenset[str] = frozenset({"continuous", "smart", "auto"})
 
 #: Smart sessizlik denetiminin kabul edilen araligi.
 #: Alt sinir 60 sn: daha kucuk bir deger NORMAL bir Smart uykusunu bile
@@ -1372,6 +1453,63 @@ def _safe_finite_float(value: Any, default: float) -> float:
     return f
 
 
+def _dogrula_dinleyici_portlari(devices: list[DeviceConfig]) -> None:
+    """Ayni gateway icinde `master_ip_port` cakismasini REDDET.
+
+    Kapsam BILEREK gateway-ici: bu proses yalnizca kendi cihazlarini bilir.
+    AYNI HOST'taki kardes gateway instance'lari arasindaki host-port
+    tekilligi bu repo'dan GORULEMEZ ve burada uydurulmaz — orasi
+    deployment/orkestrasyon sorumlulugudur (bkz. docs/BACKEND_TODO.md#B6).
+    """
+    gorulen: dict[int, str] = {}
+    for d in devices:
+        if (d.ip_endpoint_type or "").strip().lower() != "initiating":
+            continue
+        port = d.master_ip_port
+        if port is None:
+            continue
+        onceki = gorulen.get(port)
+        if onceki is not None:
+            raise GatewayConfigError(
+                f"master_ip_port cakismasi: {port} hem {onceki!r} hem {d.code!r} "
+                "cihazinda tanimli. Ayni gateway icinde her initiating cihaz "
+                "AYRI bir dinleyici portu kullanmak zorundadir."
+            )
+        gorulen[port] = d.code
+
+
+def _dogrula_oturum_politikasi_uyumu(devices: list[DeviceConfig]) -> None:
+    """`session_policy=smart` YALNIZCA `initiating` uc ile gecerlidir.
+
+    1.12.0'DAN DAVRANIS DEGISIKLIGI (bilincli sertlestirme):
+    Onceki surum bu kombinasyonu sessizce `continuous`a dusuruyordu
+    (`fail_safe_continuous`). Artik konfigurasyon REDDEDILIR.
+
+    Gerekce: Smart Mode'da baglantiyi CIHAZ baslatir. `listening` uc,
+    gateway'in TCP client olarak uyuyan bir modeme baglanmaya calismasi
+    demektir — bu kombinasyon ISTENEN Smart yasam dongusunu HICBIR ZAMAN
+    gerceklestiremez. Operatorun acik niyetini sessizce baska bir seye
+    cevirmek, reddetmekten daha kotudur.
+
+    KIRILMA RISKI YOK: `session_policy` alanini gonderen bir backend surumu
+    henuz sahaya cikmadi (bkz. docs/BACKEND_TODO.md#B5); alan gonderilmeyen
+    tum kurulumlar `continuous` varsayilaniyla etkilenmez.
+    """
+    for d in devices:
+        politika = (getattr(d, "session_policy", "") or "").strip().lower()
+        if politika not in ("smart", "auto"):
+            continue
+        if (d.ip_endpoint_type or "").strip().lower() != "initiating":
+            raise GatewayConfigError(
+                f"session_policy={politika} YALNIZCA ip_endpoint_type=initiating "
+                f"ile gecerlidir (cihaz={d.code!r}, uc={d.ip_endpoint_type!r}). "
+                "Smart Mode'da baglantiyi CIHAZ baslatir; listening uc bu yasam "
+                "dongusunu gerceklestiremez. `auto` da Smart'a cozulebildigi icin "
+                "ayni kisita tabidir — aksi halde gerceklestirilemeyecek bir "
+                "yapilandirma sessizce kabul edilirdi."
+            )
+
+
 def _parse_gateway_config(
     data: dict[str, Any],
     *,
@@ -1441,6 +1579,16 @@ def _parse_gateway_config(
                 raw_ip[:80],
             )
             continue
+
+        # UC TIPI + DINLEYICI PORTU — FAIL-CLOSED, `try` BLOGUNUN DISINDA.
+        #
+        # Bilerek asagidaki `except (TypeError, ValueError)` sarmalayicisinin
+        # DISINDA: o blok bozuk bir alani "cihazi atla" ile karsiliyor.
+        # Uc tipi ve dinleyici portu icin SESSIZ ATLAMA da kabul edilemez —
+        # cihaz sessizce yoklanmaz kalirdi. `GatewayConfigError` yukari
+        # cikar, config REDDEDILIR ve gateway son iyi config'iyle calisir.
+        uc_tipi = _parse_ip_endpoint_type(item)
+
         try:
             # DNP3 link layer adresi: standart aralik 0-65519 (RFC: 65520-65535
             # rezerve). Disindaki degerler segfault uretebilir bazi binding'lerde.
@@ -1460,18 +1608,8 @@ def _parse_gateway_config(
                     dnp3_address=dnp3_addr,
                     dnp3_tcp_port=_parse_optional_dnp3_tcp_port(item),
                     master_address=_parse_optional_master_address(item),
-                    ip_endpoint_type=(
-                        str(item.get("ip_endpoint_type") or "listening").strip().lower()
-                        if str(item.get("ip_endpoint_type") or "").strip().lower()
-                        in ("initiating", "listening")
-                        else "listening"
-                    ),
-                    master_ip_port=(
-                        int(item["master_ip_port"])
-                        if item.get("master_ip_port") not in (None, "", 0)
-                        and 1 <= int(item["master_ip_port"]) <= 65535
-                        else None
-                    ),
+                    ip_endpoint_type=uc_tipi,
+                    master_ip_port=_parse_master_ip_port(item, endpoint_type=uc_tipi),
                     # Reasonable defaults + clamping (poll_interval cok kucuk
                     # ise gateway cycle'i tikar; cok buyuk ise hic okumaz).
                     poll_interval_sec=_safe_int(item.get("poll_interval_sec"), 2, lo=1, hi=3600),
@@ -1496,6 +1634,16 @@ def _parse_gateway_config(
             "config_rejected_devices count=%d — schema validation",
             rejected_ips,
         )
+
+    # DINLEYICI PORTU CAKISMASI — MASTER KURULMADAN ONCE YAKALA.
+    #
+    # Iki initiating cihaz ayni `master_ip_port`u tasiyorsa ikinci
+    # `AddTCPServer` cagrisi calisma zamaninda anlasilmaz bir soket hatasi
+    # uretir (ya da daha kotusu: cihazlar birbirinin oturumunu kapar,
+    # `ServerAcceptMode.CloseExisting`). Config seviyesinde reddetmek bunu
+    # ONCEDEN ve ACIKCA gorunur kilar.
+    _dogrula_dinleyici_portlari(devices)
+    _dogrula_oturum_politikasi_uyumu(devices)
 
     signals = _parse_signal_list(data.get("signals") or [], alan="signals")
 

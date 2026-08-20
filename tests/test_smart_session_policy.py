@@ -60,9 +60,22 @@ class SahteMaster:
     def __init__(self, device: DeviceConfig, *, session_policy: str = "continuous") -> None:
         self.device = device
         self.cache = mod._DeviceCache()
-        self.session_policy = session_policy
-        self.cache.set_session_policy(session_policy)
+        # Gercek `_ManagedMaster` ile ayni yuzey: yapilandirilan politika ile
+        # ETKIN politika ayri (bkz. `auto`).
+        self.configured_session_policy = session_policy
+        self.session_policy = "smart" if session_policy in ("smart", "auto") else "continuous"
+        self.auto_pending = session_policy == "auto"
+        self.auto_connected_since = 0.0
+        self.auto_fallback = False
+        self.operation_mode = "unknown"
+        self.operation_mode_raw = None
+        self.operation_mode_seen_at = None
+        self.scan_etkinlestirme_sayisi = 0
+        self.cache.set_session_policy(self.session_policy)
         self.connection_fingerprint: tuple = ()
+        # Gercek `_ManagedMaster` ile ayni yuzey: initiating cihazlarda
+        # dinlenen port, listening'de None (bkz. device_health).
+        self.listen_port = device.master_ip_port if device.ip_endpoint_type == "initiating" else None
         self.g110_ranges: tuple = ()
         self.last_command_at = 0.0
         self.integrity_sayisi = 0
@@ -83,6 +96,15 @@ class SahteMaster:
 
     def shutdown(self) -> None:
         self.shutdown_sayisi += 1
+
+    def enable_periodic_scans(self) -> bool:
+        """Gercek `_ManagedMaster` ile ayni kural: quiet -> continuous."""
+        if self.session_policy != "smart":
+            return False
+        self.session_policy = "continuous"
+        self.cache.set_session_policy("continuous")
+        self.scan_etkinlestirme_sayisi += 1
+        return True
 
     def kanit_esigi_sn(self) -> float:
         return mod._bayatlik_esigi_sn(5, 30)

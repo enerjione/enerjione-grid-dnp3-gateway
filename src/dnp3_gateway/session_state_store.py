@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 #: Dosya bicimi surumu. Uyusmayan surum YOK SAYILIR (yukseltme/geri alma
 #: sirasinda yarim yamalak bir kayitla karar vermektense hic karar vermemek
 #: dogrudur).
-STORE_VERSION = 1
+STORE_VERSION = 2
 
 #: Diske yazim hiz siniri. `read_device` her cihaz icin her cycle cagriliyor;
 #: 600 cihazli bir sahada her degisiklikte fsync'siz de olsa dosya yazmak
@@ -64,6 +64,12 @@ MAX_RECORDS = 5000
 #: kabul edilirse asagidaki tum karsilastirmalar yanlis dala girerdi.
 _STATES: frozenset[str] = frozenset({"lost", "recovering", "online", "smart_idle"})
 
+#: `session_policy=auto` cihazlarda SON GOZLENEN mod. Restart'tan sonra
+#: master'i dogru politikayla kurmak icin gerekir: bilinmezse `auto` yeniden
+#: sessiz baslar ve Boost bir cihaz siniflandirma penceresi boyunca
+#: yoklanmadan kalirdi.
+_MODES: frozenset[str] = frozenset({"unknown", "smart", "boost"})
+
 
 @dataclass(frozen=True)
 class SessionStateRecord:
@@ -76,6 +82,9 @@ class SessionStateRecord:
     last_valid_contact_unix: float | None = None
     #: `smart_idle`e girildigi an (duvar saati). None = idle degil.
     smart_idle_since_unix: float | None = None
+    #: `auto` cihazlarda son gozlenen MASTER Operation Mode.
+    #: `unknown` = henuz gozlenmedi (varsayilan; guvenli).
+    operation_mode: str = "unknown"
 
 
 def _temiz_kayit(ham: Any) -> SessionStateRecord | None:
@@ -105,10 +114,14 @@ def _temiz_kayit(ham: Any) -> SessionStateRecord | None:
             return None
         return f
 
+    mod = str(ham.get("operation_mode") or "unknown").strip().lower()
+    if mod not in _MODES:
+        mod = "unknown"
     return SessionStateRecord(
         state=durum,
         last_valid_contact_unix=_zaman("last_valid_contact_unix"),
         smart_idle_since_unix=_zaman("smart_idle_since_unix"),
+        operation_mode=mod,
     )
 
 

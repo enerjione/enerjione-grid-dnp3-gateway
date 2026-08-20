@@ -1,8 +1,8 @@
 {
   "contract_version": 1,
-  "gateway_release": "1.12.0",
-  "gateway_source_ref": "v1.12.0",
-  "gateway_source_sha": "60b9a64821086bd15c78a24e1e165006304786da",
+  "gateway_release": "1.13.0",
+  "gateway_source_ref": "v1.13.0",
+  "gateway_source_sha": "84dc49565ca4b99610633b9d14216a20a7c82f2e",
   "gateway_source_sha_semantics": "BU DOSYADAKI DEGER, KENDISINI ICEREN COMMIT DEGILDIR ve olamaz: dosyaya yeni SHA yazmak yeni bir commit uretir ve SHA yeniden degisir (self-referential). Buradaki deger, bu sozlesmenin turetildigi YAYIMLANMIS BASELINE surumun commit'idir. Bir artifact'in GERCEK revizyonu iki yerde yasar ve ikisi de release sirasinda uretilir: (1) imaj etiketi org.opencontainers.image.revision=<GITHUB_SHA>, (2) release workflow'un urettigi gateway-deployment-contract.generated.json (gateway_source_sha alani GITHUB_SHA ile doldurulur). Tuketiciler revizyon icin BUNLARA bakmali; kaynak dosyadaki deger yalnizca baseline'dir.",
   "owner": "enerjione/enerjione-grid-dnp3-gateway",
   "description": "Bir uretim DNP3 gateway kurulumunun TASIMASI GEREKEN deployment sozlesmesi. Gateway repo'su sahibidir; Grid repo'su tam kopyasini vendor eder ve CI'da karsilastirir. Runtime'da iki repo birbirine baglanmaz.",
@@ -130,7 +130,7 @@
       "production_guard": "Gateway, production'da bu degerin GATEWAY_TOKEN veya GATEWAY_COMMAND_TOKEN ile ayni olmasini reddeder."
     }
   },
-  "gateway_source_sha_baseline_ref": "v1.11.4",
+  "gateway_source_sha_baseline_ref": "v1.12.0",
   "smart_session": {
     "supported": true,
     "semantics": "Horstmann Smart Navigator 2.0 Smart Mode / Initiating Endpoint oturum yasam dongusu. Politika CIHAZ BASINA ve ACIKCA yapilandirilir; cihazin DNP3 noktalarindan CIKARILMAZ (Operation Mode otomatik tespiti AYRI bir istir). Varsayilan 'continuous' oldugu icin mevcut kurulumlarin davranisi DEGISMEZ.",
@@ -140,12 +140,13 @@
     ],
     "session_policy_values": [
       "continuous",
-      "smart"
+      "smart",
+      "auto"
     ],
     "session_policy_default": "continuous",
     "session_policy_invalid_behavior": "reject_config: tanimsiz deger TUM config'i reddeder (GatewayConfigError); gateway son iyi config'iyle calismaya devam eder. Sessizce varsayilana DUSMEZ.",
     "smart_requires_endpoint_type": "initiating",
-    "smart_wrong_endpoint_behavior": "fail_safe_continuous: session_policy=smart + ip_endpoint_type!=initiating kombinasyonunda cihaz 'continuous' olarak calistirilir ve ERROR loglanir. Config TUMDEN reddedilmez.",
+    "smart_wrong_endpoint_behavior": "reject_config: session_policy=smart|auto + ip_endpoint_type!=initiating kombinasyonu TUM config'i reddeder (GatewayConfigError). 1.12.0'daki fail_safe_continuous davranisi 1.13.0'da SERTLESTIRILDI: operatorun acik niyetini sessizce baska bir seye cevirmek reddetmekten daha kotudur. Kirilma riski yok — session_policy gonderen bir backend surumu sahaya cikmadi.",
     "smart_max_silence_default": null,
     "smart_max_silence_default_semantic": "null/eksik = CIHAZ SEVIYESINDE EZME YOK (denetim kapali DEMEK DEGILDIR). Cozum sirasi: (1) gecerli cihaz degeri 60..2592000, (2) DNP3_SMART_MAX_SILENCE_SEC [0=kapali, 60..2592000=gecerli], (3) kapali. GECERSIZ cihaz degeri: cihaz ezmesi YOK SAYILIR ve ayni sirayla env yedegine dusulur; env 0/yoksa kapali.",
     "smart_max_silence_min": 60,
@@ -161,6 +162,7 @@
       "lost",
       "smart_idle",
       "smart_lost",
+      "listener_error",
       "unknown"
     ],
     "unknown_device_config_fields": "ignored",
@@ -171,6 +173,28 @@
       "disabled"
     ],
     "env_smart_max_silence_accepted": "0 | 60..2592000",
-    "env_smart_max_silence_invalid_behavior": "fail_closed: 1..59 ve 2592000 ustu boot'ta config hatasi uretir (ConfigError)."
+    "env_smart_max_silence_invalid_behavior": "fail_closed: 1..59 ve 2592000 ustu boot'ta config hatasi uretir (ConfigError).",
+    "session_policy_auto_semantics": "auto: rejim cihazin MASTER 'Operation Mode' noktasindan CALISMA ANINDA turetilir (Smart -> etkin smart, Boost -> etkin continuous). Mod gozlenene kadar gateway SESSIZ kalir (tarama yok, acilis integrity yok) — Smart bir cihazin 15sn idle sayacini bozmamak icin. Satellite Operation Mode ve Boost Mode Enabled bu karara KATILMAZ.",
+    "session_policy_auto_fallback": "continuous_after_window: mod BAGLANTILI gecen 120 saniyede gozlenemezse GUVENLI TARAFA continuous uygulanir (veri dogrulugu > pil tasarrufu), WARNING loglanir ve /health auto_fallback=true gosterir.",
+    "auto_requires_endpoint_type": "initiating",
+    "operation_mode_source": "master_operation_mode_signal",
+    "operation_mode_signal_match": "semantic: data_type=binary AND dnp3_object_group=1 AND key son bileseni 'operation_mode' AND source master/polemaster. DNP3 index SABITLENMEZ (SN2.0 G1/15, Pole Master farkli).",
+    "operation_mode_value_mapping": "1=smart, 0=boost. Dokumandaki 0x01/0x81 DEGER DEGIL tam DNP3 bayrak oktetidir; 0x80 biti STATE (=degerin kendisi). 0x81 -> deger 1 -> Smart."
+  },
+  "initiating_endpoint": {
+    "why": "ip_endpoint_type=initiating cihazlarda baglantiyi CIHAZ baslatir. Gateway container ICINDE cihazin master_ip_port degerini dinler; bridge ag modunda o port host'a acilmazsa cihaz baglanamaz.",
+    "host_port_mapping": "identity: host portu == container portu == master_ip_port",
+    "render_parameter": "--initiating-ports (orn. 20100-20199 veya 20100-20149,20300)",
+    "render_bind_parameter": "--initiating-bind-host (varsayilan 0.0.0.0)",
+    "port_min": 1024,
+    "port_max": 65535,
+    "max_published_ports_per_gateway": 512,
+    "privileged_ports": "rejected",
+    "duplicate_master_ip_port_same_gateway": "rejected (GatewayConfigError)",
+    "missing_master_ip_port_when_initiating": "rejected (GatewayConfigError)",
+    "invalid_ip_endpoint_type": "rejected (GatewayConfigError) — sessizce listening'e DUSMEZ",
+    "host_port_uniqueness_scope": "DEPLOYMENT/ORKESTRASYON SORUMLULUGU. Gateway prosesi ayni host'taki kardes instance'lari GOREMEZ; dagitik bir port ayirici gateway icinde UYDURULMAZ. Orkestrator her gateway'e AYRIK bir blok vermeli (orn. GW-001 20100-20199, GW-002 20200-20299).",
+    "network_mode": "bridge (host networking KULLANILMAZ — sinirsiz maruziyet)",
+    "docker_proxy_cost": "Docker varsayilan userland-proxy ile yayinlanan HER port icin bir docker-proxy sureci baslatir. Blogu gercek initiating cihaz sayisina gore olcun."
   }
 }
