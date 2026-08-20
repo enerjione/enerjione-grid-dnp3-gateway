@@ -115,6 +115,32 @@ class DeviceConfig:
     #: Bkz. docs/HORSTMANN_SMART_MODE.md
     session_policy: str = "continuous"
 
+    #: Horstmann Dial-In (zamanlanmis rapor) araligi — DAKIKA.
+    #:
+    #: Cihazin NE ZAMAN haber vermesi BEKLENDIGINI soyler. Gateway bunu
+    #: YALNIZCA yasam dongusu beklentisi, saglik ve tanilama icin kullanir;
+    #: cihaza Dial-In yapilandirmasi YAZMAZ (o sorumluluk backend/cihaz
+    #: yapilandirma hattindadir).
+    #:
+    #: None = bilinmiyor -> `late` (gecikmis) durumu URETILMEZ ve davranis
+    #: 1.13.0 ile birebir aynidir (yalnizca `smart_max_silence_sec` gecerli).
+    #: Kabul araligi: 60..1440 dakika.
+    dial_in_interval_min: int | None = None
+
+    #: `session_policy=smart|auto` + `ip_endpoint_type=listening` icin:
+    #: gateway'in cihaza yeniden baglanma denemelerinin UST araligi (saniye).
+    #:
+    #: Uyuyan bir Horstmann uyandiginda dinleyici soketini yalnizca
+    #: "Socket Listening Timeout" suresince (tipik ~600 sn) acik tutar;
+    #: gateway o PENCEREYI yakalamak zorundadir.
+    #:
+    #: None = opendnp3'un kendi kanal yeniden-baglanma davranisi (1 sn'den
+    #: 60 sn'ye ustel) — 600 sn'lik bir pencerede >=10 deneme demektir ve
+    #: YETERLIDIR. Deger verilirse yalnizca TAVAN daraltilir; IKINCI bir
+    #: yeniden baglanma dongusu KURULMAZ.
+    #: Kabul araligi: 5..600 saniye.
+    smart_listen_reconnect_max_sec: int | None = None
+
     #: `session_policy="smart"` iken: cihaz bu kadar saniye HIC gecerli DNP3
     #: kaniti gondermezse `smart_idle` durumundan `lost`a dusurulur ve mevcut
     #: comm_lost mekanizmasi calisir.
@@ -467,6 +493,95 @@ _SMART_SILENCE_MIN_SEC = 60
 _SMART_SILENCE_MAX_SEC = 30 * 24 * 3600
 
 
+#: Horstmann Dial-In araliginin kabul edilen araligi (dakika).
+#: Alt sinir 60: daha sik bir "zamanlanmis rapor" Smart modun enerji
+#: mantigina aykiridir. Ust sinir 1440 (24 saat).
+DIAL_IN_INTERVAL_MIN_MIN = 60
+DIAL_IN_INTERVAL_MIN_MAX = 1440
+
+#: Listening Smart yeniden baglanma tavaninin kabul araligi (saniye).
+#: Alt sinir 5: daha sik denemek uyuyan bir modeme gereksiz radyo yuku
+#: bindirir. Ust sinir 600: Horstmann'in tipik Socket Listening Timeout'u;
+#: daha buyuk bir tavan uyanik pencereyi tamamen KACIRABILIR.
+SMART_LISTEN_RECONNECT_MIN_SEC = 5
+SMART_LISTEN_RECONNECT_MAX_SEC = 600
+
+
+def exact_int(ham: Any) -> int | None:
+    """TAM tamsayi ayristirmasi; kesirli deger KIRPILMAZ, `None` doner.
+
+    NEDEN `int()` YETMEZ — SESSIZ KIRPMA
+    ------------------------------------
+    `int(60.9)` sessizce `60` verir. Bir operator `dial_in_interval_min`i
+    `60.9` girdiginde niyeti belirsizdir; onu 60'a kirpmak "anladim" demektir
+    ve YANLIS olabilir. `normalize_operation_mode` ile AYNI ilke: binary ya
+    da tamsayi bir alandan gelen ara deger, yorumlanacak bir sey degil
+    ANLASILAMAYAN bir sinyaldir. Cagiran taraf `None` gorup yok sayar ve
+    uyarir — sessizce yanlis bir degerle calismaktansa alani hic
+    kullanmamak dogrudur.
+
+    KABUL EDILENLER            REDDEDILENLER
+      60      (int)              60.9   (kesirli)
+      "60"    (metin)            "60.9" (kesirli metin)
+      60.0    (tam degerli)      nan / inf
+      "  60 " (bosluklu)         True / False (bool)
+                                 "", None, "altmis"
+
+    `bool` ACIKCA reddedilir: Python'da `isinstance(True, int)` DOGRUDUR ve
+    `True` sessizce `1` olurdu. Tamsayi bekleyen bir alana bool gelmesi
+    yapilandirma hatasidir, degeri degil.
+    """
+    if isinstance(ham, bool):
+        return None
+    if isinstance(ham, int):
+        return ham
+    if isinstance(ham, float):
+        # SONLULUK ONCE: `int(nan)` ValueError, `int(inf)` OverflowError
+        # firlatir — esitlik testinden ONCE elenmeleri sart.
+        return int(ham) if math.isfinite(ham) and ham == int(ham) else None
+    if isinstance(ham, str):
+        s = ham.strip()
+        if not s:
+            return None
+        try:
+            return int(s)
+        except ValueError:
+            pass
+        try:
+            f = float(s)  # "60.0" gibi tam degerli metinler icin
+        except ValueError:
+            return None
+        return int(f) if math.isfinite(f) and f == int(f) else None
+    return None
+
+
+def _parse_optional_int(item: dict[str, Any], alan: str, *, lo: int, hi: int) -> int | None:
+    """Opsiyonel tamsayi alani; yoksa/gecersizse None + WARNING.
+
+    `session_policy` gibi konfigurasyonu DUSURMEZ: bu alanlarin yanlis
+    olmasi sessiz bir yanlis REJIM uretmez, yalnizca bir beklenti/tanilama
+    bilgisi eksik kalir ve davranis 1.13.0'a doner.
+    """
+    ham = item.get(alan)
+    if ham is None or ham == "":
+        return None
+    n = exact_int(ham)
+    if n is None:
+        logger.warning("config_%s_invalid code=%r received=%r — yok sayildi", alan, item.get("code"), ham)
+        return None
+    if not (lo <= n <= hi):
+        logger.warning(
+            "config_%s_out_of_range code=%r received=%d min=%d max=%d — yok sayildi",
+            alan,
+            item.get("code"),
+            n,
+            lo,
+            hi,
+        )
+        return None
+    return n
+
+
 def _parse_session_policy(item: dict[str, Any]) -> str:
     """Cihazin oturum politikasi. Alan yoksa "continuous".
 
@@ -489,23 +604,6 @@ def _parse_session_policy(item: dict[str, Any]) -> str:
             f"gecersiz session_policy={ham!r} (cihaz={item.get('code')!r}); "
             f"izin verilenler: {sorted(SESSION_POLICIES)}"
         )
-    if deger == "smart":
-        # UC TIPI KISITI — erken operator geri bildirimi.
-        # Smart Mode'da baglantiyi CIHAZ baslatir; `listening` uc gateway'in
-        # TCP CLIENT olarak uyuyan bir modeme baglanmaya calismasi demektir.
-        # Deger BURADA degistirilmez: etkin politika kararinin TEK yeri
-        # adapter'dir (`Yadnp3TelemetryReader._session_policy`), cunku
-        # `DeviceConfig` disk onbelleginden de gelebilir ve o yol bu parser'i
-        # ATLAR. Burasi yalnizca sorunu config cekilirken gorunur kilar.
-        uc = str(item.get("ip_endpoint_type") or "listening").strip().lower()
-        if uc != "initiating":
-            logger.error(
-                "config_session_policy_endpoint_mismatch code=%r ip_endpoint_type=%r — "
-                "session_policy=smart YALNIZCA 'initiating' uc ile gecerlidir; "
-                "gateway bu cihazi GUVENLI TARAFA 'continuous' calistiracak",
-                item.get("code"),
-                uc,
-            )
     return deger
 
 
@@ -1479,35 +1577,29 @@ def _dogrula_dinleyici_portlari(devices: list[DeviceConfig]) -> None:
 
 
 def _dogrula_oturum_politikasi_uyumu(devices: list[DeviceConfig]) -> None:
-    """`session_policy=smart` YALNIZCA `initiating` uc ile gecerlidir.
+    """Oturum politikasi ile uc tipi uyumu.
 
-    1.12.0'DAN DAVRANIS DEGISIKLIGI (bilincli sertlestirme):
-    Onceki surum bu kombinasyonu sessizce `continuous`a dusuruyordu
-    (`fail_safe_continuous`). Artik konfigurasyon REDDEDILIR.
+    1.14.0'DAN ITIBAREN TUM MATRIS GECERLIDIR:
 
-    Gerekce: Smart Mode'da baglantiyi CIHAZ baslatir. `listening` uc,
-    gateway'in TCP client olarak uyuyan bir modeme baglanmaya calismasi
-    demektir — bu kombinasyon ISTENEN Smart yasam dongusunu HICBIR ZAMAN
-    gerceklestiremez. Operatorun acik niyetini sessizce baska bir seye
-    cevirmek, reddetmekten daha kotudur.
+        listening  + continuous | smart | auto
+        initiating + continuous | smart | auto
 
-    KIRILMA RISKI YOK: `session_policy` alanini gonderen bir backend surumu
-    henuz sahaya cikmadi (bkz. docs/BACKEND_TODO.md#B5); alan gonderilmeyen
-    tum kurulumlar `continuous` varsayilaniyla etkilenmez.
+    1.13.0'da `smart`/`auto` YALNIZCA `initiating` ile gecerliydi ve
+    `listening` kombinasyonu REDDEDILIYORDU. O kisit, o surumde Listening
+    Smart yasam dongusunun UYGULANMAMIS olmasindandi — gerceklestirilemeyecek
+    bir yapilandirmayi kabul etmemek dogruydu. 1.14.0 o yasam dongusunu
+    uyguladigi icin kisit KALKTI (genisleme; hicbir gecerli config artik
+    gecersiz olmuyor).
+
+    `initiating` uc icin `master_ip_port` zorunlulugu ve dinleyici portu
+    tekilligi AYNEN GECERLIDIR (bkz. `_parse_master_ip_port`,
+    `_dogrula_dinleyici_portlari`).
     """
-    for d in devices:
-        politika = (getattr(d, "session_policy", "") or "").strip().lower()
-        if politika not in ("smart", "auto"):
-            continue
-        if (d.ip_endpoint_type or "").strip().lower() != "initiating":
-            raise GatewayConfigError(
-                f"session_policy={politika} YALNIZCA ip_endpoint_type=initiating "
-                f"ile gecerlidir (cihaz={d.code!r}, uc={d.ip_endpoint_type!r}). "
-                "Smart Mode'da baglantiyi CIHAZ baslatir; listening uc bu yasam "
-                "dongusunu gerceklestiremez. `auto` da Smart'a cozulebildigi icin "
-                "ayni kisita tabidir — aksi halde gerceklestirilemeyecek bir "
-                "yapilandirma sessizce kabul edilirdi."
-            )
+    # Su an politikaya OZEL ek bir uyum kisiti YOK. Fonksiyon bilincli olarak
+    # KORUNUYOR: uc/politika uyumunun tek dogrulama yeri burasidir ve
+    # ileride bir kisit gerekirse (orn. yeni bir politika) dagilmadan
+    # buraya eklenir.
+    return
 
 
 def _parse_gateway_config(
@@ -1621,6 +1713,18 @@ def _parse_gateway_config(
                     ),
                     session_policy=_parse_session_policy(item),
                     smart_max_silence_sec=_parse_optional_smart_silence(item),
+                    dial_in_interval_min=_parse_optional_int(
+                        item,
+                        "dial_in_interval_min",
+                        lo=DIAL_IN_INTERVAL_MIN_MIN,
+                        hi=DIAL_IN_INTERVAL_MIN_MAX,
+                    ),
+                    smart_listen_reconnect_max_sec=_parse_optional_int(
+                        item,
+                        "smart_listen_reconnect_max_sec",
+                        lo=SMART_LISTEN_RECONNECT_MIN_SEC,
+                        hi=SMART_LISTEN_RECONNECT_MAX_SEC,
+                    ),
                 )
             )
         except (TypeError, ValueError) as exc:

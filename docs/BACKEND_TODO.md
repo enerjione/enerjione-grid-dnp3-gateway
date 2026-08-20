@@ -391,17 +391,59 @@ Backend tanimadigi anahtarlari `raw_json`e yaziyor; **migration gerekmez.**
 |---|---|---|
 | `ip_endpoint_type` | string | `listening` (varsayilan) \| `initiating`. **Tanimsiz deger config'i REDDETTIRIR** — sessizce `listening`e DUSMEZ. |
 | `master_ip_port` | int | `initiating` icin **ZORUNLU**, `1024..65535`. Eksik/0/aralik disi -> config reddedilir. Ayni gateway icinde **TEKIL** olmali. |
-| `session_policy` | string | `continuous` (varsayilan) \| `smart` \| **`auto`** (YENI) |
+| `session_policy` | string | `continuous` (varsayilan) \| `smart` \| **`auto`** |
 | `smart_max_silence_sec` | int \| null | 60..2592000 (bkz. B5) |
+| `dial_in_interval_min` | int \| null | **YENI (1.14.0)** — beklenen zamanlanmis rapor araligi, `60..1440` dk. `null` = `late` uyarisi KAPALI. |
+| `smart_listen_reconnect_max_sec` | int \| null | **YENI (1.14.0)** — `listening` kanalda yeniden baglanma TAVANI, `5..600` sn. `null` = kutuphane varsayilani (1sn→60sn ustel). |
 
-**YENI KISIT (1.13.0):** `session_policy` `smart` VEYA `auto` ise
-`ip_endpoint_type` **`initiating` OLMAK ZORUNDA**. Aksi halde config
-reddedilir.
+> **ALAN ADI DEGISTI (yayina cikmadan).** Taslakta `smart_listen_probe_interval_sec`
+> idi. Ad YANILTICIYDI: bu alan bir ICMP/TCP tanilama **sondasi** araligi
+> DEGIL, yadnp3 `ChannelRetry` **yeniden baglanma tavanidir** — ve ayni
+> surum gercek ag sondalari da getirdigi icin karisiklik kacinilmazdi.
+> **Geriye uyum takma adi YOK**: alan hicbir zaman yayina cikmadi.
 
-> **1.12.0'DAN DAVRANIS DEGISIKLIGI.** 1.12.0 bu kombinasyonu sessizce
-> `continuous`a dusuruyordu (`fail_safe_continuous`). Artik REDDEDILIYOR.
-> Kirilma riski YOK: `session_policy` gonderen bir backend surumu henuz
-> sahaya cikmadi. **Frontend bu kombinasyonu KAYDETMEDEN engellemeli.**
+> **TAM TAMSAYI SEMANTIGI (her iki yeni alan icin).** Kesirli deger
+> SESSIZCE KIRPILMAZ. `60` ve `"60"` gecerli, `60.0` gecerli, ama
+> **`60.9` GECERSIZDIR** ve WARNING ile yok sayilir. Eski `int()`
+> davranisi `60.9`u sessizce `60` yapardi — yani "anladim" deyip
+> YANLIS olabilirdi. `bool` de reddedilir (`isinstance(True, int)`
+> dogru oldugu icin sessizce `1` olurdu).
+
+**KISIT KALDIRILDI (1.14.0):** `session_policy` ile `ip_endpoint_type`
+**BAGIMSIZDIR**; alti kombinasyonun hepsi gecerlidir.
+
+> **1.13.0'DAN DAVRANIS DEGISIKLIGI — FRONTEND ETKISI VAR.**
+> 1.13.0, `smart`/`auto` + `listening` kombinasyonunu config seviyesinde
+> REDDEDIYORDU ve frontend'in bunu kaydetmeden engellemesi isteniyordu.
+> **Bu kural artik YANLIS** — uc tipi baglantiyi KIMIN actigini, Operation
+> Mode ise cihazin modemini KAPATIP kapatmadigini soyler. Sabit IP'li bir
+> Horstmann Smart modda calisir.
+>
+> **Frontend'de yapilacak:** `session_policy=smart|auto` secildiginde
+> `ip_endpoint_type=initiating` ZORLAMASI KALDIRILMALI. Zorlama kalirsa
+> gecerli bir saha kurulumu (listening + smart) UI'dan girilemez.
+>
+> `master_ip_port` zorunlulugu **yalnizca `initiating`** icin gecerli
+> olmaya DEVAM EDER — o kisit degismedi.
+
+### `dial_in_interval_min` sozlesmesi (1.14.0)
+
+Bu alan **`smart_max_silence_sec`in yerine gecmez**, onun yaninda calisir:
+
+| Pencere | Gateway davranisi | comm_lost |
+|---|---|---|
+| beklenen rapordan ONCE | `state=smart_idle`, saglikli | ❌ |
+| rapor gecti, `max_silence` dolmadi | `report_late=true` (DEGRADED) | ❌ |
+| `max_silence` asildi | `state=lost` | ✅ tam bir kez |
+
+`late` bir DURUM DEGIL, mevcut durumun uzerine binen bir BAYRAKTIR;
+`state` `smart_idle` KALIR. Backend/SCADA tarafinda **alarm degil uyari**
+olarak ele alinmalidir — Dial-In gecikmesi cok sik iyi huyludur (hucresel
+tikaniklik, rapor saatinde kucuk kayma) ve `lost` sayilirsa gunluk sahte
+alarm uretir.
+
+`/health` -> `devices.late` ayri bir sayactir ve **toplama girmez**
+(bir cihaz ayni anda hem `smart_idle` hem `late` olabilir).
 
 `auto` semantigi: gateway rejimi cihazin **Master `Operation Mode`**
 noktasindan turetir. Backend'in ek bir sey yapmasi GEREKMEZ — yalnizca

@@ -28,6 +28,7 @@ from typing import Any
 
 from dnp3_gateway import __version__
 from dnp3_gateway.adapters import TelemetryReader, build_adapter
+from dnp3_gateway.adapters.dnp3_yadnp3_master import Yadnp3ShutdownError
 from dnp3_gateway.auth import GatewayIdentity, bootstrap_gateway_identity
 from dnp3_gateway.auth.instance_lock import acquire_instance_lock
 from dnp3_gateway.backend import (
@@ -1486,6 +1487,13 @@ def run(current_settings: Settings | None = None) -> int:
         # 2) Reader: DNP3 master/channel kapanir, TCP RST gonderir
         try:
             reader.close()
+        except Yadnp3ShutdownError as exc:
+            # FAIL-CLOSED: reader yikimi BILEREK yarida birakti (tanilama
+            # iscileri cikmadi). Bu kosul DEBUG'a gomulmemeli — genel
+            # `except` onu yutsaydi ihlal edilen degismez sessizce
+            # kaybolurdu. Kapanisin GERI KALANI yine de calisir: outbox
+            # ve publisher temiz kapanmali.
+            logger.error("reader_close_aborted reason=%s", exc)
         except Exception:  # noqa: BLE001
             logger.debug("reader_close_error", exc_info=True)
 

@@ -50,26 +50,21 @@ SINYALLER = [
 # --------------------------------------------------------------------------
 # Taklit native master — GERCEK _DeviceCache tasir
 # --------------------------------------------------------------------------
-class SahteMaster:
+class SahteMaster(mod._OturumDurumu):
     """`_ManagedMaster` taklidi. Cache GERCEK: durum makinesi gercekten kosar.
 
     Gateway KAYNAKLI DNP3 trafiginin tamami burada sayilir; "gateway susuyor"
     iddiasi ancak bu sayaclarla kanitlanabilir.
+
+    OTURUM ALANLARI ELLE YAZILMAZ: `_OturumDurumu` miras alinir ve
+    `_oturum_durumunu_kur` cagrilir. Eskiden bu alanlar burada kopyalaniyordu
+    ve gercek sinifa her yeni alan eklendiginde taklit sessizce sapiyordu.
     """
 
     def __init__(self, device: DeviceConfig, *, session_policy: str = "continuous") -> None:
         self.device = device
         self.cache = mod._DeviceCache()
-        # Gercek `_ManagedMaster` ile ayni yuzey: yapilandirilan politika ile
-        # ETKIN politika ayri (bkz. `auto`).
-        self.configured_session_policy = session_policy
-        self.session_policy = "smart" if session_policy in ("smart", "auto") else "continuous"
-        self.auto_pending = session_policy == "auto"
-        self.auto_connected_since = 0.0
-        self.auto_fallback = False
-        self.operation_mode = "unknown"
-        self.operation_mode_raw = None
-        self.operation_mode_seen_at = None
+        self._oturum_durumunu_kur(session_policy=session_policy, known_mode=None)
         self.scan_etkinlestirme_sayisi = 0
         self.cache.set_session_policy(self.session_policy)
         self.connection_fingerprint: tuple = ()
@@ -130,10 +125,11 @@ class Saha:
     def cihaz(self, code: str, **kw: Any) -> DeviceConfig:
         d = make_device(code)
         if kw:
-            # SOZLESME: `smart` YALNIZCA `initiating` uc ile gecerli. Test
-            # yardimcisi bunu otomatik saglar ki senaryolar sozlesmeye uygun
-            # bir cihazla kossun; kisitin KENDISI ayri testlerde olculur
-            # (GS04 / GS05).
+            # Bu dosyadaki senaryolar 1.12/1.13'te yazildi ve `initiating`
+            # ucu VARSAYIYOR. Uc tipi acikca verilmediginde onu koruyoruz ki
+            # bu testler ESKI davranisi olcmeye devam etsin (geriye donuk
+            # uyumluluk kaniti). 1.14.0 ile `listening` + `smart` ARTIK
+            # GECERLIDIR ve `test_listening_smart_lifecycle.py`de olculur.
             if kw.get("session_policy") == "smart" and "ip_endpoint_type" not in kw:
                 kw = {**kw, "ip_endpoint_type": "initiating", "master_ip_port": 20100}
             d = replace(d, **kw)

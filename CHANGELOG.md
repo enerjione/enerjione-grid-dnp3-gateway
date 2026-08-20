@@ -2,6 +2,260 @@
 
 Semver'a gore tutulur. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.14.0] - 2026-08-20
+
+**G-SMART-LISTEN-01** — Horstmann `listening` ucta Smart/Boost/Auto yasam
+dongusu + Dial-In farkindali saglik teshisi.
+
+**KOMUT DUZLEMI DEGISMEDI.** F1/F2/F3/F3C/F4/F5/F6/F7, DirectOperate, SBO,
+`/pending`, command freshness, `delivery_not_after`, idempotency,
+CommandLedger, response signature, command credential ve CROB dogrulamasi
+AYNEN duruyor. Uyuyan cihaz icin komut kuyruklama **EKLENMEDI** (bilincli
+non-goal): `reachable=false`, komut `offline` doner, fiziksel DNP3 islem
+sayisi **0**. Genel cikis (output) komut kapsami **GENISLETILMEDI**.
+
+### Fixed
+
+- **`listening` + Smart KOMBINASYONU CALISMIYORDU.** 1.13.0 bunu config
+  seviyesinde REDDEDIYORDU. Gerekce "Smart Mode'da baglantiyi cihaz
+  baslatir" idi ve bu **uc tipi ile modu birbirine karistiriyordu**:
+
+  ```
+  ip_endpoint_type  ->  TCP baglantisini KIM acar
+  operation mode    ->  cihaz modemini KAPATIR MI
+  ```
+
+  Ikisi ORTOGONALDIR. Sabit IP'li (ya da APN icinden erisilebilen) bir
+  Horstmann Smart modda calisir: modemini kapatir. Reddetmenin somut zarari
+  iki yonluydu — ya kurulum hic yapilamiyordu, ya da cihaz `continuous`
+  kosturulup gateway her tarama araliginda frame gonderiyor, cihazin 15
+  saniyelik hareketsizlik sayaci HIC dolmuyor ve modem HICBIR ZAMAN
+  kapanmiyordu. Yani ozelligin tamami calismiyordu.
+
+  Alti kombinasyonun **hepsi** artik destekleniyor:
+  `listening`/`initiating` x `boost`/`smart`/`auto`.
+
+- **`listening` + Smart'ta uyku `comm_lost` URETIYORDU.** Orada baglantiyi
+  gateway acar; cihaz uykudayken TCP baglantisi **kurulamaz**, dolayisiyla
+  `OnOpen`/`OnClose` HIC tetiklenmez ve `set_connected(False)` yolundan
+  `smart_idle`a girilemezdi. Cihaz `lost`ta kalir ve HER uyku doneminde
+  sahte comm_lost uretirdi. Giris artik okuma yolunda yapiliyor.
+
+  **Basarisiz TCP denemeleri tek basina comm_lost URETMEZ.** Bu bir muafiyet
+  degildir: hic gecerli temas yapmamis bir cihaz icin sessizlik sayaci
+  master'in kurulus anindan baslar, yani gercekten olu bir cihaz
+  `smart_max_silence_sec` dolunca yine `lost` olur.
+
+- **`enter_smart_idle` durum alanini yazmiyordu.** Icerideki mantik "uyuyor"
+  derken `/health` ve SCADA "kopuk" gorurdu.
+
+- **`auto` + `listening` hicbir zaman siniflandirilamiyordu.** `auto` sessiz
+  basladigi icin gateway hic sormuyor, `Operation Mode` noktasi HIC
+  okunmuyor ve cihaz 120sn sonra `continuous`a dusuyordu — Smart bir cihaz
+  icin yanlis sonuc. Artik `listening`te **oturum basina EN FAZLA BIR**
+  integrity poll gonderiliyor (baglanti kurulmus olmasi cihazin uyanik
+  oldugunun kanitidir). `initiating` yolu BILEREK dokunulmadi.
+
+- **`auto` fallback penceresi uykuda da ilerliyordu.** Sayac artik YALNIZCA
+  baglantili gecen sureyi sayiyor; aksi halde `auto` bir listening cihaz
+  hicbir zaman siniflandirilamadan `continuous`a duser ve tam da kacinilmak
+  istenen surekli trafigi uretirdi.
+
+### Added
+
+- **Dial-In farkindali saglik (`late`).** `dial_in_interval_min` (60..1440
+  dk) beklenen zamanlanmis rapor araligini tanimlar. Uc pencere ayri tutulur:
+
+  | Pencere | Durum | comm_lost |
+  |---|---|---|
+  | beklenen rapordan ONCE | `smart_idle` — saglikli | ❌ |
+  | rapor gecti, `max_silence` dolmadi | **LATE / DEGRADED** | ❌ |
+  | `max_silence` asildi | `lost` | ✅ tam bir kez |
+
+  `late` bir DURUM DEGIL, mevcut durumun uzerine binen bir BAYRAKTIR —
+  `state` `smart_idle` KALIR. Dial-In gecikmesi cok sik iyi huyludur
+  (hucresel tikaniklik, rapor saatinde kucuk kayma) ve `lost` sayilirsa
+  gunluk sahte alarm uretirdi. Alan verilmezse `late` HIC uretilmez.
+
+- **Aktif ag tanilama sondalari** (`dnp3_gateway/network_probe.py`): ICMP ve
+  TCP. Teshis zinciri:
+
+  ```
+  ip unreachable            -> modem / APN / yonlendirme
+  ip ok + tcp closed        -> dinleyici / guvenlik duvari / uygulama
+  tcp open + DNP3 kaniti yok -> protokol / oturum (adres, link katmani)
+  ```
+
+  > **HICBIR SONDA SONUCU `comm_lost` URETMEZ** ve hicbiri durum
+  > makinesinin girdisi DEGILDIR. ICMP saha aglarinda/APN'lerde sikca
+  > ENGELLIDIR ve Smart bir modem MESRU olarak uykudadir; "ping dusuyor ->
+  > cihaz oldu" kurali filonun yarisini sahte kopuk gosterirdi. Sondalar
+  > yalnizca cihaz `late` iken ve 300sn siklik siniriyla calisir. `ping`
+  > ikilisi yoksa sonuc `unsupported`tir ve bu bir ARIZA DEGILDIR.
+
+- **`smart_listen_reconnect_max_sec`** (5..600 sn) — `listening` kanalda
+  yeniden baglanma TAVANI. Verilmezse kutuphane varsayilani kullanilir:
+  `ChannelRetry.Default()` = min 1000ms / max 60000ms ustel (**olculdu**,
+  yadnp3 3.2.1.1), Horstmann'in ~600sn Socket Listening Timeout'u icinde
+  >=10 deneme uretir — Smart icin de yeterlidir. **Ikinci bir yeniden
+  baglanma dongusu KURULMADI**: opendnp3 kanali zaten deniyor, ikinci dongu
+  ayni sokete paralel SYN uretir ve iki zamanlayici birbirini yarisa sokar.
+
+- **`/health` yeni alanlari** (cihaz basina): `dial_in_interval_min`,
+  `next_expected_report_epoch`, `report_overdue_sec`, `report_late`,
+  `ip_probe_status`, `tcp_probe_status`, `last_probe_epoch`.
+  Filo ozetinde ve saglik basliginda yeni `late` sayaci — **toplama
+  GIRMEZ** (bir cihaz ayni anda hem `smart_idle` hem `late` olabilir;
+  eklenirse iki kez sayilir ve sahte `unknown` uretir).
+
+- `tests/test_listening_smart_lifecycle.py` — 24 test: listening x
+  boost/smart/auto, basarisiz TCP denemeleri, LATE gecisleri, tek comm_lost,
+  sonda izolasyonu, komsu izolasyonu, restart kaliciligi.
+
+### Changed
+
+- **Test sahteleri artik sapamiyor.** Oturum/politika calisma-zamani alanlari
+  `_OturumDurumu` mixin'inde TEK KAYNAKTA toplandi; `_ManagedMaster` ve
+  testlerdeki taklit master siniflari ayni yerden kuruluyor. Bu alanlar
+  eskiden testlerde ELLE tekrarlaniyordu ve her yeni alan eklendiginde
+  taklitler sessizce sapiyordu (`AttributeError` — ya da daha kotusu:
+  gercekte olmayan bir davranisi dogrulayan yesil test).
+
+- `docs/HORSTMANN_SMART_MODE.md`, `docs/FIELD_ACCEPTANCE.md` (listening
+  kabul testleri A..E), `docs/BACKEND_TODO.md` (B6.1 alan sozlesmesi) ve
+  deployment sozlesmesi guncellendi.
+
+### PR #32 review kapanisi
+
+Mimari kabul edildi; asagidaki maddeler merge oncesi kapatildi.
+
+- **BLOCKER — tanilama DNP3 okuma yolunu BLOKLAYAMAZ.** `_sonda_calistir`
+  ICMP'yi senkron cagiriyordu. Cihaz basina 300sn siklik siniri **suru
+  etkisini COZMEZ**: 200 cihaz ayni anda `late` olursa (APN kesintisi, saha
+  elektrigi) her biri ilk sondasini AYNI cycle'da hak eder ve senkron
+  cagrilar poll thread'inde SIRAYA girer:
+
+  ```
+  200 cihaz x ~2sn ICMP zaman asimi = ~400sn HICBIR CIHAZ OKUNAMAZ
+  ```
+
+  Yani tanilama, teshis etmeye calistigi kesintiyi GERCEK bir kesintiye
+  cevirirdi. Artik `network_probe.DiagnosticExecutor` uzerinden **sinirli
+  arka plan havuzunda** kosuyor: sinirli isci, sinirli kuyruk, cihaz basina
+  en fazla bir ucus, kuyruk dolunca is **dusurulur** (telemetri ASLA
+  beklemez), istisnalar izole, temiz kapanis. Saglik/durum kararlari
+  sondanin bitmesinden **bagimsizdir**.
+
+- **BLOCKER — cihazin DNP3 portuna RAKIP TCP baglantisi acilmiyor.**
+  `network_probe.tcp_probe` cihazin DNP3 portuna ham `socket.connect()`
+  aciyordu. Bu, PR'in ikinci reconnect scheduler kurmama gerekcesiyle
+  **AYNI hataydi**: uretim DNP3 kanaliyla yarisan ikinci bir TCP baglantisi.
+  Smart moddaki bir Horstmann yalnizca sinirli bir Socket Listening Timeout
+  penceresinde uyanik kalir; ham tanilama soketi yarisi KAZANIP once
+  baglanabilir, sonra hicbir DNP3 trafigi uretmeden kapanarak gercek
+  opendnp3 oturumunu ENGELLER. Olcum araci olctugu sistemi bozmus olur.
+
+  Fonksiyon **tamamen kaldirildi**. `tcp_probe_status` artik yadnp3
+  kanalinin kendi durumundan **PASIF** turetiliyor
+  (`IChannelListener.OnStateChange`): ek soket YOK, ek trafik YOK, yaris YOK.
+  Durum dizisi gercek soketle olculdu: `OPENING -> OPEN -> CLOSED ->
+  OPENING -> OPEN`. Kutuphane "reddedildi" ile "paket dustu" ayrimini
+  vermedigi icin o ayrim **uydurulmuyor** -> `unknown`.
+
+- **BLOCKER — `DiagnosticExecutor.shutdown()` iscileri GERCEKTEN durdurmuyordu.**
+  Iki ayri yoldan bozuktu:
+
+  **A) Dolu kuyrukta sinyal HIC ULASMIYORDU.** `put_nowait(None)` kuyruk
+  doluyken `queue.Full` firlatiyor, bu yutuluyordu ve isci sinyali hic
+  almadan `queue.get()`te **sonsuza kadar** bekleyebiliyordu.
+
+  **B) Sinyaller MEVCUT ISLERIN ARKASINDA kaliyordu.** Basariyla eklense
+  bile 2 isci + 64 kuyruk + ~2sn/is ile isciler **yaklasik bir dakika**
+  daha calisabilirken `join(timeout=5)` cok once donuyordu. Yani "tanilama
+  master'lardan once kapanir" garantisi **fiilen yoktu** ve kuyruktaki
+  kapanmalar (`mm.ip_probe`, `mm.sonda_son_wall`, `mm.kanal_durumu()`)
+  yikilmakta olan master nesnelerine dokunabiliyordu.
+
+  Yeni semantik — **iptal et, sonra bekle**: yeni `submit` derhal reddedilir,
+  kuyrukta bekleyen isler **iptal edilir** (bu ayni zamanda sinyale yer
+  acar), isci basina bir sinyal **guvenilir** yerlestirilir, yalnizca o an
+  **calisan** isler biter, **tum** thread'ler cikana kadar beklenir. Isciler
+  ayrica `_kapali` bayragini kontrol eder — yarista kapilmis bir is de
+  calistirilmaz.
+
+  `shutdown()` artik `bool` doner ve `close()` `False` durumunu **ERROR**
+  loglar; sessizce master yikimina devam edilmez. `daemon=True` bir
+  mekanizma olarak KULLANILMIYOR.
+
+  Yeni sayac `cancelled_total` (kapanista iptal) `dropped_total`dan
+  (kuyruk doygunlugu) **ayri** tutulur — karistirilirlarsa operator yanlis
+  yere bakar.
+
+- **Kapanis artik FAIL-CLOSED.** `shutdown()` `False` donuyordu ama `close()`
+  yalnizca ERROR loglayip **master/kanal yikimina devam ediyordu** — yani
+  ihlal edilen degismezi bir log satirina indirgeyip use-after-free yarisini
+  fiilen KABUL ediyordu.
+
+  Artik yikim **iptal edilir** ve `Yadnp3ShutdownError` firlatilir. Yarida
+  birakmanin maliyeti daha dusuktur: proses zaten kapaniyor ve soketleri
+  isletim sistemi kapatir. `shutdown()` kendisi patlarsa da fail-closed
+  davranilir — kapanisin basarili oldugu VARSAYILAMAZ.
+
+  Oturum durumu (`session_store.flush`) bu kapidan **once** diske yazilir;
+  boylece yarida kalan bir kapanis restart'ta tam olarak onlemeye
+  calistigimiz comm_lost firtinasini uretmez.
+
+  `Yadnp3ShutdownError`, `Yadnp3AdapterError`den turer (mevcut genis
+  `except` bloklari kirilmaz). `main` kapanis yolunda **ayri** yakalanip
+  ERROR loglanir: oradaki genel `except ... logger.debug` onu DEBUG'a
+  gomer ve kosul fiilen sessizce kaybolurdu.
+
+- **Saha kabulu trafik beklentisi duzeltildi.** `gateway -> cihaz 0 bayt`
+  olcutu `listening` icin **YANLISTI** ve saglikli bir kurulumu FAIL
+  gosterirdi: orada baglantiyi gateway acar ve cihaz uyurken `ChannelRetry`
+  SYN gondermeye DEVAM EDER — cihazin uyandigini boyle fark ederiz; SYN
+  sayisi 0 ise cihaz uyandiginda **hic yakalanamaz**. Bir SYN uygulama yuku
+  tasimaz ve cihazin 15sn'lik DNP3 hareketsizlik sayacini sifirlamaz.
+
+  Yeni gecer olcutu: **DNP3 uygulama yuku = 0** (periyodik Class 1/2/3 yok,
+  Class 0/integrity yok, keepalive yok). `scripts/field_capture.sh` artik
+  iki sayiyi AYRI raporluyor ve `--endpoint listening|initiating` aliyor.
+  `greater 1` filtresi terk edildi — paketin TOPLAM uzunlugunu olctugu icin
+  bir SYN (~60 byte) ondan GECIYORDU.
+
+- **Opsiyonel tamsayi ayristirmasi sertlestirildi.** `int(60.9)` sessizce
+  `60` veriyordu — "anladim" deyip YANLIS olmak. `exact_int` kesirli degeri
+  **kirpmaz**: `60`, `"60"`, `60.0` kabul; `60.9`, `nan`, `inf` ve `bool`
+  reddedilir + WARNING. (`bool` acikca reddedilir: `isinstance(True, int)`
+  dogru oldugu icin sessizce `1` olurdu.) Ayni kural **disk onbellegi**
+  yolunda da uygulanir — o yol backend parser'ini ATLAR.
+
+- **`smart_listen_probe_interval_sec` -> `smart_listen_reconnect_max_sec`.**
+  Ad YANILTICIYDI: alan bir ICMP/TCP tanilama **sondasi** araligi degil,
+  yadnp3 `ChannelRetry` **yeniden baglanma tavanidir** — ve ayni surum
+  gercek ag sondalari da getirdigi icin karisiklik kacinilmazdi. Alan
+  hicbir zaman yayina cikmadigi icin **geriye uyum takma adi YOK**.
+
+### Backend / Frontend etkisi
+
+> **FRONTEND'DE YAPILACAK:** `session_policy=smart|auto` secildiginde
+> `ip_endpoint_type=initiating` **ZORLAMASI KALDIRILMALI**. 1.13.0 bu
+> zorlamayi istiyordu; kural artik yanlis ve zorlama kalirsa gecerli bir
+> saha kurulumu (listening + smart) UI'dan girilemez.
+>
+> `master_ip_port` zorunlulugu **yalnizca `initiating`** icin gecerli olmaya
+> DEVAM EDER.
+
+Backend iki yeni opsiyonel cihaz alanini iletmelidir:
+`dial_in_interval_min`, `smart_listen_reconnect_max_sec`. Ikisi de
+opsiyoneldir; eksik olmalari ARIZA DEGILDIR.
+
+### Saha kabulu
+
+Fiziksel Horstmann ile dogrulama **YAPILMADI**. `docs/FIELD_ACCEPTANCE.md`
+bolum 3F (A..E) listening yolunun kabul adimlarini tanimlar; hicbiri PASS
+isaretli DEGILDIR.
+
 ## [1.13.0] - 2026-08-20
 
 Uretim hazirlik paketi: **G-INIT-02** (initiating uc agi + fail-closed
@@ -295,7 +549,7 @@ alanlari gordugunde parse etmeyi surdurur ve `continuous` davranisini korur —
 - **Komut kuyruklama** (uyuyan cihazin komutunu bir sonraki uyanmada
   calistirma). Ayri gorev.
 
-## [1.11.4] - 2026-08-18## [1.11.4] - 2026-08-18
+## [1.11.4] - 2026-08-18
 
 Gateway uretim kapanis surumu. **Tek gercek kod degisikligi ClockGuard
 soguk-acilis fail-safe'i**; geri kalani stale dokumantasyon ve deployment
