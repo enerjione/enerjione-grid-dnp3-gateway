@@ -394,7 +394,20 @@ Backend tanimadigi anahtarlari `raw_json`e yaziyor; **migration gerekmez.**
 | `session_policy` | string | `continuous` (varsayilan) \| `smart` \| **`auto`** |
 | `smart_max_silence_sec` | int \| null | 60..2592000 (bkz. B5) |
 | `dial_in_interval_min` | int \| null | **YENI (1.14.0)** — beklenen zamanlanmis rapor araligi, `60..1440` dk. `null` = `late` uyarisi KAPALI. |
-| `smart_listen_probe_interval_sec` | int \| null | **YENI (1.14.0)** — `listening` kanalda yeniden baglanma TAVANI, `5..600` sn. `null` = kutuphane varsayilani (1sn→60sn ustel). |
+| `smart_listen_reconnect_max_sec` | int \| null | **YENI (1.14.0)** — `listening` kanalda yeniden baglanma TAVANI, `5..600` sn. `null` = kutuphane varsayilani (1sn→60sn ustel). |
+
+> **ALAN ADI DEGISTI (yayina cikmadan).** Taslakta `smart_listen_probe_interval_sec`
+> idi. Ad YANILTICIYDI: bu alan bir ICMP/TCP tanilama **sondasi** araligi
+> DEGIL, yadnp3 `ChannelRetry` **yeniden baglanma tavanidir** — ve ayni
+> surum gercek ag sondalari da getirdigi icin karisiklik kacinilmazdi.
+> **Geriye uyum takma adi YOK**: alan hicbir zaman yayina cikmadi.
+
+> **TAM TAMSAYI SEMANTIGI (her iki yeni alan icin).** Kesirli deger
+> SESSIZCE KIRPILMAZ. `60` ve `"60"` gecerli, `60.0` gecerli, ama
+> **`60.9` GECERSIZDIR** ve WARNING ile yok sayilir. Eski `int()`
+> davranisi `60.9`u sessizce `60` yapardi — yani "anladim" deyip
+> YANLIS olabilirdi. `bool` de reddedilir (`isinstance(True, int)`
+> dogru oldugu icin sessizce `1` olurdu).
 
 **KISIT KALDIRILDI (1.14.0):** `session_policy` ile `ip_endpoint_type`
 **BAGIMSIZDIR**; alti kombinasyonun hepsi gecerlidir.

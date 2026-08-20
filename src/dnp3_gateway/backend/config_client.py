@@ -139,7 +139,7 @@ class DeviceConfig:
     #: YETERLIDIR. Deger verilirse yalnizca TAVAN daraltilir; IKINCI bir
     #: yeniden baglanma dongusu KURULMAZ.
     #: Kabul araligi: 5..600 saniye.
-    smart_listen_probe_interval_sec: int | None = None
+    smart_listen_reconnect_max_sec: int | None = None
 
     #: `session_policy="smart"` iken: cihaz bu kadar saniye HIC gecerli DNP3
     #: kaniti gondermezse `smart_idle` durumundan `lost`a dusurulur ve mevcut
@@ -503,8 +503,56 @@ DIAL_IN_INTERVAL_MIN_MAX = 1440
 #: Alt sinir 5: daha sik denemek uyuyan bir modeme gereksiz radyo yuku
 #: bindirir. Ust sinir 600: Horstmann'in tipik Socket Listening Timeout'u;
 #: daha buyuk bir tavan uyanik pencereyi tamamen KACIRABILIR.
-SMART_LISTEN_PROBE_MIN_SEC = 5
-SMART_LISTEN_PROBE_MAX_SEC = 600
+SMART_LISTEN_RECONNECT_MIN_SEC = 5
+SMART_LISTEN_RECONNECT_MAX_SEC = 600
+
+
+def exact_int(ham: Any) -> int | None:
+    """TAM tamsayi ayristirmasi; kesirli deger KIRPILMAZ, `None` doner.
+
+    NEDEN `int()` YETMEZ — SESSIZ KIRPMA
+    ------------------------------------
+    `int(60.9)` sessizce `60` verir. Bir operator `dial_in_interval_min`i
+    `60.9` girdiginde niyeti belirsizdir; onu 60'a kirpmak "anladim" demektir
+    ve YANLIS olabilir. `normalize_operation_mode` ile AYNI ilke: binary ya
+    da tamsayi bir alandan gelen ara deger, yorumlanacak bir sey degil
+    ANLASILAMAYAN bir sinyaldir. Cagiran taraf `None` gorup yok sayar ve
+    uyarir — sessizce yanlis bir degerle calismaktansa alani hic
+    kullanmamak dogrudur.
+
+    KABUL EDILENLER            REDDEDILENLER
+      60      (int)              60.9   (kesirli)
+      "60"    (metin)            "60.9" (kesirli metin)
+      60.0    (tam degerli)      nan / inf
+      "  60 " (bosluklu)         True / False (bool)
+                                 "", None, "altmis"
+
+    `bool` ACIKCA reddedilir: Python'da `isinstance(True, int)` DOGRUDUR ve
+    `True` sessizce `1` olurdu. Tamsayi bekleyen bir alana bool gelmesi
+    yapilandirma hatasidir, degeri degil.
+    """
+    if isinstance(ham, bool):
+        return None
+    if isinstance(ham, int):
+        return ham
+    if isinstance(ham, float):
+        # SONLULUK ONCE: `int(nan)` ValueError, `int(inf)` OverflowError
+        # firlatir — esitlik testinden ONCE elenmeleri sart.
+        return int(ham) if math.isfinite(ham) and ham == int(ham) else None
+    if isinstance(ham, str):
+        s = ham.strip()
+        if not s:
+            return None
+        try:
+            return int(s)
+        except ValueError:
+            pass
+        try:
+            f = float(s)  # "60.0" gibi tam degerli metinler icin
+        except ValueError:
+            return None
+        return int(f) if math.isfinite(f) and f == int(f) else None
+    return None
 
 
 def _parse_optional_int(item: dict[str, Any], alan: str, *, lo: int, hi: int) -> int | None:
@@ -517,9 +565,8 @@ def _parse_optional_int(item: dict[str, Any], alan: str, *, lo: int, hi: int) ->
     ham = item.get(alan)
     if ham is None or ham == "":
         return None
-    try:
-        n = int(ham)
-    except (TypeError, ValueError):
+    n = exact_int(ham)
+    if n is None:
         logger.warning("config_%s_invalid code=%r received=%r — yok sayildi", alan, item.get("code"), ham)
         return None
     if not (lo <= n <= hi):
@@ -1672,11 +1719,11 @@ def _parse_gateway_config(
                         lo=DIAL_IN_INTERVAL_MIN_MIN,
                         hi=DIAL_IN_INTERVAL_MIN_MAX,
                     ),
-                    smart_listen_probe_interval_sec=_parse_optional_int(
+                    smart_listen_reconnect_max_sec=_parse_optional_int(
                         item,
-                        "smart_listen_probe_interval_sec",
-                        lo=SMART_LISTEN_PROBE_MIN_SEC,
-                        hi=SMART_LISTEN_PROBE_MAX_SEC,
+                        "smart_listen_reconnect_max_sec",
+                        lo=SMART_LISTEN_RECONNECT_MIN_SEC,
+                        hi=SMART_LISTEN_RECONNECT_MAX_SEC,
                     ),
                 )
             )

@@ -138,7 +138,7 @@
       "session_policy",
       "smart_max_silence_sec",
       "dial_in_interval_min",
-      "smart_listen_probe_interval_sec"
+      "smart_listen_reconnect_max_sec"
     ],
     "session_policy_values": [
       "continuous",
@@ -177,7 +177,7 @@
     "env_smart_max_silence_accepted": "0 | 60..2592000",
     "env_smart_max_silence_invalid_behavior": "fail_closed: 1..59 ve 2592000 ustu boot'ta config hatasi uretir (ConfigError).",
     "session_policy_auto_semantics": "auto: rejim cihazin MASTER 'Operation Mode' noktasindan CALISMA ANINDA turetilir (Smart -> etkin smart, Boost -> etkin continuous). Mod gozlenene kadar gateway SESSIZ kalir (tarama yok, acilis integrity yok) — Smart bir cihazin 15sn idle sayacini bozmamak icin. Satellite Operation Mode ve Boost Mode Enabled bu karara KATILMAZ.",
-    "session_policy_auto_fallback": "continuous_after_window: mod BAGLANTILI gecen 120 saniyede gozlenemezse GUVENLI TARAFA continuous uygulanir (veri dogrulugu > pil tasarrufu), WARNING loglanir ve /health auto_fallback=true gosterir. 1.14.0: sayac YALNIZCA baglantili sureyi sayar; uykuda gecen zaman pencereyi DOLDURMAZ � aksi halde auto bir listening cihaz hicbir zaman siniflandirilamadan continuous'a duser ve tam da kacinilmak istenen surekli trafigi uretirdi.",
+    "session_policy_auto_fallback": "continuous_after_window: mod BAGLANTILI gecen 120 saniyede gozlenemezse GUVENLI TARAFA continuous uygulanir (veri dogrulugu > pil tasarrufu), WARNING loglanir ve /health auto_fallback=true gosterir. 1.14.0: sayac YALNIZCA baglantili sureyi sayar; uykuda gecen zaman pencereyi DOLDURMAZ - aksi halde auto bir listening cihaz hicbir zaman siniflandirilamadan continuous'a duser ve tam da kacinilmak istenen surekli trafigi uretirdi.",
     "operation_mode_source": "master_operation_mode_signal",
     "operation_mode_signal_match": "semantic: data_type=binary AND dnp3_object_group=1 AND key son bileseni 'operation_mode' AND source master/polemaster. DNP3 index SABITLENMEZ (SN2.0 G1/15, Pole Master farkli).",
     "operation_mode_value_mapping": "1=smart, 0=boost. Dokumandaki 0x01/0x81 DEGER DEGIL tam DNP3 bayrak oktetidir; 0x80 biti STATE (=degerin kendisi). 0x81 -> deger 1 -> Smart.",
@@ -190,15 +190,9 @@
     "late_counted_as_lost": false,
     "late_in_total": false,
     "late_in_total_rationale": "Bir cihaz ayni anda hem smart_idle hem late olabilir; toplama eklenirse iki kez sayilir ve sahte unknown uretir. late bir DURUM degil, mevcut durumun uzerine binen BAYRAKTIR.",
-    "smart_listen_probe_interval_sec_range": "5..600",
-    "smart_listen_probe_interval_sec_default": null,
-    "smart_listen_probe_semantics": "listening kanalda ChannelRetry maxOpenRetry TAVANI. Taban 1sn'de kalir. null/eksik = kutuphane varsayilani (ChannelRetry.Default(): min 1000ms, max 60000ms ustel) � OLCULDU, yadnp3 3.2.1.1. Horstmann'in ~600sn Socket Listening Timeout'u icinde >=10 deneme uretir, dolayisiyla Smart icin de YETERLIDIR. IKINCI BIR YENIDEN BAGLANMA DONGUSU KURULMAZ: opendnp3 kanali zaten deniyor, ikinci dongu ayni sokete paralel SYN uretir ve iki zamanlayici birbirini yarisa sokar.",
-    "active_probes": [
-      "icmp_probe",
-      "tcp_probe"
-    ],
+    "smart_listen_reconnect_max_sec_default": null,
     "active_probes_affect_state": false,
-    "active_probes_semantics": "SALT TESHIS. HICBIR SONDA SONUCU comm_lost URETMEZ ve hicbiri durum makinesinin girdisi DEGILDIR. ICMP saha aglarinda/APN'lerde sikca ENGELLIDIR ve Smart bir modem MESRU olarak uykudadir � 'ping dusuyor -> cihaz oldu' kurali filonun yarisini sahte kopuk gosterirdi. Sondalar yalnizca cihaz late iken ve 300sn siklik siniriyla calisir. Teshis zinciri: ip unreachable -> modem/APN; ip ok + tcp closed -> dinleyici/guvenlik duvari; tcp open + DNP3 kaniti yok -> protokol/oturum. ping ikilisi yoksa sonuc 'unsupported'tir ve bu bir ARIZA DEGILDIR.",
+    "active_probes_semantics": "SALT TESHIS. HICBIR TANILAMA CIKTISI comm_lost URETMEZ ve hicbiri durum makinesinin girdisi DEGILDIR. ICMP saha aglarinda/APN'lerde sikca ENGELLIDIR ve Smart bir modem MESRU olarak uykudadir; 'ping dusuyor -> cihaz oldu' kurali filonun yarisini sahte kopuk gosterirdi. AKTIF olan TEK sonda ICMP'dir ve ARKA PLANDA kosar (bkz. diagnostics_execution). TCP durumu OLCULMEZ, yadnp3 kanal durumundan PASIF turetilir (bkz. tcp_probe_status_source). Tanilama yalnizca cihaz late iken ve 300sn siklik siniriyla tetiklenir. Teshis zinciri: ip unreachable -> modem/APN; ip ok + kanal hic acilmiyor -> dinleyici/guvenlik duvari/uyku; kanal OPEN + DNP3 kaniti yok -> protokol/oturum. ping ikilisi yoksa sonuc 'unsupported'tir ve bu bir ARIZA DEGILDIR.",
     "health_device_fields_added_1_14_0": [
       "dial_in_interval_min",
       "next_expected_report_epoch",
@@ -208,7 +202,28 @@
       "tcp_probe_status",
       "last_probe_epoch"
     ],
-    "auto_listening_classification": "one_shot_integrity_poll_per_session: auto + mod bilinmiyor + uc listening iken, baglanti kuruldugunda OTURUM BASINA EN FAZLA BIR integrity poll gonderilir. Gerekce: auto sessiz basladigi icin gateway hic sormazsa Operation Mode noktasi HIC okunmaz, mod ogrenilemez ve cihaz 120sn sonra continuous'a duser � Smart bir cihaz icin YANLIS SONUC. listening'te baglanti kurulmus olmasi cihazin UYANIK oldugunun kanitidir; tek poll 15sn'lik sayaci BIR KEZ sifirlar, sonra gateway susar. INITIATING BILEREK DISARIDA: orada 1.13.0'da dogrulanmis davranis AYNEN korunur."
+    "auto_listening_classification": "one_shot_integrity_poll_per_session: auto + mod bilinmiyor + uc listening iken, baglanti kuruldugunda OTURUM BASINA EN FAZLA BIR integrity poll gonderilir. Gerekce: auto sessiz basladigi icin gateway hic sormazsa Operation Mode noktasi HIC okunmaz, mod ogrenilemez ve cihaz 120sn sonra continuous'a duser - Smart bir cihaz icin YANLIS SONUC. listening'te baglanti kurulmus olmasi cihazin UYANIK oldugunun kanitidir; tek poll 15sn'lik sayaci BIR KEZ sifirlar, sonra gateway susar. INITIATING BILEREK DISARIDA: orada 1.13.0'da dogrulanmis davranis AYNEN korunur.",
+    "smart_listen_reconnect_max_sec_range": "5..600",
+    "smart_listen_reconnect_semantics": "listening kanalda ChannelRetry maxOpenRetry TAVANI. Taban 1sn'de kalir. null/eksik = kutuphane varsayilani (ChannelRetry.Default(): min 1000ms, max 60000ms ustel) - OLCULDU, yadnp3 3.2.1.1. Horstmann'in ~600sn Socket Listening Timeout'u icinde >=10 deneme uretir, dolayisiyla Smart icin de YETERLIDIR. IKINCI BIR YENIDEN BAGLANMA DONGUSU KURULMAZ: opendnp3 kanali zaten deniyor, ikinci dongu ayni sokete paralel SYN uretir ve iki zamanlayici birbirini yarisa sokar. ADLANDIRMA: 1.14.0 oncesi taslakta `smart_listen_probe_interval_sec` idi; bu alan bir ICMP/TCP tanilama sondasi araligi DEGIL, yeniden baglanma tavanidir ve ad yayina CIKMADAN duzeltildi (geriye uyum takma adi YOK).",
+    "active_probes": [
+      "icmp_probe"
+    ],
+    "raw_tcp_probe_removed": true,
+    "raw_tcp_probe_removed_rationale": "Cihazin DNP3 portuna tanilama amacli ham socket.connect() ACILMAZ. Bu, uretim DNP3 kanaliyla YARISAN ikinci bir TCP baglantisidir ve PR'in ikinci reconnect scheduler kurmama gerekcesiyle AYNI hatadir. Smart moddaki bir Horstmann yalnizca sinirli bir Socket Listening Timeout penceresinde uyanik kalir; ham tanilama soketi yarisi kazanip once baglanabilir, sonra hicbir DNP3 trafigi uretmeden kapanarak gercek opendnp3 oturumunu engeller.",
+    "tcp_probe_status_source": "yadnp3_channel_state",
+    "tcp_probe_status_values": [
+      "open",
+      "connecting",
+      "unknown"
+    ],
+    "tcp_probe_status_semantics": "IChannelListener.OnStateChange uzerinden PASIF olarak turetilir; ek soket ve ek trafik YOK. OPEN->open, OPENING->connecting (deneniyor, ARIZA DEGIL), CLOSED/SHUTDOWN/gozlenmedi->unknown. Kutuphane 'reddedildi' ile 'paket dustu' ayrimini VERMEZ ve o ayrim UYDURULMAZ.",
+    "diagnostics_block_read_path": false,
+    "diagnostics_execution": "bounded_async_executor: ICMP alt surec baslatir ve saniyelerce bloklayabilir; poll/okuma yolundan DOGRUDAN cagrilmaz. Cihaz basina 300sn siklik siniri TEK BASINA YETMEZ - 200 cihaz ayni anda late olursa senkron cagrilar poll thread'inde siraya girer (200 x ~2sn = ~400sn hicbir cihaz okunamaz) ve tanilama, teshis etmeye calistigi kesintiyi GERCEK kesintiye cevirir. Garantiler: sinirli isci, sinirli kuyruk, cihaz basina en fazla bir ucus, kuyruk dolunca is DUSURULUR (telemetri ASLA beklemez), istisnalar izole, temiz kapanis. Saglik/durum kararlari sondanin bitmesinden BAGIMSIZDIR; /health son bilinen degeri doner.",
+    "diagnostics_probe_min_interval_sec": 300,
+    "diagnostics_probe_trigger": "device_late_only",
+    "sleep_traffic_expectation": "listening ucta uyku sirasinda TCP SYN / yeniden baglanma denemeleri BEKLENIR ve GEREKLIDIR (cihazin uyandigi boyle fark edilir; SYN sayisi 0 ise cihaz uyandiginda yakalanamaz). SIFIR OLMASI GEREKEN sey DNP3 UYGULAMA YUKUDUR: periyodik Class 1/2/3 scan YOK, Class 0/integrity scan YOK, DNP3 keepalive/uygulama istegi YOK. 'gateway -> cihaz 0 paket' olcutu listening icin YANLISTIR ve saglikli bir kurulumu FAIL gosterir.",
+    "sleep_traffic_pass_criterion": "dnp3_application_payload_packets == 0",
+    "optional_int_parsing": "exact_integer: kesirli deger SESSIZCE KIRPILMAZ. int(60.9)->60 davranisi kaldirildi; 60.9 gecersizdir ve WARNING ile yok sayilir. Kabul: 60, '60', 60.0, '60.0', bosluklu metin. Red: kesirli degerler, nan/inf, bool (isinstance(True,int) DOGRU oldugu icin sessizce 1 olurdu), ayristirilamayan girdiler. Ayni kural DISK ONBELLEGI yolunda da uygulanir - o yol backend parser'ini ATLAR."
   },
   "initiating_endpoint": {
     "why": "ip_endpoint_type=initiating cihazlarda baglantiyi CIHAZ baslatir. Gateway container ICINDE cihazin master_ip_port degerini dinler; bridge ag modunda o port host'a acilmazsa cihaz baglanamaz.",

@@ -629,7 +629,7 @@ def test_deployment_contract_smart_session_alanlari_kodla_uyumlu() -> None:
         "session_policy",
         "smart_max_silence_sec",
         "dial_in_interval_min",
-        "smart_listen_probe_interval_sec",
+        "smart_listen_reconnect_max_sec",
     ]
     assert smart["smart_max_silence_min"] == _SMART_SILENCE_MIN_SEC
     assert smart["smart_max_silence_max"] == _SMART_SILENCE_MAX_SEC
@@ -654,14 +654,33 @@ def test_deployment_contract_1_14_0_alanlari() -> None:
 
     assert smart["dial_in_interval_min_range"] == "60..1440"
     assert smart["dial_in_interval_min_default"] is None
-    assert smart["smart_listen_probe_interval_sec_range"] == "5..600"
+    assert smart["smart_listen_reconnect_max_sec_range"] == "5..600"
 
-    # EN KRITIK IKI SOZLESME MADDESI — bunlar bozulursa saha davranisi
+    # EN KRITIK SOZLESME MADDELERI — bunlar bozulursa saha davranisi
     # sessizce tersine doner.
     assert smart["late_is_state"] is False
     assert smart["late_counted_as_lost"] is False
     assert smart["late_in_total"] is False
     assert smart["active_probes_affect_state"] is False
+
+    # --- Tanilama sozlesmesi (PR #32 review madde 1 + 2) ---------------
+    # Tanilama DNP3 okuma yolunu BLOKLAYAMAZ ve cihazin DNP3 portuna ham
+    # soket ACILMAZ. Ikisi de sessizce geri gelebilecek turden hatalar.
+    assert smart["diagnostics_block_read_path"] is False
+    assert smart["raw_tcp_probe_removed"] is True
+    assert smart["active_probes"] == ["icmp_probe"], "TCP sondasi sozlesmeye geri gelmis"
+    assert smart["tcp_probe_status_source"] == "yadnp3_channel_state"
+    assert smart["tcp_probe_status_values"] == ["open", "connecting", "unknown"]
+    assert "bounded_async_executor" in smart["diagnostics_execution"]
+    assert smart["diagnostics_probe_trigger"] == "device_late_only"
+
+    # --- Saha kabulu trafik beklentisi (review madde 3) ----------------
+    # "0 paket" olcutu `listening` icin YANLISTIR: uykuda SYN denemeleri
+    # BEKLENIR. Sifir olmasi gereken sey DNP3 UYGULAMA YUKUDUR.
+    assert smart["sleep_traffic_pass_criterion"] == "dnp3_application_payload_packets == 0"
+
+    # --- Tam tamsayi ayristirmasi (review madde 4) ---------------------
+    assert smart["optional_int_parsing"].startswith("exact_integer")
 
     assert "late" in smart["health_device_counters"]
     for alan in (

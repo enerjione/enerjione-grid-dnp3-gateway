@@ -31,6 +31,9 @@ BU DOSYANIN OLCTUGU SOZLESME
 
 from __future__ import annotations
 
+import inspect
+import threading
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -40,6 +43,7 @@ import pytest
 from dnp3_gateway import network_probe
 from dnp3_gateway.adapters import dnp3_yadnp3_master as mod
 from dnp3_gateway.backend import DeviceConfig
+from dnp3_gateway.backend.config_client import _parse_optional_int, exact_int
 from dnp3_gateway.operation_mode import MODE_BOOST, MODE_SMART
 
 from .conftest import make_device, make_signal
@@ -126,8 +130,44 @@ class ListeningSaha:
         self.masterlar[code].olusturuldu_wall -= saniye
 
 
+def _make_bos_soe(opendnp3: Any) -> Any:
+    class _S(opendnp3.ISOEHandler):
+        def __init__(self) -> None:
+            super().__init__()
+
+    return _S()
+
+
+def _make_bos_app(opendnp3: Any) -> Any:
+    class _A(opendnp3.IMasterApplication):
+        def __init__(self) -> None:
+            super().__init__()
+
+    return _A()
+
+
+def _yurutucu_bosalt(reader: Any, *, timeout: float = 10.0) -> None:
+    """Arka plan tanilama kuyrugu bosalana kadar bekle (YALNIZCA TEST).
+
+    Uretimde kimse beklemez — saglik kararlari sondanin bitmesinden
+    BAGIMSIZDIR. Testin sonucu gorebilmesi icin senkronizasyon gerekiyor.
+    """
+    yur = reader._tanilama_yurutucu
+    if yur is None:
+        return
+    son = time.monotonic() + timeout
+    while time.monotonic() < son:
+        ist = yur.stats()
+        if ist["queued"] == 0 and ist["in_flight"] == 0:
+            return
+        time.sleep(0.02)
+
+
 def _reader(tmp_path: Path, **kw: Any) -> Any:
     r = mod.Yadnp3TelemetryReader.__new__(mod.Yadnp3TelemetryReader)
+    # Tanilama havuzu VARSAYILAN OLARAK KAPALI: birim testleri gercek `ping`
+    # alt sureci baslatmasin. Sonda testleri acikca `diagnostics=True` verir.
+    kw.setdefault("diagnostics", False)
     r._init_runtime_state(session_store_path=str(tmp_path / "session_state.json"), **kw)
     r._scan_interval_sec = 5
     r._baseline_interval_sec = 30
@@ -509,30 +549,31 @@ def test_l19_icmp_basarisizligi_tek_basina_comm_lost_uretmez(
     ICMP saha aglarinda/APN'lerde sikca ENGELLIDIR ve Smart bir modem MESRU
     olarak uykudadir. Ping'e cevap vermemek BEKLENEN davranistir.
     """
-    r = _reader(tmp_path)
+    r = _reader(tmp_path, diagnostics=True)
     s = ListeningSaha(r)
     monkeypatch.setattr(r, "_ensure_master", lambda d, sig=None: s._ensure(d))
     monkeypatch.setattr(network_probe, "icmp_probe", lambda host, **kw: network_probe.IP_UNREACHABLE)
-    monkeypatch.setattr(network_probe, "tcp_probe", lambda host, port, **kw: network_probe.TCP_TIMEOUT)
 
     d = s.cihaz("PROBE-1", session_policy="smart", smart_max_silence_sec=86400, dial_in_interval_min=60)
     s.gateway_bagladi("PROBE-1")
     s.dnp3_kaniti("PROBE-1")
     s.oku_ve_onayla(d)
     s.uyudu("PROBE-1")
-    s.yaslandir("PROBE-1", 5400)  # LATE -> sonda calisir
+    s.yaslandir("PROBE-1", 5400)  # LATE -> sonda kuyruklanir
     s.oku_ve_onayla(d)
+    _yurutucu_bosalt(r)
 
     saglik = r.device_health()["PROBE-1"]
     assert saglik["ip_probe_status"] == network_probe.IP_UNREACHABLE
-    assert saglik["tcp_probe_status"] == network_probe.TCP_TIMEOUT
     assert saglik["state"] == "smart_idle", "sonda sonucu comm_lost uretti"
+    assert saglik["report_late"] is True
     assert saglik["last_probe_epoch"] is not None
+    r.close()
 
 
 def test_l20_sonda_yalnizca_gecikmisken_calisir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Normal uykuda ping/TCP denemesi gereksiz trafik ve gurultudur."""
-    r = _reader(tmp_path)
+    """Normal uykuda ping gereksiz trafik ve gurultudur."""
+    r = _reader(tmp_path, diagnostics=True)
     s = ListeningSaha(r)
     monkeypatch.setattr(r, "_ensure_master", lambda d, sig=None: s._ensure(d))
     sayac = {"n": 0}
@@ -542,7 +583,6 @@ def test_l20_sonda_yalnizca_gecikmisken_calisir(tmp_path: Path, monkeypatch: pyt
         return network_probe.IP_REACHABLE
 
     monkeypatch.setattr(network_probe, "icmp_probe", _say)
-    monkeypatch.setattr(network_probe, "tcp_probe", lambda host, port, **kw: network_probe.TCP_OPEN)
 
     d = s.cihaz("PROBE-2", session_policy="smart", smart_max_silence_sec=86400, dial_in_interval_min=60)
     s.gateway_bagladi("PROBE-2")
@@ -551,13 +591,16 @@ def test_l20_sonda_yalnizca_gecikmisken_calisir(tmp_path: Path, monkeypatch: pyt
     s.uyudu("PROBE-2")
     for _ in range(10):
         s.oku_ve_onayla(d)
+    _yurutucu_bosalt(r)
     assert sayac["n"] == 0, "rapor penceresi icindeyken sonda calisti"
 
     s.yaslandir("PROBE-2", 5400)
     for _ in range(10):
         s.oku_ve_onayla(d)
+    _yurutucu_bosalt(r)
     # Siklik siniri: 10 cycle'da yalnizca BIR sonda.
     assert sayac["n"] == 1, f"sonda siklik siniri calismadi ({sayac['n']} cagri)"
+    r.close()
 
 
 def test_l21_teshis_zinciri_dogru_yorumlar() -> None:
@@ -566,15 +609,228 @@ def test_l21_teshis_zinciri_dogru_yorumlar() -> None:
         network_probe.IP_REACHABLE, network_probe.TCP_OPEN, network_probe.DNP3_FAILED
     )
     assert "dinleyici" in network_probe.diagnose(
-        network_probe.IP_REACHABLE, network_probe.TCP_CLOSED, network_probe.DNP3_UNKNOWN
+        network_probe.IP_REACHABLE, network_probe.TCP_UNKNOWN, network_probe.DNP3_UNKNOWN
     )
     assert "modem" in network_probe.diagnose(
-        network_probe.IP_UNREACHABLE, network_probe.TCP_TIMEOUT, network_probe.DNP3_UNKNOWN
+        network_probe.IP_UNREACHABLE, network_probe.TCP_UNKNOWN, network_probe.DNP3_UNKNOWN
     )
     # ICMP yoksa bu bir ARIZA DEGILDIR.
     assert "kullanilamiyor" in network_probe.diagnose(
         network_probe.IP_UNSUPPORTED, network_probe.TCP_UNKNOWN, network_probe.DNP3_UNKNOWN
     )
+
+
+# ==========================================================================
+# L21b-L21f — SONDA DNP3 OKUMA YOLUNU BLOKLAYAMAZ (review madde 1)
+# ==========================================================================
+
+
+def test_l21b_ham_tcp_sondasi_artik_yok() -> None:
+    """Cihazin DNP3 portuna tanilama amacli ham soket ACILMAMALI.
+
+    Onceki hali `socket.connect()` yapiyordu ve bu, PR'in bilincli olarak
+    kacindigi hatanin ta kendisiydi: uretim DNP3 kanaliyla YARISAN ikinci
+    bir TCP baglantisi. Smart bir Horstmann yalnizca sinirli bir pencerede
+    uyanik kalir; ham soket yarisi kazanip once baglanir, hicbir DNP3
+    trafigi uretmeden kapanir ve GERCEK oturumu bozar.
+
+    Bu test fonksiyonun GERI GELMESINI engeller.
+    """
+    assert not hasattr(network_probe, "tcp_probe"), (
+        "network_probe.tcp_probe geri geldi — uretim DNP3 kanaliyla yarisir"
+    )
+    kaynak = inspect.getsource(mod.Yadnp3TelemetryReader._sonda_calistir)
+    govde = kaynak.split('"""')[-1]  # docstring'i DISLA (ismi aciklamada geciyor)
+    assert "socket" not in govde, "sonda yolunda ham soket kullanimi var"
+    assert "tcp_probe(" not in govde
+
+
+def test_l21c_tcp_durumu_kanaldan_turetilir() -> None:
+    """TCP teshisi olculmez, yadnp3 kanal durumundan TURETILIR.
+
+    Kutuphane "reddedildi" ile "paket dustu" ayrimini VERMEZ; o ayrim
+    uydurulmaz -> `unknown`.
+    """
+
+    class _Durum:
+        def __init__(self, ad: str) -> None:
+            self.name = ad
+
+    assert mod.kanal_durumu_tokeni(_Durum("OPEN")) == network_probe.TCP_OPEN
+    assert mod.kanal_durumu_tokeni(_Durum("OPENING")) == network_probe.TCP_CONNECTING
+    # CLOSED/SHUTDOWN -> UYDURMA YOK.
+    assert mod.kanal_durumu_tokeni(_Durum("CLOSED")) == network_probe.TCP_UNKNOWN
+    assert mod.kanal_durumu_tokeni(_Durum("SHUTDOWN")) == network_probe.TCP_UNKNOWN
+    assert mod.kanal_durumu_tokeni(_Durum("BILINMEYEN")) == network_probe.TCP_UNKNOWN
+
+
+def test_l21d_gercek_kanal_durumu_dizisi() -> None:
+    """yadnp3 `IChannelListener` GERCEKTEN bu dizisi uretiyor mu.
+
+    Varsayim degil OLCUM: sahte bir outstation soketi acilir, kabul edilir,
+    sonra kapatilir (cihaz uykuya daldi).
+    """
+    opendnp3 = pytest.importorskip("opendnp3", reason="yadnp3 wheel kurulu degil")
+    import socket as _socket
+    import threading as _threading
+
+    srv = _socket.socket()
+    srv.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    port = srv.getsockname()[1]
+    srv.listen(1)
+
+    def _kabul() -> None:
+        try:
+            c, _ = srv.accept()
+            time.sleep(1.0)
+            c.close()
+        except OSError:
+            pass
+
+    _threading.Thread(target=_kabul, daemon=True).start()
+
+    gorulen: list[str] = []
+    mgr = opendnp3.DNP3Manager(2)
+    try:
+        lis = mod._make_channel_listener("TEST", gorulen.append)
+        ch = mgr.AddTCPClient(
+            "t",
+            opendnp3.levels.NORMAL,
+            opendnp3.ChannelRetry.Default(),
+            [opendnp3.IPEndpoint("127.0.0.1", port)],
+            "0.0.0.0",
+            lis,
+        )
+        cfg = opendnp3.MasterStackConfig()
+        cfg.link.LocalAddr = 1
+        cfg.link.RemoteAddr = 10
+        m = ch.AddMaster("m", _make_bos_soe(opendnp3), _make_bos_app(opendnp3), cfg)
+        m.Enable()
+        son = time.monotonic() + 8.0
+        while time.monotonic() < son and network_probe.TCP_OPEN not in gorulen:
+            time.sleep(0.2)
+    finally:
+        mgr.Shutdown()
+        srv.close()
+
+    assert network_probe.TCP_CONNECTING in gorulen, f"OPENING gorulmedi: {gorulen}"
+    assert network_probe.TCP_OPEN in gorulen, f"OPEN gorulmedi: {gorulen}"
+
+
+def test_l21e_cok_sayida_gecikmis_cihaz_okuma_yolunu_bloklayamaz(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SURU ETKISI (thundering herd) — review madde 1'in ozu.
+
+    Cihaz basina 300sn siklik siniri TEK BASINA YETMEZ: 200 cihaz ayni anda
+    `late` olursa (APN kesintisi, saha elektrigi) her biri ilk sondasini AYNI
+    cycle'da hak eder. Senkron cagrilarda bunlar poll thread'inde SIRAYA
+    girer ve 200 x ~2sn = ~400 saniye boyunca gateway HICBIR cihazi okuyamaz
+    — yani tanilama, teshis etmeye calistigi kesintiyi GERCEK bir kesintiye
+    cevirir.
+
+    Burada her ICMP cagrisi 2 saniye BLOKLUYOR. Senkron olsaydi 60 cihaz
+    icin >=120 saniye surerdi; asenkron oldugu icin okuma yolu saniyenin
+    altinda tamamlanmali.
+    """
+    cihaz_sayisi = 60
+    bloke_sn = 2.0
+
+    r = _reader(tmp_path, diagnostics=True)
+    s = ListeningSaha(r)
+    monkeypatch.setattr(r, "_ensure_master", lambda d, sig=None: s._ensure(d))
+
+    baslayan = {"n": 0}
+    kilit = threading.Lock()
+
+    def _yavas_ping(host: str, **kw: Any) -> str:
+        with kilit:
+            baslayan["n"] += 1
+        time.sleep(bloke_sn)
+        return network_probe.IP_UNREACHABLE
+
+    monkeypatch.setattr(network_probe, "icmp_probe", _yavas_ping)
+
+    cihazlar = []
+    for i in range(cihaz_sayisi):
+        d = s.cihaz(
+            f"HERD-{i:03d}",
+            ip_address=f"10.9.{i // 256}.{i % 256}",
+            session_policy="smart",
+            smart_max_silence_sec=86400,
+            dial_in_interval_min=60,
+        )
+        s.gateway_bagladi(d.code)
+        s.dnp3_kaniti(d.code)
+        s.oku_ve_onayla(d)
+        s.uyudu(d.code)
+        s.yaslandir(d.code, 5400)  # HEPSI ayni anda LATE
+        cihazlar.append(d)
+
+    basla = time.monotonic()
+    for d in cihazlar:
+        s.oku_ve_onayla(d)
+    gecen = time.monotonic() - basla
+
+    # ASIL IDDIA: okuma yolu sondalari BEKLEMEDI.
+    assert gecen < bloke_sn, (
+        f"okuma yolu {gecen:.1f}s surdu (tek sonda {bloke_sn}s) — sonda poll thread'ini blokladi"
+    )
+
+    # Filo saglikli kalmali: hicbiri sonda yuzunden kopuk sayilmamali.
+    durum = {k: v["state"] for k, v in r.device_health().items()}
+    assert set(durum.values()) == {"smart_idle"}, f"sonda yuku durum uretti: {set(durum.values())}"
+
+    # Havuz SINIRLI: is ya kuyruga alindi ya DUSURULDU; ikisi de kabul.
+    ist = r._tanilama_yurutucu.stats()
+    assert ist["dropped_total"] + ist["completed_total"] + ist["queued"] + ist["in_flight"] > 0
+    r.close()
+
+
+def test_l21f_yurutucu_sinirlari(tmp_path: Path) -> None:
+    """Kuyruk doygunlugu -> is DUSURULUR, `submit` ASLA bloklamaz."""
+    yur = network_probe.DiagnosticExecutor(workers=1, queue_size=2, name="test")
+    try:
+        salivar = threading.Event()
+
+        def _bekle() -> None:
+            salivar.wait(timeout=10)
+
+        # Ilk is isciyi mesgul eder; sonrakiler kuyruga girer, sonra tasar.
+        kabul = [yur.submit(f"d{i}", _bekle) for i in range(12)]
+        assert kabul[0] is True
+        assert any(k is False for k in kabul), "kuyruk hic dolmadi — sinir yok mu?"
+        assert yur.stats()["dropped_total"] > 0
+
+        # AYNI CIHAZ icin ikinci is KABUL EDILMEZ (cihaz basina tek ucus).
+        yur2 = network_probe.DiagnosticExecutor(workers=1, queue_size=8, name="test2")
+        try:
+            assert yur2.submit("AYNI", _bekle) is True
+            assert yur2.submit("AYNI", _bekle) is False, "ayni cihaz icin ikinci is kabul edildi"
+        finally:
+            salivar.set()
+            yur2.shutdown(timeout=3)
+        salivar.set()
+    finally:
+        yur.shutdown(timeout=3)
+
+
+def test_l21g_yurutucu_istisnayi_izole_eder() -> None:
+    """Bir cihazin tanilamasi havuzu ya da digerlerini DUSUREMEZ."""
+    yur = network_probe.DiagnosticExecutor(workers=1, queue_size=8, name="test3")
+    try:
+
+        def _patla() -> None:
+            raise RuntimeError("tanilama patladi")
+
+        bitti = threading.Event()
+        assert yur.submit("PATLAYAN", _patla) is True
+        assert yur.submit("SAGLAM", bitti.set) is True
+        assert bitti.wait(timeout=5), "istisna sonrasi isci oldu — izolasyon yok"
+        assert yur.stats()["completed_total"] == 2
+    finally:
+        yur.shutdown(timeout=3)
 
 
 # ==========================================================================
@@ -735,7 +991,7 @@ def test_l26_onbellekten_gelen_gecersiz_probe_araligi_varsayilana_duser() -> Non
     assert varsayilan_ms == 60_000, "kutuphane varsayilani degismis"
 
     def _tavan(deger: Any) -> int:
-        d = replace(make_device("PR-1"), smart_listen_probe_interval_sec=deger)
+        d = replace(make_device("PR-1"), smart_listen_reconnect_max_sec=deger)
         return _ms(mod._ManagedMaster._listening_retry(d).maxOpenRetry)
 
     for gecersiz in (None, 0, -1, 4, 601, "x"):
@@ -743,10 +999,115 @@ def test_l26_onbellekten_gelen_gecersiz_probe_araligi_varsayilana_duser() -> Non
 
     # Gecerli deger TAVANI kisar, TABAN 1sn'de kalir (yeni uyanmis cihaza
     # hizli baglanmak istiyoruz).
-    d = replace(make_device("PR-1"), smart_listen_probe_interval_sec=30)
+    d = replace(make_device("PR-1"), smart_listen_reconnect_max_sec=30)
     retry = mod._ManagedMaster._listening_retry(d)
     assert _ms(retry.maxOpenRetry) == 30_000
     assert _ms(retry.minOpenRetry) == 1_000
     # Sinirlar DAHILDIR.
     assert _tavan(5) == 5_000
     assert _tavan(600) == 600_000
+
+
+# ==========================================================================
+# L27 — TAM TAMSAYI AYRISTIRMASI (review madde 4): sessiz kirpma YOK
+# ==========================================================================
+
+
+@pytest.mark.parametrize(
+    ("ham", "beklenen"),
+    [
+        # KABUL — tam tamsayi
+        (60, 60),
+        ("60", 60),
+        (60.0, 60),
+        ("60.0", 60),
+        ("  60  ", 60),
+        (1440, 1440),
+        (-5, -5),
+        (0, 0),
+        # RED — kesirli deger SESSIZCE KIRPILMAZ
+        (60.9, None),
+        (60.1, None),
+        ("60.9", None),
+        (1439.5, None),
+        (-0.5, None),
+        # RED — sayi degil
+        (None, None),
+        ("", None),
+        ("   ", None),
+        ("altmis", None),
+        ("60abc", None),
+        (object(), None),
+        ([60], None),
+        # RED — nan/inf istisna FIRLATMADAN elenmeli
+        (float("nan"), None),
+        (float("inf"), None),
+        (float("-inf"), None),
+        ("nan", None),
+        ("inf", None),
+        # RED — bool: `isinstance(True, int)` DOGRU oldugu icin sessizce
+        # 1 olurdu. Tamsayi bekleyen alana bool gelmesi yapilandirma
+        # hatasidir, degeri degil.
+        (True, None),
+        (False, None),
+    ],
+)
+def test_l27_exact_int_kesirli_degeri_kirpmaz(ham: Any, beklenen: int | None) -> None:
+    """`int(60.9)` sessizce `60` verirdi — "anladim" demek ve YANLIS olmak.
+
+    `normalize_operation_mode` ile ayni ilke: tamsayi bekleyen bir alandan
+    gelen ara deger, yorumlanacak bir sey degil ANLASILAMAYAN bir sinyaldir.
+    """
+    assert exact_int(ham) == beklenen, f"{ham!r} yanlis ayristirildi"
+
+
+@pytest.mark.parametrize(
+    ("alan", "lo", "hi"),
+    [("dial_in_interval_min", 60, 1440), ("smart_listen_reconnect_max_sec", 5, 600)],
+)
+def test_l28_opsiyonel_alanlar_kesirli_degeri_reddeder(
+    alan: str, lo: int, hi: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Iki yeni alan da AYNI kesin-tamsayi semantigini tasir."""
+    ham: dict[str, Any] = {"code": "D1", "ip_address": "10.0.0.10", "dnp3_address": 1}
+
+    # Sinirlar DAHIL ve kabul.
+    for gecerli in (lo, hi, lo + 1, hi - 1):
+        assert _parse_optional_int({**ham, alan: gecerli}, alan, lo=lo, hi=hi) == gecerli
+        assert _parse_optional_int({**ham, alan: str(gecerli)}, alan, lo=lo, hi=hi) == gecerli
+        assert _parse_optional_int({**ham, alan: float(gecerli)}, alan, lo=lo, hi=hi) == gecerli
+
+    # Kesirli -> yok sayilir + UYARIR (sessiz kirpma YOK).
+    with caplog.at_level("WARNING"):
+        assert _parse_optional_int({**ham, alan: lo + 0.9}, alan, lo=lo, hi=hi) is None
+    assert any(f"config_{alan}_invalid" in r.getMessage() for r in caplog.records)
+
+    # Aralik disi -> yok sayilir.
+    assert _parse_optional_int({**ham, alan: lo - 1}, alan, lo=lo, hi=hi) is None
+    assert _parse_optional_int({**ham, alan: hi + 1}, alan, lo=lo, hi=hi) is None
+    # Eksik/bos -> None (ARIZA DEGIL).
+    assert _parse_optional_int(ham, alan, lo=lo, hi=hi) is None
+    assert _parse_optional_int({**ham, alan: None}, alan, lo=lo, hi=hi) is None
+    assert _parse_optional_int({**ham, alan: ""}, alan, lo=lo, hi=hi) is None
+
+
+def test_l29_adapter_yolu_da_kesirli_degeri_reddeder(saha: ListeningSaha) -> None:
+    """Disk onbellegi backend parser'ini ATLAR — adapter da ayni kurali uygular."""
+    r = saha.reader
+    assert r._dial_in_limit_sn(replace(make_device("X"), dial_in_interval_min=60)) == 3600
+    assert r._dial_in_limit_sn(replace(make_device("X"), dial_in_interval_min=60.0)) == 3600
+    # Kesirli -> yok sayilir (60'a KIRPILMAZ).
+    assert r._dial_in_limit_sn(replace(make_device("X"), dial_in_interval_min=60.9)) is None
+    assert r._dial_in_limit_sn(replace(make_device("X"), dial_in_interval_min=1440.5)) is None
+
+    opendnp3 = pytest.importorskip("opendnp3", reason="yadnp3 wheel kurulu degil")
+    varsayilan = int(str(opendnp3.ChannelRetry.Default().maxOpenRetry))
+
+    def _tavan(deger: Any) -> int:
+        d = replace(make_device("X"), smart_listen_reconnect_max_sec=deger)
+        return int(str(mod._ManagedMaster._listening_retry(d).maxOpenRetry))
+
+    assert _tavan(30) == 30_000
+    assert _tavan(30.0) == 30_000
+    # Kesirli -> kutuphane varsayilanina duser (30'a KIRPILMAZ).
+    assert _tavan(30.9) == varsayilan

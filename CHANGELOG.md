@@ -93,7 +93,7 @@ sayisi **0**. Genel cikis (output) komut kapsami **GENISLETILMEDI**.
   > yalnizca cihaz `late` iken ve 300sn siklik siniriyla calisir. `ping`
   > ikilisi yoksa sonuc `unsupported`tir ve bu bir ARIZA DEGILDIR.
 
-- **`smart_listen_probe_interval_sec`** (5..600 sn) — `listening` kanalda
+- **`smart_listen_reconnect_max_sec`** (5..600 sn) — `listening` kanalda
   yeniden baglanma TAVANI. Verilmezse kutuphane varsayilani kullanilir:
   `ChannelRetry.Default()` = min 1000ms / max 60000ms ustel (**olculdu**,
   yadnp3 3.2.1.1), Horstmann'in ~600sn Socket Listening Timeout'u icinde
@@ -125,6 +125,69 @@ sayisi **0**. Genel cikis (output) komut kapsami **GENISLETILMEDI**.
   kabul testleri A..E), `docs/BACKEND_TODO.md` (B6.1 alan sozlesmesi) ve
   deployment sozlesmesi guncellendi.
 
+### PR #32 review kapanisi
+
+Mimari kabul edildi; asagidaki maddeler merge oncesi kapatildi.
+
+- **BLOCKER — tanilama DNP3 okuma yolunu BLOKLAYAMAZ.** `_sonda_calistir`
+  ICMP'yi senkron cagiriyordu. Cihaz basina 300sn siklik siniri **suru
+  etkisini COZMEZ**: 200 cihaz ayni anda `late` olursa (APN kesintisi, saha
+  elektrigi) her biri ilk sondasini AYNI cycle'da hak eder ve senkron
+  cagrilar poll thread'inde SIRAYA girer:
+
+  ```
+  200 cihaz x ~2sn ICMP zaman asimi = ~400sn HICBIR CIHAZ OKUNAMAZ
+  ```
+
+  Yani tanilama, teshis etmeye calistigi kesintiyi GERCEK bir kesintiye
+  cevirirdi. Artik `network_probe.DiagnosticExecutor` uzerinden **sinirli
+  arka plan havuzunda** kosuyor: sinirli isci, sinirli kuyruk, cihaz basina
+  en fazla bir ucus, kuyruk dolunca is **dusurulur** (telemetri ASLA
+  beklemez), istisnalar izole, temiz kapanis. Saglik/durum kararlari
+  sondanin bitmesinden **bagimsizdir**.
+
+- **BLOCKER — cihazin DNP3 portuna RAKIP TCP baglantisi acilmiyor.**
+  `network_probe.tcp_probe` cihazin DNP3 portuna ham `socket.connect()`
+  aciyordu. Bu, PR'in ikinci reconnect scheduler kurmama gerekcesiyle
+  **AYNI hataydi**: uretim DNP3 kanaliyla yarisan ikinci bir TCP baglantisi.
+  Smart moddaki bir Horstmann yalnizca sinirli bir Socket Listening Timeout
+  penceresinde uyanik kalir; ham tanilama soketi yarisi KAZANIP once
+  baglanabilir, sonra hicbir DNP3 trafigi uretmeden kapanarak gercek
+  opendnp3 oturumunu ENGELLER. Olcum araci olctugu sistemi bozmus olur.
+
+  Fonksiyon **tamamen kaldirildi**. `tcp_probe_status` artik yadnp3
+  kanalinin kendi durumundan **PASIF** turetiliyor
+  (`IChannelListener.OnStateChange`): ek soket YOK, ek trafik YOK, yaris YOK.
+  Durum dizisi gercek soketle olculdu: `OPENING -> OPEN -> CLOSED ->
+  OPENING -> OPEN`. Kutuphane "reddedildi" ile "paket dustu" ayrimini
+  vermedigi icin o ayrim **uydurulmuyor** -> `unknown`.
+
+- **Saha kabulu trafik beklentisi duzeltildi.** `gateway -> cihaz 0 bayt`
+  olcutu `listening` icin **YANLISTI** ve saglikli bir kurulumu FAIL
+  gosterirdi: orada baglantiyi gateway acar ve cihaz uyurken `ChannelRetry`
+  SYN gondermeye DEVAM EDER — cihazin uyandigini boyle fark ederiz; SYN
+  sayisi 0 ise cihaz uyandiginda **hic yakalanamaz**. Bir SYN uygulama yuku
+  tasimaz ve cihazin 15sn'lik DNP3 hareketsizlik sayacini sifirlamaz.
+
+  Yeni gecer olcutu: **DNP3 uygulama yuku = 0** (periyodik Class 1/2/3 yok,
+  Class 0/integrity yok, keepalive yok). `scripts/field_capture.sh` artik
+  iki sayiyi AYRI raporluyor ve `--endpoint listening|initiating` aliyor.
+  `greater 1` filtresi terk edildi — paketin TOPLAM uzunlugunu olctugu icin
+  bir SYN (~60 byte) ondan GECIYORDU.
+
+- **Opsiyonel tamsayi ayristirmasi sertlestirildi.** `int(60.9)` sessizce
+  `60` veriyordu — "anladim" deyip YANLIS olmak. `exact_int` kesirli degeri
+  **kirpmaz**: `60`, `"60"`, `60.0` kabul; `60.9`, `nan`, `inf` ve `bool`
+  reddedilir + WARNING. (`bool` acikca reddedilir: `isinstance(True, int)`
+  dogru oldugu icin sessizce `1` olurdu.) Ayni kural **disk onbellegi**
+  yolunda da uygulanir — o yol backend parser'ini ATLAR.
+
+- **`smart_listen_probe_interval_sec` -> `smart_listen_reconnect_max_sec`.**
+  Ad YANILTICIYDI: alan bir ICMP/TCP tanilama **sondasi** araligi degil,
+  yadnp3 `ChannelRetry` **yeniden baglanma tavanidir** — ve ayni surum
+  gercek ag sondalari da getirdigi icin karisiklik kacinilmazdi. Alan
+  hicbir zaman yayina cikmadigi icin **geriye uyum takma adi YOK**.
+
 ### Backend / Frontend etkisi
 
 > **FRONTEND'DE YAPILACAK:** `session_policy=smart|auto` secildiginde
@@ -136,7 +199,7 @@ sayisi **0**. Genel cikis (output) komut kapsami **GENISLETILMEDI**.
 > DEVAM EDER.
 
 Backend iki yeni opsiyonel cihaz alanini iletmelidir:
-`dial_in_interval_min`, `smart_listen_probe_interval_sec`. Ikisi de
+`dial_in_interval_min`, `smart_listen_reconnect_max_sec`. Ikisi de
 opsiyoneldir; eksik olmalari ARIZA DEGILDIR.
 
 ### Saha kabulu

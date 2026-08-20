@@ -330,25 +330,67 @@ ozetinde ayri bir `late` sayaciyla raporlar.
 `dial_in_interval_min` **verilmezse `late` HIC uretilmez** — her kurulumda
 zamanlanmis Dial-In tanimli olmak zorunda degildir.
 
-### Aktif tanilama sondalari (ICMP / TCP)
+### Tanilama: ICMP (aktif) + kanal durumu (pasif)
 
-Cihaz `late` oldugunda gateway bir **teshis** sondasi calistirir:
+Cihaz `late` oldugunda gateway bir **teshis** uretir:
 
 ```
-ip_probe  unreachable        -> modem / APN / yonlendirme suphesi
-ip ok + tcp_probe closed     -> dinleyici / guvenlik duvari / uygulama
-tcp open + DNP3 kaniti yok   -> protokol / oturum sorunu (adres, link)
+ip_probe  unreachable         -> modem / APN / yonlendirme suphesi
+ip ok + kanal hic acilmiyor   -> dinleyici / guvenlik duvari / uyku
+kanal OPEN + DNP3 kaniti yok  -> protokol / oturum sorunu (adres, link)
 ```
 
-> **HICBIR SONDA SONUCU `comm_lost` URETMEZ.** Bu bir tasarim kurali, bir
-> ayrinti degil. ICMP saha aglarinda/APN'lerde sikca ENGELLIDIR ve Smart
+> **HICBIR TANILAMA CIKTISI `comm_lost` URETMEZ.** Bu bir tasarim kurali,
+> bir ayrinti degil. ICMP saha aglarinda/APN'lerde sikca ENGELLIDIR ve Smart
 > bir modem MESRU olarak uykudadir — ping'e cevap vermemesi BEKLENEN
 > davranistir. "ping dusuyor -> cihaz oldu" kurali filonun yarisini sahte
-> kopuk gosterirdi. Sondalar operatorun arizanin YERINI bulmasi icindir;
+> kopuk gosterirdi. Tanilama operatorun arizanin YERINI bulmasi icindir;
 > durum makinesinin girdisi DEGILDIR.
 
-Sondalar yalnizca cihaz `late` iken ve `_PROBE_MIN_INTERVAL_SEC` (300sn)
-siklik siniriyla calisir.
+#### TCP teshisi ham soketle OLCULMEZ
+
+`tcp_probe_status` **yadnp3 kanalinin kendi durumundan** turetilir
+(`IChannelListener.OnStateChange`) — cihazin DNP3 portuna tanilama amacli
+ham soket **ACILMAZ**.
+
+> Gerekce, ikinci bir yeniden baglanma dongusu kurmama gerekcesiyle AYNIDIR:
+> **uretim DNP3 kanaliyla yarisan ikinci bir TCP baglantisi.** Smart moddaki
+> bir Horstmann yalnizca sinirli bir Socket Listening Timeout penceresi
+> boyunca uyanik kalir; ham tanilama soketi yarisi KAZANIP once baglanabilir,
+> sonra hicbir DNP3 trafigi uretmeden kapanarak gercek oturumu ENGELLER.
+> Olcum araci olctugu sistemi bozmus olur.
+
+Kutuphane "reddedildi" ile "paket dustu" ayrimini VERMEZ; o ayrim
+UYDURULMAZ:
+
+| Kanal durumu | `tcp_probe_status` |
+|---|---|
+| `OPEN` | `open` |
+| `OPENING` | `connecting` (deneniyor — ariza DEGIL) |
+| `CLOSED` / `SHUTDOWN` / hic gozlenmedi | `unknown` |
+
+#### ICMP her zaman ARKA PLANDA kosar
+
+`ping` alt surec baslatir ve saniyelerce bloklayabilir. Poll thread'inden
+dogrudan cagrilmasi **suru etkisi** uretirdi: 200 cihaz ayni anda `late`
+olursa (APN kesintisi, saha elektrigi — gercek senaryolar) her biri ilk
+sondasini AYNI cycle'da hak eder ve senkron cagrilarda bunlar SIRAYA girer:
+
+```
+200 cihaz x ~2sn ICMP zaman asimi = ~400 saniye HICBIR CIHAZ OKUNAMAZ
+```
+
+Yani tanilama, teshis etmeye calistigi kesintiyi GERCEK bir kesintiye
+cevirirdi. Cihaz basina 300sn siklik siniri bunu TEK BASINA COZMEZ.
+
+Bu yuzden ICMP **sinirli bir arka plan havuzunda** kosar
+(`network_probe.DiagnosticExecutor`): sinirli isci, sinirli kuyruk, cihaz
+basina en fazla bir ucus, kuyruk dolunca is **dusurulur** (telemetri ASLA
+beklemez), istisnalar izole, kapanis temiz. `/health` sondanin bitmesini
+**beklemez**; son bilinen degeri doner.
+
+Tanilama yalnizca cihaz `late` iken ve `_PROBE_MIN_INTERVAL_SEC` (300sn)
+siklik siniriyla tetiklenir.
 
 ---
 
@@ -361,7 +403,7 @@ siklik siniriyla calisir.
 | `master_ip_port` | backend, cihaz basina | — | `initiating` icin **ZORUNLU**, 1024..65535, gateway icinde TEKIL |
 | `smart_max_silence_sec` | backend, cihaz basina | `null` (= ezme yok) | Sessizlik esigi, **60..2592000** sn. Gecersizse yok sayilir, env yedegine dusulur. |
 | `dial_in_interval_min` | backend, cihaz basina | `null` (= `late` KAPALI) | Beklenen zamanlanmis rapor araligi, **60..1440** dk. `late` erken uyarisini besler; `comm_lost` URETMEZ. |
-| `smart_listen_probe_interval_sec` | backend, cihaz basina | `null` (= kutuphane varsayilani) | `listening` kanalda yeniden baglanma TAVANI, **5..600** sn. Cihazin uyanisinin en gec ne kadar sonra fark edilecegini belirler. |
+| `smart_listen_reconnect_max_sec` | backend, cihaz basina | `null` (= kutuphane varsayilani) | `listening` kanalda yeniden baglanma TAVANI, **5..600** sn. Cihazin uyanisinin en gec ne kadar sonra fark edilecegini belirler. |
 | `DNP3_SMART_MAX_SILENCE_SEC` | gateway `.env` | `0` (kapali) | Cihaz ezmesi yokken kullanilan yedek. Kabul: **`0` veya `60..2592000`**; `1..59` boot'ta REDDEDILIR. |
 
 Politikanin kendisi icin **env anahtari yoktur**: karar cihaz basinadir ve
@@ -405,7 +447,7 @@ Cihaz basina (`device_health()`):
     "report_late": false,
 
     "ip_probe_status": "unknown",
-    "tcp_probe_status": "unknown",
+    "tcp_probe_status": "connecting",
     "last_probe_epoch": null
   }
 }
