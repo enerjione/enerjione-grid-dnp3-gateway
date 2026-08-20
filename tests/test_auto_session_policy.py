@@ -112,6 +112,53 @@ def test_2c_beklenmeyen_deger_unknown(ham: Any) -> None:
     assert normalize_operation_mode(ham) == MODE_UNKNOWN
 
 
+# --- SINIR DEGERLERI: YALNIZCA TAM 0/1 ------------------------------------
+
+
+@pytest.mark.parametrize("ham", [0, 0.0, -0.0, False, "0"])
+def test_2c_tam_sifir_boost(ham: Any) -> None:
+    assert normalize_operation_mode(ham) == MODE_BOOST
+
+
+@pytest.mark.parametrize("ham", [1, 1.0, True, "1"])
+def test_2c_tam_bir_smart(ham: Any) -> None:
+    assert normalize_operation_mode(ham) == MODE_SMART
+
+
+@pytest.mark.parametrize(
+    "ham",
+    [0.1, 0.49, 0.5, 0.51, 0.9, 0.999999, 1.000001, 1.1, 1.49, 1.5, 1.9, 2.0, -0.4, -1.0],
+)
+def test_2c_kesirli_degerler_yuvarlanmaz(ham: float) -> None:
+    """YUVARLAMA FAIL-SAFE DEGILDIR.
+
+    Onceki hali `int(round(float(raw)))` idi: `0.51`/`0.9`/`1.1`/`1.49`
+    sessizce SMART'a, `0.1`/`0.49`/`0.5`/`-0.4` sessizce BOOST'a dusuyordu.
+    Binary bir noktadan gelen 0/1 disi deger yorumlanacak bir sey degil,
+    ANLASILAMAYAN bir sinyaldir; ona mod atamak cihazi yanlislikla susturmak
+    (modem acik kalir) ya da gereksiz taramak (Smart mod bozulur) demektir.
+    """
+    assert normalize_operation_mode(ham) == MODE_UNKNOWN, f"{ham!r} bir moda YUVARLANDI — fail-safe degil"
+
+
+@pytest.mark.parametrize("ham", [float("nan"), float("inf"), float("-inf")])
+def test_2c_nan_ve_inf_unknown_ve_istisna_atmaz(ham: float) -> None:
+    """`inf` eskiden `OverflowError` FIRLATIYORDU (`int(inf)`).
+
+    O istisna `_auto_politikayi_coz` uzerinden `read_device` yoluna
+    sizabilirdi; artik sessizce `unknown`a duser.
+    """
+    assert normalize_operation_mode(ham) == MODE_UNKNOWN
+
+
+def test_2c_ters_esleme_de_tam_deger_ister() -> None:
+    """`smart_raw_value` ters cevrildiginde de yuvarlama YOK."""
+    assert normalize_operation_mode(0, smart_raw_value=0) == MODE_SMART
+    assert normalize_operation_mode(1, smart_raw_value=0) == MODE_BOOST
+    assert normalize_operation_mode(0.51, smart_raw_value=0) == MODE_UNKNOWN
+    assert normalize_operation_mode(0.9, smart_raw_value=0) == MODE_UNKNOWN
+
+
 # ==========================================================================
 # 27-30 — SINYAL SECIMI (semantik, index sabitlenmez)
 # ==========================================================================

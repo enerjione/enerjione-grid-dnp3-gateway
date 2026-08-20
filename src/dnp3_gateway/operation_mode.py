@@ -101,19 +101,37 @@ BOOST_RAW_VALUE = _state_bit(HORSTMANN_FLAGS_BOOST)
 def normalize_operation_mode(raw: Any, *, smart_raw_value: int = SMART_RAW_VALUE) -> str:
     """Cache'teki ham binary deger -> `smart` / `boost` / `unknown`.
 
-    Beklenmeyen deger (None, NaN, 2.0) SESSIZCE bir moda ZORLANMAZ:
-    `unknown` doner ve cagiran taraf muhafazakar davranir. Uydurma bir mod,
-    cihazi yanlislikla susturabilir ya da modemini acik tutabilirdi.
+    SOZLESME: YALNIZCA TAM `0` ve `1` gecerlidir.
+
+    YUVARLAMA YAPILMAZ — bilincli. Onceki hali `int(round(float(raw)))`
+    kullaniyordu ve bu FAIL-SAFE DEGILDI: `0.51`, `0.9`, `1.1`, `1.49`
+    sessizce SMART'a; `0.1`, `0.49`, `0.5`, `-0.4` sessizce BOOST'a
+    yuvarlaniyordu. Binary bir noktadan gelen 0/1 disi bir deger,
+    yorumlanacak bir sey degil ANLASILAMAYAN bir sinyaldir; ona bir mod
+    atamak, cihazi yanlislikla susturmak (modem acik kalir, pil biter) ya da
+    gereksiz taramak (Smart mod bozulur) demektir. Ikisi de sessiz zarardir.
+
+    Tam `0.0`/`1.0` disindaki her SONLU sayisal deger, NaN, +/-inf ve
+    ayristirilamayan her girdi `unknown` doner; cagiran taraf muhafazakar
+    davranir.
+
+    Not: `inf` eskiden `OverflowError` FIRLATIYORDU (`int(inf)`) ve bu istisna
+    `read_device` yoluna sizabilirdi — artik `unknown`a duser.
     """
     if raw is None:
         return MODE_UNKNOWN
     try:
-        deger = int(round(float(raw)))
-    except (TypeError, ValueError):
+        deger = float(raw)
+    except (TypeError, ValueError, OverflowError):
         return MODE_UNKNOWN
-    if deger not in (0, 1):
+    # NaN ve +/-inf bu karsilastirmalarin HICBIRINI saglamaz -> unknown.
+    if deger == 0.0:
+        sayi = 0
+    elif deger == 1.0:
+        sayi = 1
+    else:
         return MODE_UNKNOWN
-    return MODE_SMART if deger == int(smart_raw_value) else MODE_BOOST
+    return MODE_SMART if sayi == int(smart_raw_value) else MODE_BOOST
 
 
 # ---------------------------------------------------------------------------
