@@ -492,7 +492,7 @@ Once gozlem ve eylem **tek bir erken donuse** bagliydi:
 
 ```python
 if mm.configured_session_policy != "auto":
-    return False          # <-- modu OKUMA kodu da bunun ARDINDAYDI
+    return False  # <-- modu OKUMA kodu da bunun ARDINDAYDI
 ```
 
 Sonucu sinsiydi: `continuous` yapilandirilmis bir cihaz mod noktasini
