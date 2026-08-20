@@ -2,6 +2,377 @@
 
 Semver'a gore tutulur. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.15.0] - 2026-08-20
+
+**G-DEVICE-HEALTH-01** — cihaz basina calisma-zamani sagligi icin AYRI,
+GIDEN tasiyici.
+
+### Kapatilan sorun
+
+Gateway 1.14 cihaz basina zengin saglik bilgisine **sahipti** ama Grid onu
+**guvenli sekilde alamiyordu**. Tek tasiyici `X-E1-Gateway-Health`
+**basligiydi** ve o baslik:
+
+* `/pending` isteklerine biner — yani **fiziksel komut kanalinin** tasiyicisi,
+* backend ayristirma tavani ~2 KB (`MAX_HEADER_BYTES` = 1600),
+* 200+ cihaz oraya **sigmaz**.
+
+> **Baslik buyutulerek COZULMEDI.** Buyutulseydi bir proxy/backend baslik
+> limitinde `/pending` 400 doner ve **kesici komutlari dururdu**. Toplu
+> baslik **oldugu gibi** kalir ve **buyutulmez**; yeni kanal onu rahatlatir.
+
+### Added
+
+- **`POST /gateways/{code}/device-health`** — govde tabanli, giden, komuttan
+  bagimsiz kanal. Mevcut **kanonik gateway credential**'i kullanilir
+  (`X-Gateway-Token` + kimlik basliklari); **yeni bir credential sistemi
+  kurulmadi**. Komut duzlemine ozel `X-Gateway-Command-Token` **bilerek
+  gonderilmez** — saglik telemetrisi komut yetkisi gerektirmez ve o sirri
+  yaymak F5'te ayrilan iki duzlemi yeniden birlestirirdi.
+
+- **Surumlu tel semasi `device_health_v1`** (`backend/device_health_wire.py`).
+  Zarf: `schema`, `gateway_code`, `gateway_instance_id`, `boot_id`,
+  `sequence`, `snapshot`, `device_total`, `devices`.
+
+- **Siralama modeli `(boot_id, sequence)`** — duvar saatinden **bagimsiz**.
+
+  > `gateway_instance_id` tek basina **yetmez**: o kimlik gateway diskinde
+  > **kalicidir** ve restart'ta **ayni kalir**. Restart sonrasi `sequence`
+  > 1'den baslar; yalnizca instance kimligine bakan bir backend, yeni
+  > calismanin `sequence=1` partisini "eski" sanip **atardi**. `boot_id` her
+  > acilista arttigi icin eski calismanin `sequence=9999` partisi bile yeni
+  > calismanin `sequence=1` partisinden **kucuktur**.
+  >
+  > Duvar saati kullanilmadi: sahada RTC'si bos acilan gateway'ler ve NTP
+  > siçramalari gercektir; saate bagli siralama tam da o anlarda tersine doner.
+
+- **Teslim modeli:** acilista tam snapshot → durum degisiminde delta →
+  periyodik (varsayilan 300sn) uzlastirma snapshot'i. Parti boyu sinirli
+  (varsayilan 50). Sinirli ustel geri cekilme (2sn → 120sn, ±%20 jitter).
+
+- **Backpressure: coalescing.** Cihaz basina **en son durum** tutulur, gecis
+  basina **degil**. Backend erisilemezken bellek cihaz sayisi kadar sinirli
+  kalir (200 cihaz = en fazla 200 kayit, kesinti ne kadar surerse sursun) ve
+  **diske hicbir sey yazilmaz**. Bu kanal **komut/olay denetim gecmisi
+  degildir**; ara gecisler bilincli olarak dusurulur.
+
+- **Yetenek isareti** `device_runtime_health_transport` (deployment
+  sozlesmesi, `min_gateway_version: 1.15.0`). `smart_session` /
+  `initiating_endpoint` **overload edilmedi**: Grid'in "1.14 = Smart
+  Listening var ama tasiyici yok" ile "1.15 = ikisi de var" ayrimini
+  yapabilmesi gerekiyor.
+
+- **`docs/GRID_DEVICE_HEALTH_API.md`** — backend ekibinin Python kaynagina
+  bakmadan uygulayabilecegi tam entegrasyon dokumani (HTTP, auth, sema,
+  alan tipleri, enum'lar, sequence/snapshot semantigi, retry, kontrol listesi).
+
+- Env: `DEVICE_HEALTH_PUBLISH_ENABLED` (**varsayilan false**),
+  `DEVICE_HEALTH_BATCH_MAX`, `DEVICE_HEALTH_SNAPSHOT_INTERVAL_SEC`,
+  `DEVICE_HEALTH_CHANGE_DEBOUNCE_SEC`.
+
+  > Varsayilan kapali **bilinclidir**: backend ucu tanimadan acilirsa her
+  > turda 404 alinir ve log dolar. Kapaliyken **hicbir thread baslatilmaz**.
+  > Devreye alma sirasi: **once backend ucu**, sonra gateway bayragi.
+
+### G-SMART-RECOVERY — Smart oturum kurtarma durum makinesi (saha regresyonu)
+
+**2026-08-20, cihaz SN2_0, `listening` + `smart`.** Grid v2.106.0 politikayi
+dogru sekilde `continuous` -> `smart` yapti ve **ilk Smart uykusu basarili
+oldu**. Cihaz disaridan uyandirildiginda uc ayri hata ortaya cikti.
+
+#### Fixed — sessiz ama SAGLIKLI Smart oturumu artik kopuk ilan edilmiyor
+
+```
+13:09:16  device_recovered
+13:11:16  device_stale last_data_age=120s -> recovering -> comm_lost
+```
+
+Bayatlik esigi `scan_interval`/`baseline_interval`den turetilir ve ortuk
+varsayimi sudur: *"saglikli cihaz her tarama turunda cevap verir"*. Bu
+varsayim **surekli politikaya aittir**. Smart'ta hicbir tarama kurulmaz,
+dolayisiyla **kanitlanmis ve saglikli** bir Smart oturumu 120 saniye sonra
+**garantili** olarak bayat olur.
+
+Smart bir oturum `online`dan artik **yalnizca** gercek olaylarla cikar:
+link kapanmasi (-> `smart_idle`) ya da `smart_max_silence_sec` (-> `lost`).
+Uzun vadeli "cihaz kayip mi" olcutu **Dial-In + sessizlik esigidir**, olcum
+yasi degildir. **`continuous`ta bayatlik davranisi aynen korundu.**
+
+#### Fixed — deterministik `lost`/`relink` salinimi
+
+```
+13:14:22  device_relink age=2
+13:14:37  recovery_timeout -> lost
+13:14:37  device_relink age=17     <-- AYNI eski kare
+... her ~15 saniyede bir (age=3,18,33,48,63,78,93,108)
+```
+
+`lost` -> `recovering` gecisi yalnizca *"kanit bayat degil"* kosuluna
+bagliydi. Kanit yasi esigin altinda kaldigi surece **eski bir kare** relink'i
+tekrar tekrar tetikliyor, recovery ise tamamlanmak icin **yeni veri** istedigi
+icin hicbir zaman tamamlanamiyordu.
+
+Eklenen **kanit nesli (evidence generation)**: her gecerli DNP3 kaniti bir
+sayaci artirir; `fail_recovery` o andaki nesli kaydeder ve yeni bir relink
+ancak **nesil artmissa** (ya da **yeni bir link acilmissa**) izinlidir.
+
+> **Sayac kullanildi, zaman damgasi degil.** `time.monotonic()` Windows'ta
+> ~15.6 ms cozunurluklu ve `fail_recovery` ile hemen ardindan gelen **gercek**
+> bir kanit ayni tick'e dusebiliyor — zaman karsilastirmasi o kaniti yok
+> sayar ve cihazi gereksizce `lost` tutardi. Bu tam olarak testlerde yakalandi.
+
+#### Fixed — uyanma pazarliginda sahte comm_lost
+
+```
+13:08:53  link_open (state=recovering)
+13:08:56  comm_lost_announced      <-- 3 SANIYE SONRA
+13:09:12  g110_okundu              <-- cihaz KONUSUYORDU
+13:09:16  device_recovered
+```
+
+`recovering` durumunda comm_lost **derhal** yayinlaniyordu. Smart bir cihaz
+uyandiginda TCP el sikismasi ile ilk DNP3 fragmenti arasindaki kisa pazarlik
+suresi de `recovering`tir — orada alarm **sahtedir**.
+
+Artik comm_lost bir grace penceresi kadar **ertelenir** (bastirilmaz): grace
+gercekten dolarsa `lost` olur ve comm_lost **yayinlanir**.
+
+> **Erteleme `recovery_age`e baglanMADI.** Link **flap** ederse her `OnOpen`
+> yeni bir `begin_recovery()` uretir ve `recovery_age()` sifirlanir; erteleme
+> ona baglansaydi **gercekten bozuk** bir cihaz sonsuza kadar saglikli
+> gorunurdu — smart politikanin en tehlikeli sessiz basarisizlik modu tam da
+> budur. Ayri bir damga kullanildi ve **yalnizca gercek `online` gecisinde**
+> sifirlanir. Bu acigi mevcut `test_k_kanitsiz_yeniden_baglanti...` testi
+> yakaladi.
+>
+> **`continuous`ta `recovering` sirasinda comm_lost tutma davranisi
+> degismedi** — orada sahte "online" gostermemek bilincli bir karardir.
+
+#### 60 saniyelik artik trafik — ONCEDEN DUZELTILMISTI
+
+Ayni sahada gorulen `~60 saniyede bir gateway -> cihaz 10 bayt / cihaz ->
+gateway 10 bayt` trafigi **cozuldu ve kanitlandi**:
+
+```
+056405c90a000100feda
+  CTRL = 0xc9 -> DIR=1 PRM=1 FC=9 = REQUEST_LINK_STATUS
+```
+
+Bu, **gateway'in kendi** opendnp3 master link keepalive'idir
+(`cfg.link.KeepAliveTimeout`, olculen varsayilan **60000 ms**).
+
+> **Grid'deki "DNP3 link status period = 0" ayari bunu aciklamaz**: o ayar
+> **cihaz** tarafinin link-status periyodudur. Buradaki cerceveleri
+> **gateway** uretiyordu.
+
+`smart` cihazlarda `TimeDuration.Max()` ile kapatildi (olculdu: 70 saniyede
+sifir cerceve). Fiziksel Session Timeout **hicbir yere gomulmedi** — gateway
+yalnizca susar, sureyi cihaz sahiplenir.
+
+Ayni yakalamadaki `61 bayt (cihaz->gateway)` + `15 bayt (gateway->cihaz)`
+ikilisi **mesrudur**: cihazin unsolicited raporu ve ona protokol geregi
+verilen uygulama katmani CONFIRM'i. Cihaz kaynakli trafige verilen zorunlu
+yanit **tekrarlayan gateway trafigi degildir**.
+
+#### Test — +13 (1434 -> 1447)
+
+`tests/test_smart_recovery_state_machine.py`: sessiz Smart oturumu 5+ dakika
+comm_lost uretmez; `continuous`ta bayatlik **aynen** calisir (regresyon
+guvenligi); beklenen kapanma `smart_idle` uretir; eski kare **sonsuz
+relink dongusu uretemez**; recovery timeout sonrasi ayni kare `lost` birakir,
+**yeni** kanit izni geri acar; yeni link + yeni kare `online` yapar; uyanma
+pazarliginda comm_lost ertelenir ama grace dolunca **yayinlanir**; link
+**flap** ederse erteleme sonsuz uzamaz; `auto` etkin politikaya gore Smart
+ya da Continuous semantigi uygular; ve ucdan uca durum modeli
+(`smart_idle -> recovering -> online -> smart_idle`, comm_lost **hic yok**).
+
+### G-SMART-QUIET-FIELD-01 — saha sessizlik sorusturmasi
+
+**2026-08-20 saha gozlemi:** Horstmann Smart Navigator 2.0, `listening` uc,
+panelde Operation Mode = SMART, oturum hareketsizlik zaman asimi 600 sn.
+tcpdump gateway -> cihaz yonunde **~5.73 saniyede bir 24 baytlik** uygulama
+yuku gosterdi; 600 saniyelik sayac hicbir zaman dolamadi.
+
+#### Cerceve cozumlemesi (yadnp3 3.2.1.1 ile OLCULDU)
+
+| Cerceve | TCP yuk |
+|---|---|
+| 3 sinif obje basligi (`60/2, 60/3, 60/4` = **Class 1,2,3 event scan**) | **24 bayt** |
+| 4 sinif obje basligi (`+60/1` = Class 0+1+2+3 integrity) | 27 bayt |
+| Bos (NULL) yanit | **17 bayt** |
+
+Sahada gozlenen **24/17** ikilisi tam olarak *"Class 1/2/3 event scan +
+olay yok yaniti"* imzasidir. Kadans 5.73s = `DNP3_EVENT_SCAN_INTERVAL_SEC=5`
++ ~0.73s yanit suresi.
+
+#### KOK NEDEN: konfigurasyon — gateway politika mantigi DOGRU
+
+Class 1/2/3 event scan'i kuran **tek** yer `_periyodik_scan_ekle()` ve o
+**yalnizca** `session_policy != "smart"` iken cagrilir. Yani saha cihazi
+**etkin `smart` politikayla kosmuyordu**.
+
+> **Gateway kodu kendi politikasinin gerektirdigini yapti.** "Operation Mode
+> = Smart gorunce politikayi ez" seklinde bir degisiklik **yapilmadi** —
+> mimariyi bozardi ve Grid'in acik niyetini sessizce degistirirdi.
+
+`configured_session_policy == "smart"` iken periyodik tarama kurulmasi
+**koden imkansizdir**; propagasyon zinciri de dogrulandi (disk onbellegi
+`asdict` ile tum alanlari korur, fingerprint politikayi icerir, 1.13.0'daki
+listening dusurmesi gercekten kaldirilmis).
+
+#### Fixed — Smart sessizlik sizintilari (kok neden DEGIL, ama config duzeltilince ISIRIRDI)
+
+- **Link keepalive 60 saniyede bir LINK_STATUS gonderiyordu.** OLCULDU:
+  `cfg.link.KeepAliveTimeout` varsayilani **60000 ms** ve gateway onu **hic
+  ayarlamiyordu**. Tamamen sessiz bir master bile 60. saniyede 10 baytlik
+  bir cerceve gonderiyor. Horstmann sayaci **her** TCP/DNP trafigiyle
+  sifirlandigi icin bu, **taramalar kapatilsa bile** modemin uyumasini
+  imkansiz kilardi. Saha yakalamasi 17 saniyelikti ve bu cerceveyi
+  **gormedi**. `smart` cihazlarda `TimeDuration.Max()` ile kapatildi;
+  **`continuous`ta dokunulmadi**.
+
+- **G110 string okumasi `smart` kapisiyla korunmuyordu.** Ayni fonksiyondaki
+  diger tum yoklamalar korunuyordu. Cihaz G110 dondurmezse 15/30/60/120/240
+  sn backoff ile **6 `ScanRange`** gidiyordu — sessizlik penceresinin tam
+  ortasina dusen **tekrarlayan** uygulama istekleri. Artik `smart`ta oturum
+  basina **tek deneme**; `continuous`ta backoff **aynen** korunur.
+
+- **Bilinen kutuphane siniri (kapatilamadi, belgelendi):** yadnp3
+  `MasterParams.startupIntegrityClassMask` alanini **sunmuyor**;
+  `AssignClassDuringStartup=False` acilis integrity poll'unu kapatmaz. Bu
+  **tek atisliktir** ve 600 sn sayacini engellemez.
+
+#### Changed — gozlem ile eylem AYRILDI
+
+`Operation Mode` artik **her cihazda** okunur ve raporlanir; **etkin
+politika yalnizca `auto`da** degistirilir.
+
+> Once ikisi tek bir erken donuse bagliydi. Sonucu sinsiydi: `continuous`
+> yapilandirilmis bir cihaz modu durustce raporlasa bile
+> `operation_mode="unknown"` kaliyordu — yani **"panel SMART diyor ama
+> gateway continuous kosuyor"** uyusmazligi gateway'in **hicbir yuzeyinde**
+> gorunmuyordu ve teshis icin **tcpdump** gerekti.
+
+Uyusmazlik artik kenar-tetikli `device_policy_mismatch` WARNING'i uretir.
+**Politika DEGISTIRILMEZ** — operatore backend duzeltmesi soylenir.
+
+#### Changed — saha teshis loglari
+
+`yadnp3_master_enabled` artik `ip_endpoint_type`, `configured_policy`,
+`effective_policy`, `operation_mode`, **`periodic_scans=true|false`**,
+`event_scan`, `baseline_scan` alanlarini **acikca** basar. Calisma aninda
+taramalar acilirsa `yadnp3_periodic_scans_enabled` gecis logu basilir.
+Kimlik bilgisi/token **basilmaz**.
+
+Amac: bir sonraki saha teshisinde "bu cihaz kazara `continuous` mu kosuyor"
+sorusu **tek `docker logs | grep` ile** cevaplanabilsin.
+
+#### Test — +18 (1416 -> 1434)
+
+`tests/test_smart_quiet_field_regression.py`: **gercek DNP3 + gercek TCP
+bayt sayimi** ile listening senaryosu (iki client'i birlestiren bulusma
+proxy'si; yadnp3 `AddOutstationTCPServer` sunmadigi icin).
+
+Kapsam: listening+smart uygulama trafigi **0**, listening+continuous trafik
+**devam eder** (regresyon guvenligi), politikanin `DeviceConfig`ten
+`_ManagedMaster`a **gercek `_ensure_master` yolundan** tasindigi
+(master **elle kurulmaz** — saha hatasi tam o entegrasyon katmanindaydi),
+`session_policy`nin disk onbelleginde kaybolmadigi, auto+Smart/Boost
+cozumleri, Boost->Smart gecisinde **bayat tarama gorevi kalmadigi** (gercek
+trafikle), keepalive kapatmasinin **kutuphane duzeyinde olculmesi**, G110
+tek-deneme kapisi, uyusmazlik uyarisinin **politikayi ezmedigi**, ve teshis
+log alanlari.
+
+#### Saha kabulu
+
+`docs/FIELD_ACCEPTANCE.md` bolum **3G** eklendi: 2026-08-20 gozlemi
+**FAIL / RETEST GEREKLI** olarak kayitli. Hicbir madde PASS isaretli
+**degildir**. Retest en az **90 saniyelik** capture ister — ilk gozlem
+~17 saniyeydi ve 30 saniyelik baseline taramasini (27 bayt) kacirdi.
+
+### PR #33 review kapanisi
+
+- **Yayinci GERCEK poll yoluna baglandi.** `mark_dirty()` yalnizca izole
+  test ediliyordu; uretimde HIC tetiklenmiyordu ve durum degisiklikleri
+  ancak yayincinin **30sn'lik yedek uyanmasinda** gorulurdu. Artik
+  `run_poll_cycle` sonrasi **`finally` dalinda** cagriliyor — bir cycle
+  patlasa bile durum degismis olabilir (`read_device` bir cihazi `lost`a
+  cekip sonrakinde hata verebilir), ve tam da o gecisler en ilginc olanlar.
+  Config degisiminde (`changed=True`) `request_snapshot()` cagriliyor:
+  delta **silinen** bir cihazi tasimaz, uzlastirma ancak tam snapshot ile olur.
+  Gecikme artik **~poll araligi + debounce**.
+
+- **Standart kurulum yolu eklendi.** `docker/compose.template.yml`
+  `DEVICE_HEALTH_*` degiskenlerini container'a **gecirmiyordu**; ozellik
+  normal render edilmis kurulumlarda compose **elle duzenlenmeden**
+  acilamiyordu. Artik compose degisken ikamesi kullaniliyor
+  (`${DEVICE_HEALTH_PUBLISH_ENABLED:-false}`), yani operator dosyayi
+  **duzenlemeden** yanindaki `.env` ile aciyor — elle duzenleme bir sonraki
+  render'da **sessizce geri alinirdi**. `render_compose.py
+  --device-health-enabled` render varsayilanini acar; **varsayilan yine
+  kapali**.
+
+- **Cok parcali snapshot korelasyonu.** `device_total` **tek basina
+  yetmiyordu**: kismi bir basarisizliktan sonra cihaz seti degisse bile
+  toplam ayni kalabilir (200 → 200) ve backend yarim kalan **eski**
+  snapshot ile yenisini **ayirt edemezdi** — ikisini birlestirip tutarsiz
+  bir tablo kurar, "eksik kalanlari sil" mantigi varsa **var olan
+  cihazlari silerdi**.
+
+  Eklenen alanlar: **`snapshot_id`**, **`snapshot_batch_index`** (0 tabanli),
+  **`snapshot_batch_count`**. Ayni tam snapshot'in tum partileri ayni
+  kimligi paylasir; yeniden deneme **her zaman yeni** kimlik uretir (veri
+  yeniden okunur). Delta'da uc alan da `null`. `(boot_id, sequence)` istek
+  basina bayat siralama icin **aynen** kalir.
+
+- **Ayri HTTP istemcisi/oturumu** (opsiyonel sertlestirme, `command_client`
+  ile ayni kalip). `config_client` ile paylasilsaydi saglik POST'lari
+  config-refresh ile **ayni baglanti havuzunu** tuketirdi: 200 cihazlik bir
+  snapshot 4 istek demektir ve havuz doluyken config yenilemesi beklerdi.
+
+### Semantik — v1.14 AYNEN korunur
+
+* `smart_idle` **!= offline** — saglikli uykudur.
+* `report_late` **!= lost** — DEGRADED uyaridir; `connection_state`
+  `smart_idle` **kalir**.
+* Sonda sonuclari `connection_state`i **belirlemez**; salt teshistir.
+* `operation_mode`: **1 = Smart, 0 = Boost**.
+* **Satellite** Operation Mode **yok sayilir**, tel kaydina **girmez**.
+* **Boost Mode Enabled** bir yetenektir; calisma-zamani siniflandirmasina
+  **girmez** ve tel kaydinda **yer almaz**.
+
+### Izolasyon
+
+Basarisiz bir saglik teslimi **hicbirini** etkilemez: DNP3 okuma dongusu,
+komut duzlemi, telemetri yayini, toplu saglik basligi. Yayinci **kendi
+daemon thread'inde** kosar; `mark_dirty()` poll thread'inden cagrilir ve
+**asla bloklamaz**. Kapanista reader'dan **once** durdurulur — ucusta bir
+istek `device_health()`i yikilmakta olan bir adapter uzerinde cagirmasin.
+
+### KOMUT DUZLEMI DEGISMEDI
+
+`/pending` semantigi, F1–F7, DirectOperate, SBO, teslim token'lari,
+CommandLedger, CROB ve komut kuyrugu davranisi **aynen** duruyor.
+`X-E1-Gateway-Health` toplu basligi **geriye uyumlu** kaldi.
+
+### Test
+
+`tests/test_device_health_transport.py` — 31 test: 1 cihaz, 200 cihaz
+(4 parti), uzun cihaz kodlariyla gercekci govde boyutu, partinin **govdede**
+gittigi (baslikta degil, AST ile), `/pending` basliginin 200 cihazda da
+sinirli kaldigi, `online -> smart_idle -> late -> lost -> kurtarma`
+gecisleri, Smart/Boost modu, `boost_mode_enabled`in calisma-zamanina
+giremedigi, backend erisilemezken **sinirli** bellek, retry/backoff,
+`mark_dirty`nin bloklamadigi (1000 cagri < 0.5sn), kapanis guvenligi,
+restart siralamasi ve bayat yeniden gonderim sozlesmesi.
+
+### Grid entegrasyonu BEKLIYOR
+
+Backend ucu **henuz yok**. Bu surum tasiyiciyi getirir ama
+`DEVICE_HEALTH_PUBLISH_ENABLED` **varsayilan kapalidir**. Grid tarafi
+`docs/GRID_DEVICE_HEALTH_API.md` bolum 10'daki kontrol listesini
+tamamlayana kadar acilmamalidir.
+
 ## [1.14.0] - 2026-08-20
 
 **G-SMART-LISTEN-01** — Horstmann `listening` ucta Smart/Boost/Auto yasam

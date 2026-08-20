@@ -8,8 +8,12 @@
 #   {{BACKEND_API_URL}} — backend public URL (orn. https://api.enerjione.local/api/v1)
 #   {{NATS_URL}}        — JetStream URL (orn. nats://enerjione-nats:4222)
 #   {{HOST_HEALTH_PORT}}— host tarafinda exposed port (her instance icin farkli)
-#   {{IMAGE}}           — docker image tag (orn. ghcr.io/enerjione/enerjione-grid-dnp3-gateway:1.14.0)
+#   {{IMAGE}}           — docker image tag (orn. ghcr.io/enerjione/enerjione-grid-dnp3-gateway:1.15.0)
 #   {{APP_ENVIRONMENT}} — production | staging | development
+#   {{DEVICE_HEALTH_ENABLED_DEFAULT}} — cihaz saglik kanalinin RENDER edilmis
+#                         varsayilani ("true"/"false", varsayilan "false").
+#                         Operator bunu compose'u DUZENLEMEDEN ezebilir:
+#                         `.env`e DEVICE_HEALTH_PUBLISH_ENABLED=true yazmak yeter.
 #   {{INSTALL_MODE}}    — local | remote. NATS ERISILEMEDIGINDE ne olacagini
 #                         BELIRLER: `local` (gateway backend ile ayni makinede)
 #                         NATS'i zorunlu tutar, HTTP yedegi YOKTUR — ayni makinede
@@ -114,6 +118,27 @@ services:
       # bunlar YALNIZCA legacy DNP3_LIBRARY=dnp3py dalinda gecerli; varsayilan
       # yadnp3 adapter'i onlari yok sayiyor ve set edilmeleri operatoru
       # "ayari degistirdim ama bir sey olmadi" cikmazina sokuyordu.
+      # --- CIHAZ BASINA CALISMA-ZAMANI SAGLIGI (1.15.0) -------------------
+      # AYRI, GIDEN kanal: POST /gateways/{code}/device-health
+      # `X-E1-Gateway-Health` toplu basligi OLDUGU GIBI kalir ve BUYUTULMEZ;
+      # o baslik `/pending`e (FIZIKSEL KOMUT KANALI) biner ve tavani ~2 KB'dir.
+      #
+      # DEGERLER COMPOSE DEGISKEN IKAMESIYLE VERILIR (`${VAR:-varsayilan}`).
+      # Boylece operator bu DOSYAYI DUZENLEMEDEN ozelligi acabilir: compose
+      # dosyasinin yanindaki `.env`e `DEVICE_HEALTH_PUBLISH_ENABLED=true`
+      # yazip `docker compose up -d` yeter. Render edilmis dosyayi elle
+      # duzenlemek, bir sonraki render'da sessizce GERI ALINIRDI.
+      #
+      # VARSAYILAN KAPALI: backend ucu tanimadan acilirsa her turda 404
+      # alinir ve log dolar. DEVREYE ALMA SIRASI: ONCE BACKEND ucu, SONRA
+      # bu bayrak. Sozlesme: docs/GRID_DEVICE_HEALTH_API.md
+      DEVICE_HEALTH_PUBLISH_ENABLED: "${DEVICE_HEALTH_PUBLISH_ENABLED:-{{DEVICE_HEALTH_ENABLED_DEFAULT}}}"
+      # Tek HTTP govdesindeki azami cihaz sayisi (1..500).
+      DEVICE_HEALTH_BATCH_MAX: "${DEVICE_HEALTH_BATCH_MAX:-50}"
+      # Periyodik TAM anlik goruntu (uzlastirma) araligi, saniye (30..86400).
+      DEVICE_HEALTH_SNAPSHOT_INTERVAL_SEC: "${DEVICE_HEALTH_SNAPSHOT_INTERVAL_SEC:-300}"
+      # Degisiklik toplama penceresi, saniye (0..60).
+      DEVICE_HEALTH_CHANGE_DEBOUNCE_SEC: "${DEVICE_HEALTH_CHANGE_DEBOUNCE_SEC:-2.0}"
       LOG_LEVEL: "INFO"
       LOG_FORMAT: "json"
       SHOW_GATEWAY_TOKEN_ON_START: "false"

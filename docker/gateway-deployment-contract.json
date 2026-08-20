@@ -1,8 +1,8 @@
 {
   "contract_version": 1,
-  "gateway_release": "1.14.0",
-  "gateway_source_ref": "v1.14.0",
-  "gateway_source_sha": "e1181ae2ad3481e49883956b2e4ff6d2b8ae7287",
+  "gateway_release": "1.15.0",
+  "gateway_source_ref": "v1.15.0",
+  "gateway_source_sha": "1bea87f6ec22696f0a5d7654047caa0b4bbd5f3f",
   "gateway_source_sha_semantics": "BU DOSYADAKI DEGER, KENDISINI ICEREN COMMIT DEGILDIR ve olamaz: dosyaya yeni SHA yazmak yeni bir commit uretir ve SHA yeniden degisir (self-referential). Buradaki deger, bu sozlesmenin turetildigi YAYIMLANMIS BASELINE surumun commit'idir. Bir artifact'in GERCEK revizyonu iki yerde yasar ve ikisi de release sirasinda uretilir: (1) imaj etiketi org.opencontainers.image.revision=<GITHUB_SHA>, (2) release workflow'un urettigi gateway-deployment-contract.generated.json (gateway_source_sha alani GITHUB_SHA ile doldurulur). Tuketiciler revizyon icin BUNLARA bakmali; kaynak dosyadaki deger yalnizca baseline'dir.",
   "owner": "enerjione/enerjione-grid-dnp3-gateway",
   "description": "Bir uretim DNP3 gateway kurulumunun TASIMASI GEREKEN deployment sozlesmesi. Gateway repo'su sahibidir; Grid repo'su tam kopyasini vendor eder ve CI'da karsilastirir. Runtime'da iki repo birbirine baglanmaz.",
@@ -130,7 +130,7 @@
       "production_guard": "Gateway, production'da bu degerin GATEWAY_TOKEN veya GATEWAY_COMMAND_TOKEN ile ayni olmasini reddeder."
     }
   },
-  "gateway_source_sha_baseline_ref": "v1.13.0",
+  "gateway_source_sha_baseline_ref": "v1.14.0",
   "smart_session": {
     "supported": true,
     "semantics": "Horstmann Smart Navigator 2.0 Smart/Boost oturum yasam dongusu. Politika CIHAZ BASINA yapilandirilir (session_policy) ya da auto ile MASTER Operation Mode'dan turetilir. 1.14.0: UC TIPI (ip_endpoint_type) ile MOD (session_policy) BAGIMSIZ iki kavramdir ve alti kombinasyonun HEPSI desteklenir. Varsayilan 'continuous' oldugu icin mevcut kurulumlarin davranisi DEGISMEZ.",
@@ -234,7 +234,35 @@
     ],
     "diagnostics_counters_semantics": "dropped_total = kuyruk DOYGUNLUGU nedeniyle kabul edilmeyen is. cancelled_total = KAPANISTA iptal edilen (baslamamis) is. completed_total = fiilen CALISTIRILAN is. Uc sayac AYRI tutulur: doygunluk ile kapanis farkli seyler soyler ve karistirilirlarsa operator yanlis yere bakar.",
     "diagnostics_shutdown_failure_behavior": "fail_closed_abort_teardown",
-    "diagnostics_shutdown_failure_semantics": "Tanilama iscileri sure icinde cikmazsa (shutdown() False doner ya da kendisi patlarsa) master/kanal yikimina DEVAM EDILMEZ: ERROR loglanir ve Yadnp3ShutdownError firlatilir. Loglayip devam etmek, ihlal edilen degismezi bir log satirina indirger ve use-after-free yarisini fiilen KABUL ederdi. Yikimi yarida birakmanin maliyeti daha dusuktur: proses zaten kapaniyor ve soketleri isletim sistemi kapatir. Oturum durumu (session store) bu kapidan ONCE diske yazilir, boylece yarida kalan bir kapanis restart'ta sahte comm_lost firtinasi uretmez. Yadnp3ShutdownError, Yadnp3AdapterError'den turer (mevcut genis except bloklari kirilmaz) ve main kapanis yolunda AYRI yakalanip ERROR loglanir - genel except onu DEBUG'a gomerdi."
+    "diagnostics_shutdown_failure_semantics": "Tanilama iscileri sure icinde cikmazsa (shutdown() False doner ya da kendisi patlarsa) master/kanal yikimina DEVAM EDILMEZ: ERROR loglanir ve Yadnp3ShutdownError firlatilir. Loglayip devam etmek, ihlal edilen degismezi bir log satirina indirger ve use-after-free yarisini fiilen KABUL ederdi. Yikimi yarida birakmanin maliyeti daha dusuktur: proses zaten kapaniyor ve soketleri isletim sistemi kapatir. Oturum durumu (session store) bu kapidan ONCE diske yazilir, boylece yarida kalan bir kapanis restart'ta sahte comm_lost firtinasi uretmez. Yadnp3ShutdownError, Yadnp3AdapterError'den turer (mevcut genis except bloklari kirilmaz) ve main kapanis yolunda AYRI yakalanip ERROR loglanir - genel except onu DEBUG'a gomerdi.",
+    "smart_quiet_invariant": "Bir Smart oturumunun ACILIS isi bittikten sonra gateway UYGULAMA KATMANINDA SUSAR: event scan KAPALI, periyodik baseline/integrity scan KAPALI, tekrarlayan uygulama keepalive KAPALI, link katmani keepalive KAPALI, G110 string okumasi OTURUM BASINA EN FAZLA BIR deneme. Outstation'dan gelen unsolicited/olay yanitlari NORMAL kabul edilir. Tek atislik acilis/integrity isi sozlesmece serbesttir.",
+    "smart_link_keepalive_disabled": true,
+    "smart_link_keepalive_rationale": "OLCULDU (yadnp3 3.2.1.1): cfg.link.KeepAliveTimeout varsayilani 60000 ms ve 1.14.0'a kadar HIC ayarlanmiyordu. Tamamen sessiz bir master bile 60. saniyede 10 baytlik LINK_STATUS gonderiyor. Horstmann hareketsizlik sayaci HER TCP/DNP trafigiyle sifirlandigi icin bu, 600 saniyelik oturum sayacini SONSUZA KADAR sifirlar: taramalar kapatilsa BILE modem uyuyamaz. smart'ta TimeDuration.Max() ile devre disi birakilir. CONTINUOUS'TA DOKUNULMAZ.",
+    "smart_g110_max_attempts_per_session": 1,
+    "smart_g110_rationale": "G110 string okumasi (seri no/IMEI/firmware) 1.14.0'a kadar smart kapisiyla KORUNMUYORDU; cihaz cevap vermezse 15/30/60/120/240 sn backoff ile 6 ScanRange gidiyordu - tam da sessizlik penceresinin ortasina dusen TEKRARLAYAN uygulama istekleri. Artik smart'ta oturum basina TEK deneme (acilis isi olarak serbest); continuous'ta backoff AYNEN korunur.",
+    "startup_integrity_not_suppressible": "KUTUPHANE SINIRI: yadnp3 MasterParams `startupIntegrityClassMask` alanini BINDING'DE SUNMUYOR. AssignClassDuringStartup=False acilis 'assign class' gorevini kapatir ama opendnp3'un acilis integrity poll'unu KAPATMAZ. Bu TEK ATISLIKtir (cihaz cevap verince tekrarlanmaz) ve 600sn sayacini ENGELLEMEZ; sozlesme geregi serbest birakilmistir.",
+    "operation_mode_observed_on_all_policies": true,
+    "operation_mode_observation_vs_action": "GOZLEM ile EYLEM AYRIDIR. Operation Mode HER cihazda okunur ve /health uzerinden raporlanir; ETKIN POLITIKA ise YALNIZCA configured_session_policy=auto iken degistirilir. Yapilandirilan politika HER ZAMAN otoriterdir - gateway Operation Mode'a bakip politikayi ASLA ezmez. Once ikisi tek bir erken donuse bagliydi ve sonucu sinsiydi: continuous yapilandirilmis bir cihaz modu durustce raporlasa bile operation_mode='unknown' kaliyordu, yani 'panel SMART diyor ama gateway continuous kosuyor' uyusmazligi gateway'in HICBIR yuzeyinde gorunmuyordu ve teshis icin tcpdump gerekiyordu.",
+    "policy_mismatch_warning": "device_policy_mismatch: gozlenen mod smart ama etkin politika smart DEGIL ise KENAR-TETIKLI WARNING. Politika DEGISTIRILMEZ; operatore backend'de session_policy duzeltmesi soylenir.",
+    "master_enabled_log_fields": [
+      "device",
+      "mode",
+      "endpoint",
+      "remote",
+      "local",
+      "ip_endpoint_type",
+      "configured_policy",
+      "effective_policy",
+      "operation_mode",
+      "periodic_scans",
+      "event_scan",
+      "baseline_scan"
+    ],
+    "smart_state_model": "smart_idle -> link open -> recovering -> TAZE DNP3 kaniti -> online -> beklenen kapanma -> smart_idle. Basarisizlik: recovering -> grace taze kanit olmadan dolar -> lost. lost -> YENI baglanti/YENI kanit -> recovering -> YENI kanit -> online.",
+    "smart_no_telemetry_age_comm_lost": true,
+    "smart_no_telemetry_age_comm_lost_rationale": "Bayatlik esigi scan_interval/baseline_interval'den turetilir ve ortuk varsayimi 'saglikli cihaz her tarama turunda cevap verir'dir. Bu varsayim SUREKLI politikaya aittir; smart'ta tarama YOKTUR, dolayisiyla KANITLANMIS ve SAGLIKLI bir oturum esik kadar sonra GARANTILI olarak bayat olur ve sahte comm_lost uretir (sahada 120sn'de gorulduu). Smart bir oturum online'dan YALNIZCA link kapanmasi ya da smart_max_silence_sec ile cikar. Uzun vadeli 'cihaz kayip mi' olcutu Dial-In + sessizlik esigidir, olcum yasi DEGILDIR. CONTINUOUS'ta bayatlik davranisi AYNEN korunur.",
+    "recovery_proof_boundary": "evidence_generation: her gecerli DNP3 kaniti (olcum ya da IIN/gorev basarisi) bir sayaci artirir. fail_recovery o andaki nesli kaydeder; lost -> recovering gecisi ancak nesil ARTMIS ise (ya da YENI link acilisi olmussa) izinlidir. Boylece ESKI bir kare recovery'yi tekrar tetikleyemez ve sahada gorulen deterministik ~15 saniyelik lost/relink salinimi IMKANSIZ olur. SAYAC kullanilir, zaman damgasi DEGIL: time.monotonic() Windows'ta ~15.6ms cozunurluklu ve fail_recovery ile hemen ardindan gelen gercek bir kanit ayni tick'e dusebiliyor.",
+    "smart_wake_comm_lost_deferral": "bounded_by_grace: smart bir cihaz uyandiginda recovering sirasinda comm_lost ERTELENIR (bastirilmaz). Erteleme recovery_age'e DEGIL AYRI bir damgaya baglidir: link FLAP ederse her OnOpen recovery_age'i sifirlar ve bozuk bir cihaz SONSUZA KADAR gizlenirdi. Damga yalnizca GERCEK online gecisinde sifirlanir; grace dolunca comm_lost YAYINLANIR. CONTINUOUS'ta recovering sirasinda comm_lost tutma davranisi DEGISMEDI."
   },
   "initiating_endpoint": {
     "why": "ip_endpoint_type=initiating cihazlarda baglantiyi CIHAZ baslatir. Gateway container ICINDE cihazin master_ip_port degerini dinler; bridge ag modunda o port host'a acilmazsa cihaz baglanamaz.",
@@ -251,5 +279,60 @@
     "host_port_uniqueness_scope": "DEPLOYMENT/ORKESTRASYON SORUMLULUGU. Gateway prosesi ayni host'taki kardes instance'lari GOREMEZ; dagitik bir port ayirici gateway icinde UYDURULMAZ. Orkestrator her gateway'e AYRIK bir blok vermeli (orn. GW-001 20100-20199, GW-002 20200-20299).",
     "network_mode": "bridge (host networking KULLANILMAZ — sinirsiz maruziyet)",
     "docker_proxy_cost": "Docker varsayilan userland-proxy ile yayinlanan HER port icin bir docker-proxy sureci baslatir. Blogu gercek initiating cihaz sayisina gore olcun."
+  },
+  "device_runtime_health_transport": {
+    "supported": true,
+    "min_gateway_version": "1.15.0",
+    "schema": "device_health_v1",
+    "http_method": "POST",
+    "path": "/gateways/{gateway_code}/device-health",
+    "auth": "canonical_gateway_credential: X-Gateway-Token + X-Gateway-Code + X-Gateway-Instance-Id + X-Request-Id (build_config_request_headers). YENI BIR CREDENTIAL SISTEMI YOK. Komut duzlemine ozel X-Gateway-Command-Token BILEREK GONDERILMEZ: saglik telemetrisi komut yetkisi gerektirmez ve o sirri yaymak F5'te ayrilan iki duzlemi yeniden birlestirirdi.",
+    "transport": "http_body",
+    "why_not_header": "X-E1-Gateway-Health basligi /pending isteklerine biner (FIZIKSEL KOMUT KANALI) ve backend tavani ~2KB'dir (MAX_HEADER_BYTES=1600). 200+ cihaz oraya SIGMAZ. Baslik buyutulseydi bir proxy/backend baslik limitinde /pending 400 doner ve KESICI KOMUTLARI DURURDU. Toplu baslik AYNEN korunur ve BUYUTULMEZ.",
+    "aggregate_header_unchanged": true,
+    "direction": "outbound_gateway_to_backend",
+    "ordering_model": "(boot_id, sequence) leksikografik. sequence = proses ici monotonik sayac; boot_id = her proses baslangicinda ARTAN, diskte tutulan sayac. gateway_instance_id TEK BASINA YETMEZ: o kimlik KALICIDIR ve restart'ta AYNI kalir, yani sifirlanan bir sequence ile birlesince backend iki calismayi ayirt edemez. DUVAR SAATI KULLANILMAZ: RTC'si bos acilan gateway'ler ve NTP siçramalari gercektir.",
+    "stale_write_protection": "Backend (boot_id, sequence) ikilisi ESKI ya da ESIT olan bir partiyi REDDEDEBILIR/YOK SAYABILIR. Gateway garantisi: eski bir calismanin partisi HER ZAMAN daha kucuk boot_id tasir, sequence'i ne kadar ilerlemis olursa olsun.",
+    "batch_max_default": 50,
+    "batch_max_range": "1..500",
+    "delivery_model": "startup'ta TAM snapshot; durum degisiminde DELTA (yalnizca degisen cihazlar); periyodik TAM snapshot ile uzlastirma (varsayilan 300sn). Bir snapshot birden fazla partiye bolunebilir; HEPSI snapshot=true tasir ve device_total kac cihaz beklendigini soyler.",
+    "snapshot_interval_sec_default": 300,
+    "retry": "bounded_exponential_backoff: 2sn -> 120sn tavan, +/-%20 jitter",
+    "backpressure": "coalescing_latest_state: cihaz basina EN SON durum tutulur, gecis basina DEGIL. Backend erisilemezken bellek cihaz sayisi kadar SINIRLI kalir (200 cihaz = en fazla 200 kayit, kesinti ne kadar surerse sursun). DISKE HICBIR SEY YAZILMAZ. Bu kanal KOMUT/OLAY DENETIM GECMISI DEGILDIR; ara gecisler bilincli olarak DUSURULUR.",
+    "blocks_dnp3_read_loop": false,
+    "blocks_command_plane": false,
+    "blocks_telemetry": false,
+    "isolation": "KENDI daemon thread'inde kosar. mark_dirty() poll thread'inden cagrilir ve ASLA BLOKLAMAZ (Event.set). Ag isi thread'in kendisindedir. Basarisiz teslim ne DNP3 okumasini, ne komutlari, ne telemetriyi etkiler.",
+    "probes_affect_connection_state": false,
+    "semantics": "smart_idle != offline (SAGLIKLI uyku). report_late != lost (DEGRADED uyari; connection_state smart_idle KALIR). Sonda sonuclari connection_state'i BELIRLEMEZ. operation_mode: 1=Smart, 0=Boost. Satellite Operation Mode YOK SAYILIR. Boost Mode Enabled (yetenek) calisma-zamani siniflandirmasina GIRMEZ.",
+    "connection_states": [
+      "online",
+      "smart_idle",
+      "recovering",
+      "lost",
+      "listener_error",
+      "unknown"
+    ],
+    "default_enabled": false,
+    "default_enabled_rationale": "DEVICE_HEALTH_PUBLISH_ENABLED varsayilan false. Backend bu ucu tanimadan acilirsa her turda 404 alinir ve log dolar. Grid tarafi hazir olunca acilir; kapaliyken HICBIR thread baslatilmaz.",
+    "env": [
+      "DEVICE_HEALTH_PUBLISH_ENABLED",
+      "DEVICE_HEALTH_BATCH_MAX",
+      "DEVICE_HEALTH_SNAPSHOT_INTERVAL_SEC",
+      "DEVICE_HEALTH_CHANGE_DEBOUNCE_SEC"
+    ],
+    "integration_doc": "docs/GRID_DEVICE_HEALTH_API.md",
+    "snapshot_correlation": "snapshot_id + snapshot_batch_index (0 tabanli) + snapshot_batch_count. Ayni TAM snapshot'in TUM partileri AYNI snapshot_id'yi paylasir; YENI bir tam snapshot YENI kimlik alir. Delta partilerinde uc alan da null'dur. device_total TEK BASINA YETMEZ: kismi basarisizlik sonrasi cihaz seti degisse bile toplam ayni kalabilir (200 -> 200) ve backend yarim kalan eski snapshot ile yenisini AYIRT EDEMEZ; ikisini birlestirip tutarsiz tablo kurar ya da 'eksik kalanlari sil' mantigi varsa VAR OLAN cihazlari siler.",
+    "snapshot_id_format": "{boot_id}-{artan_sayac} (saatten BAGIMSIZ)",
+    "snapshot_retry_creates_new_snapshot_id": true,
+    "backend_snapshot_rules": [
+      "ayni snapshot_id'li partileri BIRLESTIR",
+      "yeni snapshot_id baslayinca TAMAMLANMAMIS eskisini AT",
+      "silinen cihazlari YALNIZCA snapshot_batch_count kadar parti geldikten SONRA uzlastir"
+    ],
+    "poll_loop_notification": "run_poll_cycle sonrasi `finally` dalinda mark_dirty(). `finally` BILINCLI: bir cycle patlasa bile durum degismis olabilir (read_device bir cihazi lost'a cekip sonrakinde hata verebilir). Config degisiminde (changed=True) request_snapshot() cagrilir — delta silinen cihazi TASIMAZ.",
+    "state_change_latency": "~poll_interval + change_debounce (yayincinin 30sn yedek uyanmasi DEGIL)",
+    "compose_enable_path": "docker/compose.template.yml DEVICE_HEALTH_* degiskenlerini ${VAR:-varsayilan} ile gecirir. Operator compose dosyasini DUZENLEMEDEN, yanindaki .env ile acar. Elle duzenleme bir sonraki render'da SESSIZCE geri alinirdi. render_compose.py --device-health-enabled bayragi RENDER edilmis varsayilani acar; varsayilan YINE false.",
+    "dedicated_http_client": "AYRI BackendConfigClient/oturum (command_client ile ayni kalip). config_client ile paylasilsaydi saglik POST'lari config-refresh ile AYNI baglanti havuzunu tuketirdi."
   }
 }

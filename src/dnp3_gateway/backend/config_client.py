@@ -297,6 +297,22 @@ class GatewayConfigError(RuntimeError):
     """Backend API config endpoint'inden gecerli bir yanit alinamadi."""
 
 
+class DeviceHealthDeliveryError(GatewayConfigError):
+    """Cihaz saglik partisi backend'e teslim edilemedi.
+
+    `http_status` tasir ama cagiran taraf GECICI/KALICI ayrimini komut
+    duzlemindeki kadar keskin yapmaz: saglik verisi BEST-EFFORT'tur ve
+    kalici bir red (orn. backend bu ucu henuz tanimiyorsa 404) yalnizca
+    geri cekilmeyi buyutur, prosesi ya da baska bir kanali ETKILEMEZ.
+
+    `GatewayConfigError`den turuyor ki mevcut genis yakalayicilar bozulmasin.
+    """
+
+    def __init__(self, message: str, *, http_status: int | None = None) -> None:
+        super().__init__(message)
+        self.http_status = http_status
+
+
 class CommandResultDeliveryError(GatewayConfigError):
     """Komut sonucu backend'e teslim edilemedi.
 
@@ -1298,6 +1314,52 @@ class BackendConfigClient:
             )
             raise CommandResultDeliveryError(
                 f"command-results POST rejected: HTTP {response.status_code}: {preview}",
+                http_status=response.status_code,
+            )
+
+    # -- Cihaz basina calisma-zamani sagligi (G-DEVICE-HEALTH-01) ----------
+
+    def post_device_health(self, payload: dict[str, Any]) -> None:
+        """`POST /gateways/{code}/device-health` — cihaz basina saglik partisi.
+
+        KOMUT DUZLEMINDEN TAMAMEN AYRI. `/pending` semantigine, teslim
+        token'ina, deftere ya da `X-E1-Gateway-Health` basligina DOKUNMAZ.
+        Bu ucun basarisiz olmasi komutlari ya da telemetriyi ETKILEMEZ.
+
+        NEDEN GOVDE, BASLIK DEGIL: toplu saglik basliginin backend tavani
+        ~2 KB'dir ve 200+ cihaz oraya SIGMAZ. Baslik buyutulseydi FIZIKSEL
+        KOMUT KANALI tehlikeye girerdi — `/pending` kesici komutlarinin
+        tasiyicisidir ve bir proxy baslik limitinde 400 donerse komutlar
+        durur.
+
+        AUTH: mevcut kanonik gateway kimligi (`X-Gateway-Token` + kimlik
+        basliklari). YENI BIR CREDENTIAL SISTEMI KURULMAZ. Komut duzlemine
+        ozel `X-Gateway-Command-Token` ise BILEREK GONDERILMEZ: saglik
+        telemetrisi komut yetkisi gerektirmez ve o sirri gereksiz yere
+        yaymak, F5'te ayrilan iki duzlemi yeniden birlestirirdi.
+
+        Hata GECICI kabul edilir ve raise edilir; cagiran (publisher) sinirli
+        ustel geri cekilmeyle yeniden dener.
+        """
+        url = f"{self.base_url}/gateways/{self.gateway_code}/device-health"
+        headers = build_config_request_headers(self.identity)
+        headers["Content-Type"] = "application/json"
+        try:
+            response = self._session.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=self.timeout_sec,
+            )
+        except requests.RequestException as exc:
+            raise DeviceHealthDeliveryError(
+                _scrub_token_from_text(f"device-health POST failed: {exc}", self.identity.token),
+                http_status=None,
+            ) from exc
+        if response.status_code >= 400:
+            preview = _scrub_token_from_text((response.text or "")[:200], self.identity.token)
+            raise DeviceHealthDeliveryError(
+                f"device-health POST rejected: HTTP {response.status_code}: {preview}",
                 http_status=response.status_code,
             )
 

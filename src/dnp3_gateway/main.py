@@ -38,6 +38,7 @@ from dnp3_gateway.backend import (
     health_header,
     parse_device_ip_allowlist,
 )
+from dnp3_gateway.backend.device_health_publisher import DeviceHealthPublisher, next_boot_id
 from dnp3_gateway.command_authorization import authorize_output_command
 from dnp3_gateway.command_freshness import validate_command_freshness
 from dnp3_gateway.config import Settings, get_settings
@@ -576,6 +577,7 @@ def _run_config_refresh(
     stop_event: Event,
     refresh_sec: int,
     config_wake: Event | None = None,
+    device_health_publisher: Any = None,
 ) -> None:
     """Backend config refresh thread'i. Basarili durumda sabit interval (5dk);
     hata durumunda exponential backoff (`refresh_sec → 2*refresh_sec → ... → 300s cap`).
@@ -606,6 +608,15 @@ def _run_config_refresh(
                     consecutive_failures,
                 )
                 consecutive_failures = 0
+            if changed and device_health_publisher is not None:
+                # CIHAZ SETI DEGISTI -> DELTA YETMEZ, TAM snapshot gerek.
+                # Delta yalnizca "degisen cihazlari" tasir; silinen bir cihaz
+                # hicbir delta'da GORUNMEZ ve backend onu sonsuza kadar eski
+                # durumuyla gosterirdi. Uzlastirma ancak tam snapshot ile olur.
+                try:
+                    device_health_publisher.request_snapshot()
+                except Exception:  # noqa: BLE001
+                    logger.debug("device_health_snapshot_request_failed", exc_info=True)
             if changed:
                 logger.info(
                     "config_refresh gateway=%s version=%s devices=%s signals=%s active=%s",
@@ -1306,6 +1317,65 @@ def run(current_settings: Settings | None = None) -> int:
         delivery_provider=lambda: command_ledger.epoch,
     )
 
+    # --- Cihaz basina calisma-zamani sagligi (G-DEVICE-HEALTH-01) --------
+    #
+    # AYRI KANAL. `X-E1-Gateway-Health` toplu basligi OLDUGU GIBI kalir ve
+    # BUYUTULMEZ: o baslik `/pending` isteklerine biner ve backend tavani
+    # ~2 KB'dir. 200+ cihazin cihaz-bazli durumu oraya sigmaz; sigdirmaya
+    # calismak FIZIKSEL KOMUT KANALINI tehlikeye atardi.
+    #
+    # VARSAYILAN KAPALI: backend bu ucu tanimadan acilirsa her turda 404
+    # alinir ve log dolar. Grid tarafi hazir olunca `DEVICE_HEALTH_PUBLISH_
+    # ENABLED=true` ile acilir.
+    def _cihaz_saglik_kaynagi() -> dict[str, Any]:
+        """Adapter'in ANLIK cihaz saglik haritasi. Kopya tutulmaz."""
+        okuyucu = reader_holder.get("reader")
+        fn = getattr(okuyucu, "device_health", None)
+        if not callable(fn):
+            return {}
+        try:
+            return fn() or {}
+        except Exception:  # noqa: BLE001
+            logger.debug("device_health_source_error", exc_info=True)
+            return {}
+
+    # AYRI HTTP ISTEMCISI/OTURUMU — `command_client` ile ayni kalip.
+    #
+    # `config_client` ile paylasilsaydi saglik POST'lari config-refresh ile
+    # AYNI baglanti havuzunu tuketirdi: 200 cihazlik bir snapshot 4 istek
+    # demektir ve havuz doluyken config yenilemesi BEKLERDI. Kanal
+    # izolasyonu ancak oturum da ayriyken GERCEKTIR.
+    #
+    # `health_provider`/`delivery_provider` BILEREK verilmez: bu istemci
+    # `/pending` cagirmaz, dolayisiyla toplu saglik basligini ve teslim
+    # kimligini tasimasinin anlami yoktur.
+    device_health_client = BackendConfigClient(
+        base_url=cfg.backend_api_url,
+        identity=identity,
+        # (connect, read) — saglik best-effort'tur; uzun bir read timeout'u
+        # yayinci thread'ini gereksiz yere tutar.
+        timeout_sec=(3, 10),
+        verify=_tls_verify_param(cfg),
+        response_max_bytes=cfg.backend_response_max_bytes,
+        device_ip_allowlist=device_ip_allowlist,
+        require_response_signature=cfg.require_backend_response_signature,
+    )
+
+    device_health_publisher = DeviceHealthPublisher(
+        health_source=_cihaz_saglik_kaynagi,
+        send=device_health_client.post_device_health,
+        gateway_code=identity.gateway_code,
+        gateway_instance_id=identity.instance_id,
+        # SAATTEN BAGIMSIZ siralama capasi. `instance_id` restart'ta AYNI
+        # kaldigi icin tek basina yetmez (bkz. next_boot_id docstring'i).
+        boot_id=next_boot_id(cfg.gateway_state_dir, gateway_code=identity.gateway_code),
+        batch_max=cfg.device_health_batch_max,
+        change_debounce_sec=cfg.device_health_change_debounce_sec,
+        snapshot_interval_sec=cfg.device_health_snapshot_interval_sec,
+        enabled=cfg.device_health_publish_enabled,
+    )
+    device_health_publisher.start()
+
     refresh_thread = Thread(
         target=_run_config_refresh,
         kwargs={
@@ -1315,6 +1385,7 @@ def run(current_settings: Settings | None = None) -> int:
             "stop_event": stop_event,
             "refresh_sec": cfg.config_refresh_sec,
             "config_wake": config_wake,
+            "device_health_publisher": device_health_publisher,
         },
         name="config-refresh",
         daemon=True,
@@ -1437,6 +1508,20 @@ def run(current_settings: Settings | None = None) -> int:
                         cycle_failures,
                     )
                 metrics.inc_read_error()
+            finally:
+                # CIHAZ SAGLIGI: her cycle sonrasi yayinciyi UYAR.
+                #
+                # `finally` BILINCLI: bir cycle PATLASA bile durum degismis
+                # olabilir — `read_device` bir cihazi `lost`a cekip sonraki
+                # cihazda hata verebilir. `try` icinde olsaydi tam da en
+                # ilginc gecisler (arizali cycle'lar) yayinciya hic
+                # bildirilmezdi ve backend onlari ancak 30sn'lik yedek
+                # uyanmada ogrenirdi.
+                #
+                # BLOKLAMAZ: `mark_dirty` yalnizca `Event.set` yapar; ag isi
+                # yayincinin KENDI thread'indedir. Poll dongusunun sicak
+                # yolunda oldugu icin bu sart.
+                device_health_publisher.mark_dirty()
 
             # Periyodik bakim: disk olcumu, budama. Cycle'dan bagimsiz olarak
             # hata versin diye ayri try; hicbiri poll akisini durdurmamali.
@@ -1483,6 +1568,16 @@ def run(current_settings: Settings | None = None) -> int:
                     )
         except Exception:  # noqa: BLE001
             logger.debug("refresh_thread_join_error", exc_info=True)
+
+        # 1b) Cihaz saglik yayincisi: KENDI thread'i, best-effort kanal.
+        # Reader'dan ONCE durdurulur ki ucusta bir istek `device_health()`i
+        # yikilmakta olan bir adapter uzerinde cagirmasin. Basarisizligi
+        # kapanisin geri kalanini ETKILEMEZ.
+        try:
+            if not device_health_publisher.stop(timeout=5.0):
+                logger.warning("device_health_publisher_stop_incomplete")
+        except Exception:  # noqa: BLE001
+            logger.debug("device_health_publisher_stop_error", exc_info=True)
 
         # 2) Reader: DNP3 master/channel kapanir, TCP RST gonderir
         try:

@@ -727,6 +727,47 @@ class Settings(BaseSettings):
         ),
     )
 
+    # ----- Cihaz basina calisma-zamani sagligi (G-DEVICE-HEALTH-01) --------
+    # AYRI, GIDEN, GOVDE tabanli kanal. `X-E1-Gateway-Health` toplu basligini
+    # DEGISTIRMEZ ve komut duzlemine DOKUNMAZ.
+    device_health_publish_enabled: bool = Field(
+        default=False,
+        description=(
+            "Cihaz basina calisma-zamani sagligini backend'e POST eder "
+            "(/gateways/{code}/device-health). VARSAYILAN KAPALI: backend bu ucu "
+            "tanimadan acilirsa her turda 404 alinir ve log dolar. Grid tarafi "
+            "hazir olunca acilir. Kapaliyken hicbir thread baslatilmaz."
+        ),
+    )
+    device_health_batch_max: int = Field(
+        default=50,
+        ge=1,
+        le=500,
+        description=(
+            "Tek HTTP govdesindeki AZAMI cihaz sayisi. 200+ cihazli filoda tek dev "
+            "govde hem backend'i hem proxy'leri zorlar."
+        ),
+    )
+    device_health_snapshot_interval_sec: int = Field(
+        default=300,
+        ge=30,
+        le=86400,
+        description=(
+            "Periyodik TAM anlik goruntu (uzlastirma) araligi. Delta'lar kaybolsa "
+            "bile backend en gec bu surede gercekle hizalanir."
+        ),
+    )
+    device_health_change_debounce_sec: float = Field(
+        default=2.0,
+        ge=0.0,
+        le=60.0,
+        description=(
+            "Durum degisikligi sonrasi toplama penceresi. Ayni saniyede 200 cihaz "
+            "birden degisirse (config yenilemesi, toplu uyanma) tek partide "
+            "toplanmalari daha iyidir."
+        ),
+    )
+
     dnp3_event_scan_interval_sec: int = Field(
         default=0,
         ge=0,

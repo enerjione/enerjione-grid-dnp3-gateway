@@ -86,8 +86,10 @@ class SahteCache:
     def is_connected(self) -> bool:
         return self._connected
 
-    def g110_gerekli(self) -> bool:
+    def g110_gerekli(self, *, max_deneme: int | None = None) -> bool:
         # Bu testler G110 ile ilgilenmiyor: hic tarama istenmesin.
+        # Imza GERCEK `_DeviceCache` ile ayni olmali; `max_deneme` smart
+        # cihazlarda oturum basina tek denemeyi zorlamak icin gecirilir.
         return False
 
     def g110_tukendi_mi(self) -> bool:
