@@ -151,16 +151,47 @@ def build_envelope(
     snapshot: bool,
     devices: list[dict[str, Any]],
     device_total: int,
+    snapshot_id: str | None = None,
+    snapshot_batch_index: int | None = None,
+    snapshot_batch_count: int | None = None,
 ) -> dict[str, Any]:
     """Gonderilecek govde.
 
-    `snapshot=True`: bu parti TAM durumu temsil eder (uzlastirma). Backend
-    partideki cihazlari o anki gercek kabul edebilir.
+    `snapshot=True`: bu parti TAM durumun bir PARCASIDIR (uzlastirma).
     `snapshot=False`: yalnizca DEGISEN cihazlar (delta).
 
-    `device_total` her iki halde de gateway'in TANIDIGI toplam cihaz
-    sayisidir; backend bir snapshot'in kac partiye bolundugunu bundan
-    anlayabilir.
+    COK PARCALI SNAPSHOT KORELASYONU — `device_total` TEK BASINA YETMEZ
+    ------------------------------------------------------------------
+    Bir snapshot birden fazla partiye bolunur. Kismi bir basarisizliktan
+    sonra backend'in "bu parti HANGI snapshot'a ait" sorusunu
+    cevaplayabilmesi gerekir; `device_total` bunu SOYLEMEZ:
+
+        1. parti (200 cihaz, 1/4) -> BASARILI
+        2. parti                   -> BASARISIZ
+        (cihaz seti degisir; toplam YINE 200)
+        yeniden deneme            -> yeni partiler, `device_total` HALA 200
+
+    `device_total` degismedigi icin backend eski yarim snapshot ile yeniyi
+    AYIRT EDEMEZ ve ikisini birlestirip TUTARSIZ bir tablo kurar — ya da
+    daha kotusu, "eksik kalanlari sil" mantigi calisirsa var olan cihazlari
+    siler.
+
+    Bu yuzden her TAM snapshot kendi `snapshot_id`sini tasir:
+
+      * ayni snapshot'in TUM partileri AYNI `snapshot_id`yi paylasir,
+      * YENI bir tam snapshot YENI bir `snapshot_id` alir,
+      * `snapshot_batch_index` (0 tabanli) ve `snapshot_batch_count` ile
+        backend partinin tam gelip gelmedigini bilir.
+
+    Backend boylece guvenle:
+      * tek bir snapshot'i BIRLESTIREBILIR,
+      * yeni bir snapshot basladiginda TAMAMLANMAMIS eskisini ATABILIR,
+      * silinen cihazlari YALNIZCA snapshot TAMAMLANDIKTAN sonra uzlastirir.
+
+    Delta partilerinde bu uc alan `null`dur.
+
+    `(boot_id, sequence)` ikilisi ISTEK BASINA bayat siralama icin AYNEN
+    kalir; snapshot korelasyonu ONUN YERINE GECMEZ, uzerine eklenir.
     """
     return {
         "schema": SCHEMA_VERSION,
@@ -171,6 +202,10 @@ def build_envelope(
         "boot_id": int(boot_id),
         "sequence": int(sequence),
         "snapshot": bool(snapshot),
+        # COK PARCALI SNAPSHOT KORELASYONU (delta'da null).
+        "snapshot_id": snapshot_id,
+        "snapshot_batch_index": snapshot_batch_index,
+        "snapshot_batch_count": snapshot_batch_count,
         "device_total": int(device_total),
         "devices": devices,
     }

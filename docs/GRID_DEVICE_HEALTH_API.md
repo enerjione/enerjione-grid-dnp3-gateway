@@ -72,6 +72,9 @@ Govde **okunmaz**; yalnizca durum kodu onemlidir. Backend bos govde donebilir.
   "boot_id": 12,
   "sequence": 34,
   "snapshot": true,
+  "snapshot_id": "12-3",
+  "snapshot_batch_index": 0,
+  "snapshot_batch_count": 4,
   "device_total": 200,
   "devices": [ /* bkz. bolum 4 */ ]
 }
@@ -85,6 +88,9 @@ Govde **okunmaz**; yalnizca durum kodu onemlidir. Backend bos govde donebilir.
 | `boot_id` | int ≥ 1 | Her proses baslangicinda **artar**. |
 | `sequence` | int ≥ 1 | Proses ici **monotonik** sayac. |
 | `snapshot` | bool | `true` = tam durum, `false` = yalnizca degisenler. |
+| `snapshot_id` | string \| null | Ayni tam snapshot'in **tum** partilerinde ayni. Delta'da `null`. |
+| `snapshot_batch_index` | int \| null | **0 tabanli** parti sirasi (`0..count-1`). Delta'da `null`. |
+| `snapshot_batch_count` | int \| null | Bu snapshot'in toplam parti sayisi. Delta'da `null`. |
 | `device_total` | int | Gateway'in tanidigi **toplam** cihaz sayisi. |
 | `devices` | array | En fazla `batch_max` (varsayilan 50) kayit. |
 
@@ -216,14 +222,45 @@ gelen (boot_id, sequence) >  saklanan  ->  UYGULA ve sakla
 
 * Acilista **her zaman** bir snapshot gelir.
 * Durum degisiminde delta gelir (varsayilan 2sn toplama penceresi).
+  Gateway her poll cycle'indan **sonra** yayinciyi uyarir, dolayisiyla
+  gecikme **~poll araligi + debounce**tir (yayincinin 30sn'lik yedek
+  uyanmasi **degil**).
+* **Cihaz seti degisince** (config yenilemesi) otomatik olarak **tam
+  snapshot** gonderilir — delta silinen bir cihazi **tasimaz**.
 * Varsayilan **300 saniyede bir** uzlastirma snapshot'i gelir — delta
   kaybolsa bile backend en gec o surede gercekle hizalanir.
 
-> **Bir snapshot birden fazla partiye bolunebilir.** Hepsi `snapshot=true`
-> tasir; kac cihaz beklendigi `device_total` alanindadir. Backend "eksik
-> kalanlari sil" mantigi kuracaksa **`device_total` kadar kayit gorene
-> kadar beklemelidir** — yoksa ilk partiden sonra geri kalan cihazlari
-> yanlislikla siler.
+### Cok parcali snapshot — **`device_total` tek basina YETMEZ**
+
+Bir snapshot birden fazla partiye bolunur ve hepsi `snapshot=true` tasir.
+Partileri **`snapshot_id`** ile eslestirin:
+
+```
+snapshot_id = "12-3"   batch_index=0  batch_count=4   -> BASARILI
+snapshot_id = "12-3"   batch_index=1  batch_count=4   -> BASARISIZ
+    (gateway'de cihaz seti degisir; device_total YINE 200)
+snapshot_id = "12-4"   batch_index=0  batch_count=4   -> yeni snapshot basladi
+```
+
+> **Neden `device_total` yetmez:** iki turda da `200`dur. Yalnizca ona bakan
+> bir backend yarim kalan **eski** snapshot ile yenisini **ayirt edemez**;
+> ikisini birlestirip **tutarsiz** bir tablo kurar — ya da "eksik kalanlari
+> sil" mantigi varsa **var olan cihazlari siler**.
+
+**Backend kurallari:**
+
+1. Ayni `snapshot_id`li partileri **birlestir**.
+2. Yeni bir `snapshot_id` baslayinca **tamamlanmamis eskisini at**.
+3. Silinen cihazlari **yalnizca** `snapshot_batch_count` kadar parti
+   geldikten **sonra** uzlastir.
+
+`snapshot_id` formati `{boot_id}-{artan_sayac}` — **saatten bagimsiz**.
+Kismi bir basarisizliktan sonraki yeniden deneme **her zaman yeni bir
+`snapshot_id`** uretir: veri `health_source`tan yeniden okunur ve bu arada
+cihaz seti degismis olabilir.
+
+`(boot_id, sequence)` **istek basina** bayat siralama icin aynen kalir;
+snapshot korelasyonu onun **yerine gecmez**, uzerine eklenir.
 
 ### Cihaz silme
 
@@ -276,6 +313,27 @@ Yayinci **kendi thread'inde** kosar; poll yolundan yapilan cagrilar
 > **Varsayilan kapali olmasi bilinclidir.** Backend ucu tanimadan acilirsa
 > her turda 404 alinir ve log dolar. Kapaliyken **hicbir thread baslatilmaz**.
 
+### Nasil acilir — compose **duzenlenmeden**
+
+Render edilmis compose bu degiskenleri `${VAR:-varsayilan}` ile gecirir:
+
+```yaml
+DEVICE_HEALTH_PUBLISH_ENABLED: "${DEVICE_HEALTH_PUBLISH_ENABLED:-false}"
+```
+
+Yani compose dosyasinin **yanindaki `.env`e** yazmak yeterlidir:
+
+```bash
+echo "DEVICE_HEALTH_PUBLISH_ENABLED=true" >> .env
+docker compose -f gw-001.yml up -d
+```
+
+> Render edilmis dosyayi **elle duzenlemeyin**: bir sonraki render'da
+> sessizce geri alinir.
+
+Grid renderer'i isterse varsayilani acik da uretebilir:
+`render_compose.py --device-health-enabled`.
+
 **Devreye alma sirasi:** once backend ucu yayina alin, sonra gateway'lerde
 bayragi acin.
 
@@ -287,7 +345,10 @@ bayragi acin.
 - [ ] `X-Gateway-Code` ile yol parametresi uyumu (defans derinligi)
 - [ ] `schema != "device_health_v1"` → reddet
 - [ ] `(boot_id, sequence)` sakla; **eski/esit** olani **yok say**
-- [ ] `snapshot=true` partilerini `device_total` ile uzlastir
+- [ ] `snapshot=true` partilerini **`snapshot_id`** ile birlestir
+- [ ] Yeni `snapshot_id` basladiginda **tamamlanmamis eskisini at**
+- [ ] Silinen cihazlari **yalnizca tam snapshot** (`snapshot_batch_count`
+      kadar parti) geldikten sonra uzlastir
 - [ ] `smart_idle` ve `report_late` icin **ayri** gosterim — `lost` **degil**
 - [ ] Sonda alanlarini **teshis** olarak goster, durum olarak **degil**
 - [ ] Bilinmeyen alanlari **yok say** (ileri uyumluluk: alan eklemek geriye

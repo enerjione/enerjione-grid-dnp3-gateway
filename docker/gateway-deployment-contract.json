@@ -293,6 +293,18 @@
       "DEVICE_HEALTH_SNAPSHOT_INTERVAL_SEC",
       "DEVICE_HEALTH_CHANGE_DEBOUNCE_SEC"
     ],
-    "integration_doc": "docs/GRID_DEVICE_HEALTH_API.md"
+    "integration_doc": "docs/GRID_DEVICE_HEALTH_API.md",
+    "snapshot_correlation": "snapshot_id + snapshot_batch_index (0 tabanli) + snapshot_batch_count. Ayni TAM snapshot'in TUM partileri AYNI snapshot_id'yi paylasir; YENI bir tam snapshot YENI kimlik alir. Delta partilerinde uc alan da null'dur. device_total TEK BASINA YETMEZ: kismi basarisizlik sonrasi cihaz seti degisse bile toplam ayni kalabilir (200 -> 200) ve backend yarim kalan eski snapshot ile yenisini AYIRT EDEMEZ; ikisini birlestirip tutarsiz tablo kurar ya da 'eksik kalanlari sil' mantigi varsa VAR OLAN cihazlari siler.",
+    "snapshot_id_format": "{boot_id}-{artan_sayac} (saatten BAGIMSIZ)",
+    "snapshot_retry_creates_new_snapshot_id": true,
+    "backend_snapshot_rules": [
+      "ayni snapshot_id'li partileri BIRLESTIR",
+      "yeni snapshot_id baslayinca TAMAMLANMAMIS eskisini AT",
+      "silinen cihazlari YALNIZCA snapshot_batch_count kadar parti geldikten SONRA uzlastir"
+    ],
+    "poll_loop_notification": "run_poll_cycle sonrasi `finally` dalinda mark_dirty(). `finally` BILINCLI: bir cycle patlasa bile durum degismis olabilir (read_device bir cihazi lost'a cekip sonrakinde hata verebilir). Config degisiminde (changed=True) request_snapshot() cagrilir — delta silinen cihazi TASIMAZ.",
+    "state_change_latency": "~poll_interval + change_debounce (yayincinin 30sn yedek uyanmasi DEGIL)",
+    "compose_enable_path": "docker/compose.template.yml DEVICE_HEALTH_* degiskenlerini ${VAR:-varsayilan} ile gecirir. Operator compose dosyasini DUZENLEMEDEN, yanindaki .env ile acar. Elle duzenleme bir sonraki render'da SESSIZCE geri alinirdi. render_compose.py --device-health-enabled bayragi RENDER edilmis varsayilani acar; varsayilan YINE false.",
+    "dedicated_http_client": "AYRI BackendConfigClient/oturum (command_client ile ayni kalip). config_client ile paylasilsaydi saglik POST'lari config-refresh ile AYNI baglanti havuzunu tuketirdi."
   }
 }

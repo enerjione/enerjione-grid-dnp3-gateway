@@ -105,6 +105,11 @@ class DeviceHealthPublisher:
         #: yapilir; boylece degismeyen cihazlar tekrar tekrar gonderilmez.
         self._gonderilen: dict[str, dict[str, Any]] = {}
         self._sequence = 0
+        #: Kacinci TAM snapshot. `snapshot_id` bundan turetilir ve HER YENI
+        #: snapshot turunda artar — kismi basarisizliktan sonraki yeniden
+        #: deneme YENI bir snapshot'tir (veri yeniden okunur), dolayisiyla
+        #: yarim kalan eskisiyle KARISMAMALIDIR.
+        self._snapshot_sayaci = 0
         self._uyandir = threading.Event()
         self._dur = threading.Event()
         self._thread: threading.Thread | None = None
@@ -144,6 +149,7 @@ class DeviceHealthPublisher:
                 "enabled": self._enabled,
                 "boot_id": self._boot_id,
                 "sequence": self._sequence,
+                "snapshot_count": self._snapshot_sayaci,
                 "tracked_devices": len(self._gonderilen),
                 "sent_batches": self.sent_batches,
                 "sent_devices": self.sent_devices,
@@ -265,9 +271,28 @@ class DeviceHealthPublisher:
             return None
 
         toplam = len(guncel)
+        parti_sayisi = (len(kayitlar) + self._batch_max - 1) // self._batch_max
+
+        # SNAPSHOT KIMLIGI HER TURDA YENI URETILIR.
+        #
+        # Kismi bir basarisizliktan sonraki yeniden deneme YENI bir
+        # snapshot'tir: veri `health_source()`tan YENIDEN okunur ve bu arada
+        # cihaz seti degismis olabilir. Ayni kimligi surdurmek, backend'in
+        # yarim kalan ESKI partilerle yeni partileri BIRLESTIRMESINE yol
+        # acardi — tutarsiz bir tablo, ya da "eksik kalanlari sil" mantigi
+        # varsa var olan cihazlarin SILINMESI.
+        #
+        # SAATTEN BAGIMSIZ: kimlik `boot_id` + artan sayacdir.
+        snapshot_id: str | None = None
+        if snapshot:
+            with self._lock:
+                self._snapshot_sayaci += 1
+                snapshot_id = f"{self._boot_id}-{self._snapshot_sayaci}"
+
         basarili = True
         for i in range(0, len(kayitlar), self._batch_max):
             parca = kayitlar[i : i + self._batch_max]
+            parti_index = i // self._batch_max
             with self._lock:
                 self._sequence += 1
                 sira = self._sequence
@@ -277,11 +302,13 @@ class DeviceHealthPublisher:
                 boot_id=self._boot_id,
                 sequence=sira,
                 # Bir snapshot birden fazla partiye bolunebilir; HEPSI
-                # `snapshot=true` tasir ve backend `device_total` ile kac
-                # cihaz bekledigini bilir.
+                # `snapshot=true` ve AYNI `snapshot_id`yi tasir.
                 snapshot=snapshot,
                 devices=parca,
                 device_total=toplam,
+                snapshot_id=snapshot_id,
+                snapshot_batch_index=parti_index if snapshot else None,
+                snapshot_batch_count=parti_sayisi if snapshot else None,
             )
             try:
                 self._send(govde)
@@ -292,9 +319,12 @@ class DeviceHealthPublisher:
                     self.dropped_batches += 1
                     self.last_error = f"{type(exc).__name__}: {exc}"
                 logger.warning(
-                    "device_health_send_failed batch=%d/%d devices=%d error=%s",
-                    i // self._batch_max + 1,
-                    (len(kayitlar) + self._batch_max - 1) // self._batch_max,
+                    "device_health_send_failed batch=%d/%d snapshot_id=%s devices=%d error=%s — "
+                    "yarim kalan snapshot backend tarafinda ATILMALI; yeniden deneme YENI "
+                    "snapshot_id ile gelir",
+                    parti_index + 1,
+                    parti_sayisi,
+                    snapshot_id or "-",
                     len(parca),
                     self.last_error[:160],
                 )
@@ -315,10 +345,11 @@ class DeviceHealthPublisher:
                     self._snapshot_gerekli = False
                     self._son_snapshot_at = time.monotonic()
             logger.info(
-                "device_health_published devices=%d batches=%d snapshot=%s seq_last=%d",
+                "device_health_published devices=%d batches=%d snapshot=%s snapshot_id=%s seq_last=%d",
                 len(kayitlar),
-                (len(kayitlar) + self._batch_max - 1) // self._batch_max,
+                parti_sayisi,
                 snapshot,
+                snapshot_id or "-",
                 self._sequence,
             )
         return basarili

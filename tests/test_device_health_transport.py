@@ -753,6 +753,15 @@ def test_d30_sozlesme_http_ve_siralama_semantigini_tasir() -> None:
     assert blok["default_enabled"] is False
 
     assert "boot_id" in blok["ordering_model"] and "sequence" in blok["ordering_model"]
+    # Snapshot korelasyonu (review madde 3) — `device_total` tek basina yetmez.
+    assert blok["snapshot_retry_creates_new_snapshot_id"] is True
+    assert "snapshot_id" in blok["snapshot_correlation"]
+    assert len(blok["backend_snapshot_rules"]) == 3
+    # Poll yoluna baglilik (review madde 1) ve compose yolu (madde 2).
+    assert "finally" in blok["poll_loop_notification"]
+    assert "request_snapshot" in blok["poll_loop_notification"]
+    assert "${VAR:-" in blok["compose_enable_path"]
+    assert "DUZENLEMEDEN" in blok["compose_enable_path"]
     assert "coalescing" in blok["backpressure"]
     assert sorted(blok["connection_states"]) == sorted(CONNECTION_STATES)
 
@@ -782,3 +791,309 @@ def test_d31_sozlesme_ve_kod_ayni_varsayilanlari_soyluyor() -> None:
     metin = dok.read_text(encoding="utf-8")
     for zorunlu in ("device_health_v1", "boot_id", "smart_idle", "report_late", "X-Gateway-Token"):
         assert zorunlu in metin, f"Grid dokumaninda eksik: {zorunlu}"
+
+
+# ==========================================================================
+# D32-D34 — GERCEK CALISMA YOLUNA BAGLILIK (PR #33 review, madde 1)
+#
+# Yayinciyi izole test etmek YETMEZ: `mark_dirty` gercek poll dongusune
+# baglanmazsa ozellik uretimde HIC tetiklenmez ve durum degisiklikleri ancak
+# yayincinin 30sn'lik YEDEK uyanmasinda gorulur. Kabul olcutu:
+#
+#     durum degisimi -> ~poll araligi + debounce   (30sn yedek DEGIL)
+# ==========================================================================
+
+
+def test_d32_poll_dongusu_her_cycle_sonrasi_yayinciyi_uyarir() -> None:
+    """`run_poll_cycle` cagrisindan sonra `mark_dirty()` MUTLAKA cagrilmali."""
+    import ast
+    import inspect
+
+    from dnp3_gateway import main as main_mod
+
+    kaynak = inspect.getsource(main_mod)
+    i = kaynak.index("published = run_poll_cycle(")
+    pencere = kaynak[i : i + 2500]
+    assert "device_health_publisher.mark_dirty()" in pencere, (
+        "poll dongusu cihaz saglik yayincisini UYARMIYOR — ozellik uretimde tetiklenmez"
+    )
+
+    # `finally` DALINDA olmali: bir cycle PATLASA bile durum degismis
+    # olabilir (`read_device` bir cihazi `lost`a cekip sonrakinde hata verir).
+    # `try` icinde olsaydi tam da en ilginc gecisler bildirilmezdi.
+    agac = ast.parse(inspect.getsource(main_mod))
+    bulundu = False
+    for dugum in ast.walk(agac):
+        if not isinstance(dugum, ast.Try) or not dugum.finalbody:
+            continue
+        govde_metni = "\n".join(ast.unparse(n) for n in dugum.body)
+        final_metni = "\n".join(ast.unparse(n) for n in dugum.finalbody)
+        if "run_poll_cycle" in govde_metni and "mark_dirty" in final_metni:
+            bulundu = True
+            break
+    assert bulundu, "mark_dirty() `finally` dalinda degil — arizali cycle'lar gozlemlenmez"
+
+
+def test_d33_config_degisiminde_tam_snapshot_istenir() -> None:
+    """Cihaz seti degistiginde delta YETMEZ.
+
+    Delta yalnizca "degisen cihazlari" tasir; SILINEN bir cihaz hicbir
+    delta'da GORUNMEZ ve backend onu sonsuza kadar eski durumuyla gosterirdi.
+    Uzlastirma ancak TAM snapshot ile olur.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    from dnp3_gateway import main as main_mod
+
+    kaynak = textwrap.dedent(inspect.getsource(main_mod._run_config_refresh))
+    assert "request_snapshot()" in kaynak, "config degisiminde tam snapshot istenmiyor"
+
+    # KOSULU AST ile dogrula: duz metin penceresi araya giren yorum bloklari
+    # yuzunden kirilgan olurdu (ve tam da oyle oldu).
+    bulundu = False
+    for dugum in ast.walk(ast.parse(kaynak)):
+        if not isinstance(dugum, ast.If):
+            continue
+        if "request_snapshot" not in "\n".join(ast.unparse(n) for n in dugum.body):
+            continue
+        if "changed" in ast.unparse(dugum.test):
+            bulundu = True
+            break
+    assert bulundu, "snapshot istegi `changed` kosuluna bagli degil — her refresh'te tam snapshot gider"
+
+
+def test_d34_uyarma_gecikmesi_poll_araligi_mertebesinde() -> None:
+    """Durum degisimi ~poll araligi + debounce icinde yayinlanmali.
+
+    Yayincinin 30sn'lik YEDEK uyanmasini beklemek KABUL EDILMEZ: bir cihazin
+    kopmasi backend'e yarim dakika gec ulasirsa operator arizayi gec gorur.
+
+    Burada gercek poll dongusu taklit ediliyor: her "cycle" sonrasi
+    `mark_dirty` cagriliyor ve gecikme OLCULUYOR.
+    """
+    durum = {"D1": _saglik(state="online")}
+    g = SahteGonderici()
+    y = _yayinci(lambda: durum, g, change_debounce_sec=0.1, snapshot_interval_sec=3600.0)
+    y.start()
+    try:
+        assert _bekle(lambda: len(g.govdeler) >= 1), "ilk snapshot gelmedi"
+        onceki = len(g.govdeler)
+
+        poll_araligi = 0.05  # gercek gateway'de 1sn
+        durum["D1"] = _saglik(state="lost", connected=False, reachable=False)
+        basla = time.monotonic()
+        # Poll dongusunun yaptigi TAM olarak bu: her cycle sonrasi uyar.
+        for _ in range(5):
+            y.mark_dirty()
+            time.sleep(poll_araligi)
+        assert _bekle(lambda: len(g.govdeler) > onceki, timeout=3.0), "gecis yayinlanmadi"
+        gecen = time.monotonic() - basla
+
+        # Yedek uyanma 30sn; poll+debounce mertebesinde olmali.
+        assert gecen < 2.0, f"gecis {gecen:.1f}s surdu — yedek uyanmaya dusmus olabilir"
+        assert g.govdeler[-1]["devices"][0]["connection_state"] == "lost"
+    finally:
+        y.stop()
+
+
+# ==========================================================================
+# D35-D37 — STANDART KURULUM YOLU (PR #33 review, madde 2)
+# ==========================================================================
+
+
+def _render_compose(**kw: Any) -> str:
+    import sys
+    from pathlib import Path as _Path
+
+    kok = _Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(kok / "scripts"))
+    import render_compose  # noqa: PLC0415
+
+    varsayilan = {
+        "code": "GW-001",
+        "token": "x" * 40,
+        "name": "Test",
+        "backend_url": "https://api.local/api/v1",
+        "nats_url": "nats://n:4222",
+        "host_port": 8021,
+        "install_mode": "local",
+    }
+    varsayilan.update(kw)
+    return render_compose.render_compose(**varsayilan)
+
+
+def test_d35_standart_render_device_health_degiskenlerini_gecirir() -> None:
+    """Sablon bu ayarlari container'a GECIRMEZSE ozellik normal kurulumlarda
+    compose ELLE duzenlenmeden ACILAMAZ."""
+    import yaml
+
+    cikti = _render_compose()
+    env = yaml.safe_load(cikti)["services"]["gateway"]["environment"]
+    for anahtar in (
+        "DEVICE_HEALTH_PUBLISH_ENABLED",
+        "DEVICE_HEALTH_BATCH_MAX",
+        "DEVICE_HEALTH_SNAPSHOT_INTERVAL_SEC",
+        "DEVICE_HEALTH_CHANGE_DEBOUNCE_SEC",
+    ):
+        assert anahtar in env, f"render edilmis compose'da YOK: {anahtar}"
+
+    # VARSAYILAN KAPALI kalmali.
+    assert env["DEVICE_HEALTH_PUBLISH_ENABLED"] == "${DEVICE_HEALTH_PUBLISH_ENABLED:-false}"
+
+
+def test_d36_compose_duzenlenmeden_sonradan_acilabilir() -> None:
+    """ASIL KABUL OLCUTU.
+
+    Render edilmis dosya `${VAR:-varsayilan}` kullanmali; operator compose'u
+    DUZENLEMEDEN, yalnizca yanindaki `.env` ile ozelligi acabilmeli. Elle
+    duzenleme bir sonraki render'da SESSIZCE geri alinirdi.
+    """
+    import yaml
+
+    cikti = _render_compose()
+    env = yaml.safe_load(cikti)["services"]["gateway"]["environment"]
+    for anahtar in (
+        "DEVICE_HEALTH_PUBLISH_ENABLED",
+        "DEVICE_HEALTH_BATCH_MAX",
+        "DEVICE_HEALTH_SNAPSHOT_INTERVAL_SEC",
+        "DEVICE_HEALTH_CHANGE_DEBOUNCE_SEC",
+    ):
+        deger = env[anahtar]
+        assert deger.startswith("${" + anahtar + ":-"), (
+            f"{anahtar} compose degisken ikamesi kullanmiyor: {deger!r} — "
+            "operator acmak icin compose'u DUZENLEMEK zorunda kalir"
+        )
+
+    # Compose'un `.env` ikamesini gercekten uyguladigini dogrula.
+    import os
+    import re
+
+    def _ikame(metin: str, ortam: dict[str, str]) -> str:
+        return re.sub(
+            r"\$\{([A-Z0-9_]+):-([^}]*)\}",
+            lambda m: ortam.get(m.group(1), m.group(2)),
+            metin,
+        )
+
+    assert _ikame(env["DEVICE_HEALTH_PUBLISH_ENABLED"], {}) == "false"
+    assert _ikame(env["DEVICE_HEALTH_PUBLISH_ENABLED"], {"DEVICE_HEALTH_PUBLISH_ENABLED": "true"}) == "true"
+    assert os.sep  # (lint: kullanilmayan import olmasin)
+
+
+def test_d37_render_bayragi_varsayilani_acik_yapabilir() -> None:
+    """Grid renderer'i isterse acik render edebilir; varsayilan YINE kapali."""
+    import yaml
+
+    acik = yaml.safe_load(_render_compose(device_health_enabled=True))["services"]["gateway"]["environment"]
+    assert acik["DEVICE_HEALTH_PUBLISH_ENABLED"] == "${DEVICE_HEALTH_PUBLISH_ENABLED:-true}"
+
+    kapali = yaml.safe_load(_render_compose())["services"]["gateway"]["environment"]
+    assert kapali["DEVICE_HEALTH_PUBLISH_ENABLED"] == "${DEVICE_HEALTH_PUBLISH_ENABLED:-false}"
+
+
+# ==========================================================================
+# D38-D40 — COK PARCALI SNAPSHOT KORELASYONU (PR #33 review, madde 3)
+# ==========================================================================
+
+
+def test_d38_snapshot_partileri_ayni_snapshot_id_paylasir() -> None:
+    kaynak = {f"D{i:03d}": _saglik() for i in range(200)}
+    g = SahteGonderici()
+    y = _yayinci(lambda: kaynak, g, batch_max=50)
+    y.start()
+    try:
+        assert _bekle(lambda: len(g.cihaz_kodlari()) >= 200)
+        assert len(g.govdeler) == 4
+        kimlikler = {z["snapshot_id"] for z in g.govdeler}
+        assert len(kimlikler) == 1, f"ayni snapshot'in partileri farkli kimlik tasiyor: {kimlikler}"
+        assert all(z["snapshot_batch_count"] == 4 for z in g.govdeler)
+        assert sorted(z["snapshot_batch_index"] for z in g.govdeler) == [0, 1, 2, 3]
+    finally:
+        y.stop()
+
+
+def test_d39_delta_partilerinde_snapshot_alanlari_null() -> None:
+    durum = {"D1": _saglik(state="online")}
+    g = SahteGonderici()
+    y = _yayinci(lambda: durum, g, snapshot_interval_sec=3600.0)
+    y.start()
+    try:
+        assert _bekle(lambda: len(g.govdeler) >= 1)
+        onceki = len(g.govdeler)
+        durum["D1"] = _saglik(state="lost", connected=False)
+        y.mark_dirty()
+        assert _bekle(lambda: len(g.govdeler) > onceki)
+        z = g.govdeler[-1]
+        assert z["snapshot"] is False
+        assert z["snapshot_id"] is None
+        assert z["snapshot_batch_index"] is None
+        assert z["snapshot_batch_count"] is None
+    finally:
+        y.stop()
+
+
+def test_d40_kismi_basarisizlik_sonrasi_yeni_snapshot_id_uretilir() -> None:
+    """ASIL SENARYO (review madde 3).
+
+    200 cihaz -> 1. parti BASARILI -> 2. parti BASARISIZ
+    -> cihaz seti DEGISIR ama toplam YINE 200
+    -> yeniden deneme
+
+    `device_total` TEK BASINA YETMEZ: iki turda da 200'dur. Backend yarim
+    kalan ESKI snapshot ile yenisini `snapshot_id` olmadan AYIRT EDEMEZ ve
+    ikisini birlestirip TUTARSIZ bir tablo kurar — "eksik kalanlari sil"
+    mantigi varsa var olan cihazlari SILER.
+    """
+    ilk_set = {f"ESKI-{i:03d}": _saglik(state="online") for i in range(200)}
+    durum = dict(ilk_set)
+
+    g = SahteGonderici()
+    orijinal = g.__call__
+    sayac = {"n": 0}
+
+    def _iki_parti_sonra_patla(payload: dict[str, Any]) -> None:
+        sayac["n"] += 1
+        if sayac["n"] == 2:  # 2. parti DUSER
+            raise RuntimeError("backend gecici hata")
+        orijinal(payload)
+
+    y = _yayinci(lambda: durum, _iki_parti_sonra_patla, batch_max=50, snapshot_interval_sec=3600.0)
+    y.start()
+    try:
+        assert _bekle(lambda: sayac["n"] >= 2, timeout=6.0), "ilk tur baslamadi"
+        assert len(g.govdeler) == 1, "yalnizca 1. parti gecmeliydi"
+        yarim = g.govdeler[0]
+        assert yarim["snapshot"] is True
+        yarim_id = yarim["snapshot_id"]
+        assert yarim["snapshot_batch_count"] == 4
+
+        # CIHAZ SETI DEGISIR — toplam YINE 200.
+        durum.clear()
+        durum.update({f"YENI-{i:03d}": _saglik(state="smart_idle", connected=False) for i in range(200)})
+        y.request_snapshot()
+
+        assert _bekle(lambda: len(g.govdeler) >= 5, timeout=10.0), "yeniden deneme tamamlanmadi"
+        yeni = [z for z in g.govdeler if z["snapshot_id"] != yarim_id]
+        assert yeni, "yeniden deneme AYNI snapshot_id ile geldi — yarim snapshot'la karisir"
+
+        yeni_id = {z["snapshot_id"] for z in yeni}
+        assert len(yeni_id) == 1, f"yeni snapshot birden fazla kimlik tasiyor: {yeni_id}"
+        assert yeni_id != {yarim_id}
+
+        # Backend SOZLESMESI: iki snapshot kesin ayrilabilir.
+        assert yarim["device_total"] == 200 and yeni[0]["device_total"] == 200, (
+            "senaryo kurulumu: toplam iki turda da 200 olmali"
+        )
+        assert all(z["snapshot_batch_count"] == 4 for z in yeni)
+        assert sorted(z["snapshot_batch_index"] for z in yeni) == [0, 1, 2, 3], (
+            "yeni snapshot TAM gelmedi; backend uzlastirmayi baslatamaz"
+        )
+        # Yeni snapshot ESKI cihazlari HIC icermez -> backend silinenleri
+        # ancak TAM snapshot geldikten sonra uzlastirir.
+        yeni_kodlar = {d["device_code"] for z in yeni for d in z["devices"]}
+        assert len(yeni_kodlar) == 200
+        assert not any(k.startswith("ESKI-") for k in yeni_kodlar)
+    finally:
+        y.stop()

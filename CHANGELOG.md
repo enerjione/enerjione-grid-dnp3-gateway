@@ -74,6 +74,46 @@ Gateway 1.14 cihaz basina zengin saglik bilgisine **sahipti** ama Grid onu
   > turda 404 alinir ve log dolar. Kapaliyken **hicbir thread baslatilmaz**.
   > Devreye alma sirasi: **once backend ucu**, sonra gateway bayragi.
 
+### PR #33 review kapanisi
+
+- **Yayinci GERCEK poll yoluna baglandi.** `mark_dirty()` yalnizca izole
+  test ediliyordu; uretimde HIC tetiklenmiyordu ve durum degisiklikleri
+  ancak yayincinin **30sn'lik yedek uyanmasinda** gorulurdu. Artik
+  `run_poll_cycle` sonrasi **`finally` dalinda** cagriliyor — bir cycle
+  patlasa bile durum degismis olabilir (`read_device` bir cihazi `lost`a
+  cekip sonrakinde hata verebilir), ve tam da o gecisler en ilginc olanlar.
+  Config degisiminde (`changed=True`) `request_snapshot()` cagriliyor:
+  delta **silinen** bir cihazi tasimaz, uzlastirma ancak tam snapshot ile olur.
+  Gecikme artik **~poll araligi + debounce**.
+
+- **Standart kurulum yolu eklendi.** `docker/compose.template.yml`
+  `DEVICE_HEALTH_*` degiskenlerini container'a **gecirmiyordu**; ozellik
+  normal render edilmis kurulumlarda compose **elle duzenlenmeden**
+  acilamiyordu. Artik compose degisken ikamesi kullaniliyor
+  (`${DEVICE_HEALTH_PUBLISH_ENABLED:-false}`), yani operator dosyayi
+  **duzenlemeden** yanindaki `.env` ile aciyor — elle duzenleme bir sonraki
+  render'da **sessizce geri alinirdi**. `render_compose.py
+  --device-health-enabled` render varsayilanini acar; **varsayilan yine
+  kapali**.
+
+- **Cok parcali snapshot korelasyonu.** `device_total` **tek basina
+  yetmiyordu**: kismi bir basarisizliktan sonra cihaz seti degisse bile
+  toplam ayni kalabilir (200 → 200) ve backend yarim kalan **eski**
+  snapshot ile yenisini **ayirt edemezdi** — ikisini birlestirip tutarsiz
+  bir tablo kurar, "eksik kalanlari sil" mantigi varsa **var olan
+  cihazlari silerdi**.
+
+  Eklenen alanlar: **`snapshot_id`**, **`snapshot_batch_index`** (0 tabanli),
+  **`snapshot_batch_count`**. Ayni tam snapshot'in tum partileri ayni
+  kimligi paylasir; yeniden deneme **her zaman yeni** kimlik uretir (veri
+  yeniden okunur). Delta'da uc alan da `null`. `(boot_id, sequence)` istek
+  basina bayat siralama icin **aynen** kalir.
+
+- **Ayri HTTP istemcisi/oturumu** (opsiyonel sertlestirme, `command_client`
+  ile ayni kalip). `config_client` ile paylasilsaydi saglik POST'lari
+  config-refresh ile **ayni baglanti havuzunu** tuketirdi: 200 cihazlik bir
+  snapshot 4 istek demektir ve havuz doluyken config yenilemesi beklerdi.
+
 ### Semantik — v1.14 AYNEN korunur
 
 * `smart_idle` **!= offline** — saglikli uykudur.

@@ -240,6 +240,15 @@ def default_image() -> str:
 INSTALL_MODES = ("local", "remote")
 
 
+def _validate_bool_flag(value: bool) -> str:
+    """Compose'a yazilacak bool metni.
+
+    RENDER EDILMIS VARSAYILAN budur; operator onu compose'u DUZENLEMEDEN
+    `.env` uzerinden ezebilir (bkz. sablondaki `${VAR:-varsayilan}`).
+    """
+    return "true" if value else "false"
+
+
 def _validate_install_mode(mode: str) -> str:
     """`local` | `remote` — VARSAYILANI YOK, bilincli secilmeli.
 
@@ -265,6 +274,7 @@ def render_compose(
     app_environment: str = "production",
     initiating_ports: str | None = None,
     initiating_bind_host: str = "0.0.0.0",
+    device_health_enabled: bool = False,
     template_path: Path = DEFAULT_TEMPLATE_PATH,
 ) -> str:
     """Tek bir gateway icin docker compose YAML'i uretir.
@@ -306,6 +316,7 @@ def render_compose(
             "IMAGE": image or default_image(),
             "APP_ENVIRONMENT": app_environment,
             "INSTALL_MODE": _validate_install_mode(install_mode),
+            "DEVICE_HEALTH_ENABLED_DEFAULT": _validate_bool_flag(device_health_enabled),
             "INITIATING_PORT_MAPPINGS": _PORT_SENTINEL,
         },
     )
@@ -402,6 +413,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--device-health-enabled",
+        action="store_true",
+        help=(
+            "Cihaz basina calisma-zamani saglik kanalini RENDER edilmis varsayilan "
+            "olarak ACIK yapar (POST /gateways/{code}/device-health). VARSAYILAN KAPALI: "
+            "backend ucu tanimadan acilirsa her turda 404 alinir. "
+            "BU BAYRAK OLMADAN DA sonradan acilabilir — render edilmis compose "
+            "`${DEVICE_HEALTH_PUBLISH_ENABLED:-...}` kullanir, yani compose'u "
+            "DUZENLEMEDEN `.env` ile ezmek yeterlidir."
+        ),
+    )
+    p.add_argument(
         "--app-environment",
         default="production",
         choices=("development", "staging", "production"),
@@ -456,6 +479,7 @@ def main(argv: list[str] | None = None) -> int:
             app_environment=args.app_environment,
             initiating_ports=args.initiating_ports,
             initiating_bind_host=args.initiating_bind_host,
+            device_health_enabled=args.device_health_enabled,
         )
 
     if args.output:
