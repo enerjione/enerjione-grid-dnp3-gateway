@@ -253,15 +253,21 @@ def test_26_gecersiz_session_policy_reddedilir(deger: str) -> None:
         _parse_dev(session_policy=deger)
 
 
-def test_26b_auto_listening_ile_reddedilir() -> None:
-    """`auto` Smart'a cozulebildigi icin `smart` ile AYNI uc kisitina tabi.
+@pytest.mark.parametrize("politika", ["smart", "auto"])
+def test_26b_listening_ile_smart_ve_auto_kabul_edilir(politika: str) -> None:
+    """1.14.0: uc tipi ile mod BAGIMSIZ iki kavramdir.
 
-    Aksi halde gerceklestirilemeyecek bir yapilandirma sessizce kabul edilir
-    ve cihaz Smart'a cozuldugunde beklenen yasam dongusu HIC olusmazdi.
+    1.13.0'da `smart`/`auto` + `listening` config seviyesinde REDDEDILIYORDU.
+    Bu kisit KALDIRILDI: uc tipi baglantiyi KIMIN actigini soyler, Operation
+    Mode ise cihazin modemini kapatip kapatmadigini. Sabit IP'li bir
+    Horstmann'in Smart modda calismasi gercek ve yaygin bir kurulumdur.
+
+    Reddetmek YANLIS SONUC uretiyordu: ya kurulum hic yapilamiyordu ya da
+    cihaz `continuous` kosturulup modemi hicbir zaman kapanmiyordu.
     """
-    with pytest.raises(GatewayConfigError) as hata:
-        _parse_dev(session_policy="auto")
-    assert "initiating" in str(hata.value)
+    d = _parse_dev(session_policy=politika, ip_endpoint_type="listening")
+    assert d.session_policy == politika
+    assert (d.ip_endpoint_type or "listening") == "listening"
 
 
 # ==========================================================================
@@ -269,28 +275,17 @@ def test_26b_auto_listening_ile_reddedilir() -> None:
 # ==========================================================================
 
 
-class SahteMaster:
-    """`_ManagedMaster` taklidi; GERCEK `_DeviceCache` tasir."""
+class SahteMaster(mod._OturumDurumu):
+    """`_ManagedMaster` taklidi; GERCEK `_DeviceCache` tasir.
+
+    Politika/mod alanlari `_OturumDurumu`dan gelir — gercek sinifla AYNI
+    kaynak. Elle kopyalandiklarinda taklit sessizce sapiyordu.
+    """
 
     def __init__(self, device: DeviceConfig, *, session_policy: str, known_mode: str | None = None) -> None:
         self.device = device
         self.cache = mod._DeviceCache()
-        # Gercek `_ManagedMaster` ile AYNI kural: yapilandirilan politika
-        # DUSURULMEZ; bilinen mod yalnizca BASLANGIC etkin politikasini secer.
-        bilinen = known_mode if known_mode in (MODE_SMART, MODE_BOOST) else None
-        self.configured_session_policy = session_policy
-        if session_policy == "auto":
-            self.session_policy = "continuous" if bilinen == MODE_BOOST else "smart"
-        elif session_policy == "smart":
-            self.session_policy = "smart"
-        else:
-            self.session_policy = "continuous"
-        self.auto_pending = session_policy == "auto" and bilinen is None
-        self.auto_connected_since = 0.0
-        self.auto_fallback = False
-        self.operation_mode = bilinen or MODE_UNKNOWN
-        self.operation_mode_raw = None
-        self.operation_mode_seen_at = None
+        self._oturum_durumunu_kur(session_policy=session_policy, known_mode=known_mode)
         self.cache.set_session_policy(self.session_policy)
         self.connection_fingerprint: tuple = ()
         self.g110_ranges: tuple = ()

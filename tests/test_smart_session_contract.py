@@ -84,7 +84,7 @@ def test_gs03_continuous_initiating_kabul() -> None:
 
 
 # ==========================================================================
-# GS04 + GS05 — smart YALNIZCA initiating ile gecerli
+# GS04 + GS05 — smart HER IKI uc tipiyle gecerli (1.14.0'da genisletildi)
 # ==========================================================================
 
 
@@ -97,39 +97,38 @@ def test_gs04_smart_initiating_kabul() -> None:
     )
 
 
-def test_gs05_smart_listening_guvenli_tarafa_duser(caplog: pytest.LogCaptureFixture) -> None:
-    """`smart` + `listening` GECERSIZ bir kombinasyondur.
+def test_gs05_smart_listening_artik_korunur(caplog: pytest.LogCaptureFixture) -> None:
+    """1.14.0: `smart` + `listening` GECERLIDIR ve DUSURULMEZ.
 
-    Smart Mode'da baglantiyi CIHAZ baslatir. `listening` uc, gateway'in TCP
-    CLIENT olarak uyuyan bir modeme surekli SYN gondermesi demektir; hem
-    anlamsizdir hem Smart Mode'u imkansiz kilar.
+    1.13.0 sozlesmesi bu kombinasyonu `continuous`a dusuruyor ve ERROR
+    logluyordu. Gerekce "Smart Mode'da baglantiyi cihaz baslatir" idi; bu
+    UC TIPI ile MODU birbirine karistiriyordu. Sabit IP'li bir Horstmann
+    Smart modda calisir: modemini kapatir, gateway ona baglanamaz ve DOGRU
+    davranis uykuyu KABUL ETMEKTIR (`smart_idle`), surekli SYN gondermek
+    degil.
 
-    SOZLESME: cihaz `continuous` olarak calistirilir (mevcut davranis) ve
-    durum ERROR seviyesinde loglanir. Config TUMDEN REDDEDILMEZ — tek bir
-    yanlis cihaz yuzunden 600 cihazin config yenilemesini bloke etmek cok
-    daha kotu bir uretim sonucu olurdu.
+    Dusurmenin somut zarari: cihaz `continuous` kosturuldugunda gateway her
+    tarama araliginda frame gonderir, 15sn'lik hareketsizlik sayaci HIC
+    dolmaz ve modem HICBIR ZAMAN kapanmaz.
     """
-    mod._uc_uyarilan.clear()
     with caplog.at_level("ERROR"):
         etkin = _etkin_politika(session_policy="smart", ip_endpoint_type="listening")
-    assert etkin == "continuous", "smart+listening guvenli tarafa dusmedi"
-    assert any("session_policy_endpoint_mismatch" in r.getMessage() for r in caplog.records)
-
-    # Uyari cihaz basina TEK sefer (kalici kosul; log bogulmasin).
-    caplog.clear()
-    with caplog.at_level("ERROR"):
-        _etkin_politika(session_policy="smart", ip_endpoint_type="listening")
+    assert etkin == "smart", "smart+listening hala dusuruluyor"
     assert not [r for r in caplog.records if "session_policy_endpoint_mismatch" in r.getMessage()]
 
 
-def test_gs05b_parse_asamasinda_da_uyarilir(caplog: pytest.LogCaptureFixture) -> None:
-    """Operator sorunu config cekilirken gormeli (adapter'i beklemeden)."""
+def test_gs05b_parse_asamasinda_uyari_yok(caplog: pytest.LogCaptureFixture) -> None:
+    """Gecerli bir kombinasyon icin config asamasinda uyari URETILMEZ.
+
+    Operatoru dogru bir kurulum icin ERROR ile uyarmak, gercek arizalari
+    gizleyen gurultudur.
+    """
     with caplog.at_level("ERROR"):
         deger = _parse_session_policy(_cihaz_item(session_policy="smart"))
-    # Parser degeri DEGISTIRMEZ — etkin karar adapter'da (disk onbellegi de
-    # ayni kapidan gecsin diye).
     assert deger == "smart"
-    assert any("config_session_policy_endpoint_mismatch" in r.getMessage() for r in caplog.records)
+    assert not [
+        r for r in caplog.records if "config_session_policy_endpoint_mismatch" in r.getMessage()
+    ]
 
 
 # ==========================================================================
@@ -628,10 +627,83 @@ def test_deployment_contract_smart_session_alanlari_kodla_uyumlu() -> None:
 
     assert smart["supported"] is True
     assert sorted(smart["session_policy_values"]) == sorted(SESSION_POLICIES)
-    assert smart["device_config_fields"] == ["session_policy", "smart_max_silence_sec"]
+    assert smart["device_config_fields"] == [
+        "session_policy",
+        "smart_max_silence_sec",
+        "dial_in_interval_min",
+        "smart_listen_probe_interval_sec",
+    ]
     assert smart["smart_max_silence_min"] == _SMART_SILENCE_MIN_SEC
     assert smart["smart_max_silence_max"] == _SMART_SILENCE_MAX_SEC
     assert smart["smart_idle_health_state"] == "smart_idle"
     assert smart["smart_idle_counted_as_lost"] is False
     assert smart["unknown_device_config_fields"] == "ignored"
-    assert smart["smart_requires_endpoint_type"] == "initiating"
+
+    # 1.14.0: uc tipi kisiti KALDIRILDI. Anahtarin KENDISI de gitmeli —
+    # dosyada kalirsa Grid onu hala gecerli bir kural sanip frontend'de
+    # `initiating` zorlamasini surdururdu.
+    assert "smart_requires_endpoint_type" not in smart
+    assert "auto_requires_endpoint_type" not in smart
+
+
+def test_deployment_contract_1_14_0_alanlari() -> None:
+    """Dial-In / sonda / listening sozlesmesi dosyada TAM olmali."""
+    import json
+
+    kok = Path(__file__).resolve().parents[1]
+    sozlesme = json.loads((kok / "docker/gateway-deployment-contract.json").read_text(encoding="utf-8"))
+    smart = sozlesme["smart_session"]
+
+    assert smart["dial_in_interval_min_range"] == "60..1440"
+    assert smart["dial_in_interval_min_default"] is None
+    assert smart["smart_listen_probe_interval_sec_range"] == "5..600"
+
+    # EN KRITIK IKI SOZLESME MADDESI — bunlar bozulursa saha davranisi
+    # sessizce tersine doner.
+    assert smart["late_is_state"] is False
+    assert smart["late_counted_as_lost"] is False
+    assert smart["late_in_total"] is False
+    assert smart["active_probes_affect_state"] is False
+
+    assert "late" in smart["health_device_counters"]
+    for alan in (
+        "dial_in_interval_min",
+        "next_expected_report_epoch",
+        "report_overdue_sec",
+        "report_late",
+        "ip_probe_status",
+        "tcp_probe_status",
+        "last_probe_epoch",
+    ):
+        assert alan in smart["health_device_fields_added_1_14_0"]
+
+    assert sozlesme["gateway_release"] == (kok / "VERSION").read_text(encoding="utf-8").strip()
+
+
+def test_health_ciktisi_sozlesmedeki_1_14_0_alanlarini_tasir() -> None:
+    """Sozlesme dosyasi ile GERCEK `/health` ciktisi ayni seyi soylemeli.
+
+    Dosyaya alan yazip kodda uretmemek, Grid tarafinda sessizce `None`
+    okunan bir alan demektir — en pahali entegrasyon hatasi turu.
+    """
+    import json
+
+    kok = Path(__file__).resolve().parents[1]
+    sozlesme = json.loads((kok / "docker/gateway-deployment-contract.json").read_text(encoding="utf-8"))
+
+    r = mod.Yadnp3TelemetryReader.__new__(mod.Yadnp3TelemetryReader)
+    r._init_runtime_state()
+    r._scan_interval_sec = 5
+    r._baseline_interval_sec = 30
+    r._default_dnp3_tcp_port = 20000
+
+    # Taklit `_OturumDurumu`dan tureyen TEK KAYNAKtan gelir; elle alan
+    # kopyalamak bu testi gercekten olmayan bir yuzeye karsi yesil yapardi.
+    from .test_smart_session_policy import SahteMaster
+
+    mm = SahteMaster(make_device("D1"), session_policy="smart")
+    r._masters["D1"] = mm
+    saglik = r.device_health()["D1"]
+
+    for alan in sozlesme["smart_session"]["health_device_fields_added_1_14_0"]:
+        assert alan in saglik, f"sozlesmede var, /health ciktisinda YOK: {alan}"

@@ -147,6 +147,11 @@ def build_payload(
             "alive_no_data",
             "smart_idle",
             "smart_lost",
+            # `late`: beklenen Dial-In raporunu kacirmis cihaz sayisi.
+            # `smart_lost` ile AYNI SEY DEGILDIR — bunlar hala `smart_idle`
+            # durumundadir ve comm_lost URETMEMISTIR; erken uyaridir.
+            # `smart_lost` gibi `states` haritasini DEGISTIRMEZ.
+            "late",
             "listener_error",
         ):
             if anahtar in device_summary:

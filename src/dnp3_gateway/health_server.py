@@ -373,6 +373,11 @@ def _device_health_snapshot(reader: Any, configured_count: int) -> dict[str, Any
     politika_sayim = {"continuous": 0, "smart": 0, "auto": 0}
     etkin_sayim = {"continuous": 0, "smart": 0, "unknown": 0}
     smart_lost = 0
+    # Beklenen Dial-In raporunu KACIRMIS cihazlar. `state` DEGISMEZ (hala
+    # `smart_idle`) cunku bu bir DEGRADED uyaridir, kopus degil; ayri
+    # sayilmasinin sebebi tam da budur — operator "3 cihaz gec kaldi" ile
+    # "3 cihaz koptu" arasindaki farki tek GET ile gormeli.
+    late = 0
     for info in per_device.values():
         state_name = str(info.get("state") or "unknown")
         if state_name in ("online", "recovering", "lost", "smart_idle", "listener_error"):
@@ -389,12 +394,18 @@ def _device_health_snapshot(reader: Any, configured_count: int) -> dict[str, Any
         # asilmis) — saglikli `smart_idle` ile KARISTIRILMAMALI.
         if politika == "smart" and state_name == "lost":
             smart_lost += 1
+        if info.get("report_late"):
+            late += 1
         last_frame = info.get("last_frame_epoch")
         if last_frame:
             age = max(0.0, now - float(last_frame))
             oldest_age = age if oldest_age is None else max(oldest_age, age)
 
     summary["smart_lost"] = smart_lost
+    # `late` TOPLAMA GIRMEZ: bir cihaz ayni anda hem `smart_idle` hem `late`
+    # olabilir. `tracked` hesabina eklenirse cihaz iki kez sayilir ve
+    # `total` sisip sahte `unknown` uretirdi.
+    summary["late"] = late
     summary["session_policies"] = politika_sayim
     summary["effective_policies"] = etkin_sayim
 

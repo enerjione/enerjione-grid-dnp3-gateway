@@ -8,7 +8,7 @@
 #   {{BACKEND_API_URL}} — backend public URL (orn. https://api.enerjione.local/api/v1)
 #   {{NATS_URL}}        — JetStream URL (orn. nats://enerjione-nats:4222)
 #   {{HOST_HEALTH_PORT}}— host tarafinda exposed port (her instance icin farkli)
-#   {{IMAGE}}           — docker image tag (orn. ghcr.io/enerjione/enerjione-grid-dnp3-gateway:1.13.0)
+#   {{IMAGE}}           — docker image tag (orn. ghcr.io/enerjione/enerjione-grid-dnp3-gateway:1.14.0)
 #   {{APP_ENVIRONMENT}} — production | staging | development
 #   {{INSTALL_MODE}}    — local | remote. NATS ERISILEMEDIGINDE ne olacagini
 #                         BELIRLER: `local` (gateway backend ile ayni makinede)

@@ -45,24 +45,51 @@ DeviceConfig.ip_endpoint_type = "listening" (VARSAYILAN) | "initiating"
 * **`auto`** (1.13.0) — rejim cihazin **Master `Operation Mode`** noktasindan
   CALISMA ANINDA turetilir. Mod gozlenene kadar gateway **sessiz** kalir.
 
-### Gecerli kombinasyonlar
+### Gecerli kombinasyonlar (1.14.0 — HEPSI)
+
+**Uc tipi ile Operation Mode BAGIMSIZ iki kavramdir:**
+
+```
+ip_endpoint_type  ->  TCP baglantisini KIM acar
+operation mode    ->  cihaz modemini KAPATIR MI
+```
 
 | `ip_endpoint_type` | `session_policy` | Gecerli mi |
 |---|---|---|
-| `listening` | `continuous` | ✅ |
-| `initiating` | `continuous` | ✅ |
+| `listening` | `continuous` (boost) | ✅ |
+| `listening` | `smart` | ✅ (1.14.0) |
+| `listening` | `auto` | ✅ (1.14.0) |
+| `initiating` | `continuous` (boost) | ✅ |
 | `initiating` | `smart` | ✅ |
 | `initiating` | `auto` | ✅ |
-| `listening` | `smart` / `auto` | ❌ **config REDDEDILIR** |
 
-`listening` uc gateway'in TCP **client** olarak cihaza baglanmasi demektir;
-Smart Mode'da baglantiyi CIHAZ baslatir. Bu kombinasyon istenen yasam
-dongusunu HICBIR ZAMAN gerceklestiremez.
+> **1.13.0'dan davranis degisikligi.** 1.13.0 `listening` + `smart`/`auto`
+> kombinasyonunu config seviyesinde REDDEDIYORDU. Gerekce "Smart Mode'da
+> baglantiyi cihaz baslatir" idi ve bu **uc tipi ile modu birbirine
+> karistiriyordu**. Sabit IP'li (ya da APN icinden erisilebilen) bir
+> Horstmann Smart modda calisir: modemini kapatir. Dogru davranis surekli
+> SYN gondermek degil, uykuyu KABUL ETMEKTIR.
+>
+> Reddetmenin somut zarari: ya kurulum hic yapilamiyordu, ya da cihaz
+> `continuous` kosturulup gateway her tarama araliginda frame gonderiyor,
+> 15sn'lik hareketsizlik sayaci HIC dolmuyor ve modem HICBIR ZAMAN
+> kapanmiyordu — yani ozelligin tamami calismiyordu.
 
-> **1.12.0'dan davranis degisikligi.** 1.12.0 bu kombinasyonu sessizce
-> `continuous`a dusuruyordu. Artik reddediliyor: operatorun acik niyetini
-> sessizce baska bir seye cevirmek, reddetmekten daha kotudur. Kirilma
-> riski yok — `session_policy` gonderen bir backend surumu sahaya cikmadi.
+**`listening` + `smart` yasam dongusu** `initiating`ten SU NOKTADA AYRILIR:
+orada baglantiyi gateway acar, dolayisiyla cihaz uykudayken TCP baglantisi
+**kurulamaz** ve `OnOpen`/`OnClose` HIC tetiklenmez. `smart_idle`e giris
+`set_connected(False)` yolundan DEGIL, okuma yolundan yapilir:
+
+```
+baglanti kurulamiyor + session_policy=smart + uc=listening
+    -> smart_idle (BEKLENEN uyku)      -> comm_lost YOK
+    -> denetim: dial_in + max_silence  -> gercek kopus YINE yakalanir
+```
+
+**Basarisiz TCP denemeleri TEK BASINA `comm_lost` URETMEZ.** Bu bir muafiyet
+degildir: hic konusmamis bir cihaz icin sessizlik sayaci master'in kurulus
+anindan baslar (`olusturuldu_wall` capasi), yani gercekten olu bir cihaz
+`smart_max_silence_sec` dolunca yine `lost` olur.
 
 Varsayilan `continuous` oldugu icin **mevcut kurulumlarin davranisi
 degismez**. Backend sozlesmesi: [BACKEND_TODO.md](./BACKEND_TODO.md#b5)
@@ -279,14 +306,62 @@ Esik asildiktan sonra cihaz, **yeni ve kanitli bir oturum** kurmadan tekrar
 
 ---
 
+## 5b. Dial-In farkindali saglik: `late` (1.14.0)
+
+`smart_max_silence_sec` **kopus** esigidir ve tipik olarak gunler
+mertebesindedir. Tek basina kullanildiginda operator, gercekten bozulmus bir
+cihazi gunler sonra ogrenir. `dial_in_interval_min` bu bosluga **erken
+uyari** koyar.
+
+Uc pencere vardir ve **karistirilmamalidirlar**:
+
+| Pencere | Durum | comm_lost |
+|---|---|---|
+| beklenen rapordan ONCE | `smart_idle` — SAGLIKLI | ❌ |
+| rapor gecti, `max_silence` dolmadi | **LATE / DEGRADED** | ❌ |
+| `max_silence` asildi | `lost` | ✅ **tam bir kez** |
+
+`late` bir **durum degil, bayraktir**: `state` `smart_idle` KALIR. Sebebi
+somut — Dial-In gecikmesi cok sik iyi huyludur (hucresel ag tikanikligi,
+cihazin rapor saatinde kucuk kayma) ve bunu `lost` saymak SCADA'da
+gunluk sahte alarm uretirdi. `/health` bunu `report_late: true` ve fleet
+ozetinde ayri bir `late` sayaciyla raporlar.
+
+`dial_in_interval_min` **verilmezse `late` HIC uretilmez** — her kurulumda
+zamanlanmis Dial-In tanimli olmak zorunda degildir.
+
+### Aktif tanilama sondalari (ICMP / TCP)
+
+Cihaz `late` oldugunda gateway bir **teshis** sondasi calistirir:
+
+```
+ip_probe  unreachable        -> modem / APN / yonlendirme suphesi
+ip ok + tcp_probe closed     -> dinleyici / guvenlik duvari / uygulama
+tcp open + DNP3 kaniti yok   -> protokol / oturum sorunu (adres, link)
+```
+
+> **HICBIR SONDA SONUCU `comm_lost` URETMEZ.** Bu bir tasarim kurali, bir
+> ayrinti degil. ICMP saha aglarinda/APN'lerde sikca ENGELLIDIR ve Smart
+> bir modem MESRU olarak uykudadir — ping'e cevap vermemesi BEKLENEN
+> davranistir. "ping dusuyor -> cihaz oldu" kurali filonun yarisini sahte
+> kopuk gosterirdi. Sondalar operatorun arizanin YERINI bulmasi icindir;
+> durum makinesinin girdisi DEGILDIR.
+
+Sondalar yalnizca cihaz `late` iken ve `_PROBE_MIN_INTERVAL_SEC` (300sn)
+siklik siniriyla calisir.
+
+---
+
 ## 6. Yapilandirma anahtarlari
 
 | Anahtar | Yer | Varsayilan | Aciklama |
 |---|---|---|---|
 | `session_policy` | backend, cihaz basina | `continuous` | `continuous` \| `smart` \| `auto` |
-| `ip_endpoint_type` | backend, cihaz basina | `listening` | `listening` \| `initiating`. `smart`/`auto` icin **`initiating` zorunlu** |
+| `ip_endpoint_type` | backend, cihaz basina | `listening` | `listening` \| `initiating`. **Politikadan BAGIMSIZ** (1.14.0) — alti kombinasyon da gecerli |
 | `master_ip_port` | backend, cihaz basina | — | `initiating` icin **ZORUNLU**, 1024..65535, gateway icinde TEKIL |
 | `smart_max_silence_sec` | backend, cihaz basina | `null` (= ezme yok) | Sessizlik esigi, **60..2592000** sn. Gecersizse yok sayilir, env yedegine dusulur. |
+| `dial_in_interval_min` | backend, cihaz basina | `null` (= `late` KAPALI) | Beklenen zamanlanmis rapor araligi, **60..1440** dk. `late` erken uyarisini besler; `comm_lost` URETMEZ. |
+| `smart_listen_probe_interval_sec` | backend, cihaz basina | `null` (= kutuphane varsayilani) | `listening` kanalda yeniden baglanma TAVANI, **5..600** sn. Cihazin uyanisinin en gec ne kadar sonra fark edilecegini belirler. |
 | `DNP3_SMART_MAX_SILENCE_SEC` | gateway `.env` | `0` (kapali) | Cihaz ezmesi yokken kullanilan yedek. Kabul: **`0` veya `60..2592000`**; `1..59` boot'ta REDDEDILIR. |
 
 Politikanin kendisi icin **env anahtari yoktur**: karar cihaz basinadir ve
@@ -322,7 +397,16 @@ Cihaz basina (`device_health()`):
     "ip_endpoint_type": "initiating",
     "master_ip_port": 20100,
     "listener_expected": true,
-    "listener_port": 20100
+    "listener_port": 20100,
+
+    "dial_in_interval_min": 720,
+    "next_expected_report_epoch": 1755643200.0,
+    "report_overdue_sec": 0.0,
+    "report_late": false,
+
+    "ip_probe_status": "unknown",
+    "tcp_probe_status": "unknown",
+    "last_probe_epoch": null
   }
 }
 ```
@@ -332,9 +416,16 @@ raporlanir (port dolu/ayricalikli). Bu bir **kurulum** arizasidir, haberlesme
 arizasi degil — `devices.listener_error` sayacinda ayri tutulur.
 
 Ozet sayimlar (`/health` -> `devices`): `online`, `recovering`, `lost`,
-**`smart_idle`**, `smart_lost`, `listener_error`, `unknown`,
+**`smart_idle`**, `smart_lost`, **`late`**, `listener_error`, `unknown`,
 `session_policies: {continuous, smart, auto}` ve
 `effective_policies: {continuous, smart, unknown}`.
+
+> **`late` TOPLAMA GIRMEZ.** Bir cihaz ayni anda hem `smart_idle` hem
+> `late` olabilir; `total` hesabina eklenirse iki kez sayilir ve sahte
+> `unknown` uretirdi. `late` bir DURUM degil, mevcut durumun uzerine binen
+> bir BAYRAKTIR — `smart_lost` ile de karistirilmamalidir: `smart_lost`
+> cihazlar GERCEKTEN kopuktur, `late` cihazlar hala `smart_idle`dir ve
+> `comm_lost` URETMEMISTIR.
 
 Sayaclar (`devices.recovery`): `smart_idle_wakeup_total`,
 `smart_silence_lost_total`.

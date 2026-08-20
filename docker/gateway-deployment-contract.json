@@ -1,8 +1,8 @@
 {
   "contract_version": 1,
-  "gateway_release": "1.13.0",
-  "gateway_source_ref": "v1.13.0",
-  "gateway_source_sha": "84dc49565ca4b99610633b9d14216a20a7c82f2e",
+  "gateway_release": "1.14.0",
+  "gateway_source_ref": "v1.14.0",
+  "gateway_source_sha": "e1181ae2ad3481e49883956b2e4ff6d2b8ae7287",
   "gateway_source_sha_semantics": "BU DOSYADAKI DEGER, KENDISINI ICEREN COMMIT DEGILDIR ve olamaz: dosyaya yeni SHA yazmak yeni bir commit uretir ve SHA yeniden degisir (self-referential). Buradaki deger, bu sozlesmenin turetildigi YAYIMLANMIS BASELINE surumun commit'idir. Bir artifact'in GERCEK revizyonu iki yerde yasar ve ikisi de release sirasinda uretilir: (1) imaj etiketi org.opencontainers.image.revision=<GITHUB_SHA>, (2) release workflow'un urettigi gateway-deployment-contract.generated.json (gateway_source_sha alani GITHUB_SHA ile doldurulur). Tuketiciler revizyon icin BUNLARA bakmali; kaynak dosyadaki deger yalnizca baseline'dir.",
   "owner": "enerjione/enerjione-grid-dnp3-gateway",
   "description": "Bir uretim DNP3 gateway kurulumunun TASIMASI GEREKEN deployment sozlesmesi. Gateway repo'su sahibidir; Grid repo'su tam kopyasini vendor eder ve CI'da karsilastirir. Runtime'da iki repo birbirine baglanmaz.",
@@ -130,13 +130,15 @@
       "production_guard": "Gateway, production'da bu degerin GATEWAY_TOKEN veya GATEWAY_COMMAND_TOKEN ile ayni olmasini reddeder."
     }
   },
-  "gateway_source_sha_baseline_ref": "v1.12.0",
+  "gateway_source_sha_baseline_ref": "v1.13.0",
   "smart_session": {
     "supported": true,
-    "semantics": "Horstmann Smart Navigator 2.0 Smart Mode / Initiating Endpoint oturum yasam dongusu. Politika CIHAZ BASINA ve ACIKCA yapilandirilir; cihazin DNP3 noktalarindan CIKARILMAZ (Operation Mode otomatik tespiti AYRI bir istir). Varsayilan 'continuous' oldugu icin mevcut kurulumlarin davranisi DEGISMEZ.",
+    "semantics": "Horstmann Smart Navigator 2.0 Smart/Boost oturum yasam dongusu. Politika CIHAZ BASINA yapilandirilir (session_policy) ya da auto ile MASTER Operation Mode'dan turetilir. 1.14.0: UC TIPI (ip_endpoint_type) ile MOD (session_policy) BAGIMSIZ iki kavramdir ve alti kombinasyonun HEPSI desteklenir. Varsayilan 'continuous' oldugu icin mevcut kurulumlarin davranisi DEGISMEZ.",
     "device_config_fields": [
       "session_policy",
-      "smart_max_silence_sec"
+      "smart_max_silence_sec",
+      "dial_in_interval_min",
+      "smart_listen_probe_interval_sec"
     ],
     "session_policy_values": [
       "continuous",
@@ -145,8 +147,7 @@
     ],
     "session_policy_default": "continuous",
     "session_policy_invalid_behavior": "reject_config: tanimsiz deger TUM config'i reddeder (GatewayConfigError); gateway son iyi config'iyle calismaya devam eder. Sessizce varsayilana DUSMEZ.",
-    "smart_requires_endpoint_type": "initiating",
-    "smart_wrong_endpoint_behavior": "reject_config: session_policy=smart|auto + ip_endpoint_type!=initiating kombinasyonu TUM config'i reddeder (GatewayConfigError). 1.12.0'daki fail_safe_continuous davranisi 1.13.0'da SERTLESTIRILDI: operatorun acik niyetini sessizce baska bir seye cevirmek reddetmekten daha kotudur. Kirilma riski yok — session_policy gonderen bir backend surumu sahaya cikmadi.",
+    "smart_wrong_endpoint_behavior": "not_applicable_since_1.14.0: uc tipi kisiti KALDIRILDI. 1.13.0 session_policy=smart|auto + ip_endpoint_type=listening kombinasyonunu reject_config ile reddediyordu; bu kural UC TIPI ile MODU birbirine karistiriyordu ve gecerli bir saha kurulumunu (sabit IP'li Horstmann Smart modda) IMKANSIZ kiliyordu. Artik alti kombinasyon da kabul edilir. master_ip_port zorunlulugu YALNIZCA initiating icin gecerli olmaya DEVAM EDER.",
     "smart_max_silence_default": null,
     "smart_max_silence_default_semantic": "null/eksik = CIHAZ SEVIYESINDE EZME YOK (denetim kapali DEMEK DEGILDIR). Cozum sirasi: (1) gecerli cihaz degeri 60..2592000, (2) DNP3_SMART_MAX_SILENCE_SEC [0=kapali, 60..2592000=gecerli], (3) kapali. GECERSIZ cihaz degeri: cihaz ezmesi YOK SAYILIR ve ayni sirayla env yedegine dusulur; env 0/yoksa kapali.",
     "smart_max_silence_min": 60,
@@ -162,6 +163,7 @@
       "lost",
       "smart_idle",
       "smart_lost",
+      "late",
       "listener_error",
       "unknown"
     ],
@@ -175,11 +177,38 @@
     "env_smart_max_silence_accepted": "0 | 60..2592000",
     "env_smart_max_silence_invalid_behavior": "fail_closed: 1..59 ve 2592000 ustu boot'ta config hatasi uretir (ConfigError).",
     "session_policy_auto_semantics": "auto: rejim cihazin MASTER 'Operation Mode' noktasindan CALISMA ANINDA turetilir (Smart -> etkin smart, Boost -> etkin continuous). Mod gozlenene kadar gateway SESSIZ kalir (tarama yok, acilis integrity yok) — Smart bir cihazin 15sn idle sayacini bozmamak icin. Satellite Operation Mode ve Boost Mode Enabled bu karara KATILMAZ.",
-    "session_policy_auto_fallback": "continuous_after_window: mod BAGLANTILI gecen 120 saniyede gozlenemezse GUVENLI TARAFA continuous uygulanir (veri dogrulugu > pil tasarrufu), WARNING loglanir ve /health auto_fallback=true gosterir.",
-    "auto_requires_endpoint_type": "initiating",
+    "session_policy_auto_fallback": "continuous_after_window: mod BAGLANTILI gecen 120 saniyede gozlenemezse GUVENLI TARAFA continuous uygulanir (veri dogrulugu > pil tasarrufu), WARNING loglanir ve /health auto_fallback=true gosterir. 1.14.0: sayac YALNIZCA baglantili sureyi sayar; uykuda gecen zaman pencereyi DOLDURMAZ � aksi halde auto bir listening cihaz hicbir zaman siniflandirilamadan continuous'a duser ve tam da kacinilmak istenen surekli trafigi uretirdi.",
     "operation_mode_source": "master_operation_mode_signal",
     "operation_mode_signal_match": "semantic: data_type=binary AND dnp3_object_group=1 AND key son bileseni 'operation_mode' AND source master/polemaster. DNP3 index SABITLENMEZ (SN2.0 G1/15, Pole Master farkli).",
-    "operation_mode_value_mapping": "1=smart, 0=boost. Dokumandaki 0x01/0x81 DEGER DEGIL tam DNP3 bayrak oktetidir; 0x80 biti STATE (=degerin kendisi). 0x81 -> deger 1 -> Smart."
+    "operation_mode_value_mapping": "1=smart, 0=boost. Dokumandaki 0x01/0x81 DEGER DEGIL tam DNP3 bayrak oktetidir; 0x80 biti STATE (=degerin kendisi). 0x81 -> deger 1 -> Smart.",
+    "endpoint_mode_independence": "ip_endpoint_type TCP baglantisini KIM actigini belirler (listening=gateway client, initiating=gateway server). session_policy/Operation Mode cihazin modemini KAPATIP kapatmadigini belirler. Ikisi ORTOGONALDIR.",
+    "listening_smart_idle_entry": "read_path: listening ucta cihaz uykudayken TCP baglantisi KURULAMAZ, dolayisiyla OnOpen/OnClose HIC tetiklenmez ve set_connected(False) yolundan smart_idle'a girilemez. Giris okuma yolunda yapilir. BASARISIZ TCP DENEMELERI TEK BASINA comm_lost URETMEZ. Muafiyet degildir: hic gecerli temas yapmamis cihaz icin sessizlik sayaci master'in kurulus anindan baslar, yani gercekten olu bir cihaz smart_max_silence_sec dolunca yine lost olur.",
+    "dial_in_interval_min_range": "60..1440",
+    "dial_in_interval_min_default": null,
+    "dial_in_semantics": "Beklenen zamanlanmis rapor araligi. smart_max_silence_sec'in YERINE GECMEZ, yaninda calisir. Uc pencere: (1) beklenen rapordan ONCE -> smart_idle SAGLIKLI, comm_lost YOK; (2) rapor gecti ama max_silence dolmadi -> report_late=true (DEGRADED), comm_lost YOK, state smart_idle KALIR; (3) max_silence asildi -> lost, comm_lost TAM BIR KEZ. null/eksik = late uyarisi KAPALI (her kurulumda Dial-In tanimli olmak zorunda degildir).",
+    "late_is_state": false,
+    "late_counted_as_lost": false,
+    "late_in_total": false,
+    "late_in_total_rationale": "Bir cihaz ayni anda hem smart_idle hem late olabilir; toplama eklenirse iki kez sayilir ve sahte unknown uretir. late bir DURUM degil, mevcut durumun uzerine binen BAYRAKTIR.",
+    "smart_listen_probe_interval_sec_range": "5..600",
+    "smart_listen_probe_interval_sec_default": null,
+    "smart_listen_probe_semantics": "listening kanalda ChannelRetry maxOpenRetry TAVANI. Taban 1sn'de kalir. null/eksik = kutuphane varsayilani (ChannelRetry.Default(): min 1000ms, max 60000ms ustel) � OLCULDU, yadnp3 3.2.1.1. Horstmann'in ~600sn Socket Listening Timeout'u icinde >=10 deneme uretir, dolayisiyla Smart icin de YETERLIDIR. IKINCI BIR YENIDEN BAGLANMA DONGUSU KURULMAZ: opendnp3 kanali zaten deniyor, ikinci dongu ayni sokete paralel SYN uretir ve iki zamanlayici birbirini yarisa sokar.",
+    "active_probes": [
+      "icmp_probe",
+      "tcp_probe"
+    ],
+    "active_probes_affect_state": false,
+    "active_probes_semantics": "SALT TESHIS. HICBIR SONDA SONUCU comm_lost URETMEZ ve hicbiri durum makinesinin girdisi DEGILDIR. ICMP saha aglarinda/APN'lerde sikca ENGELLIDIR ve Smart bir modem MESRU olarak uykudadir � 'ping dusuyor -> cihaz oldu' kurali filonun yarisini sahte kopuk gosterirdi. Sondalar yalnizca cihaz late iken ve 300sn siklik siniriyla calisir. Teshis zinciri: ip unreachable -> modem/APN; ip ok + tcp closed -> dinleyici/guvenlik duvari; tcp open + DNP3 kaniti yok -> protokol/oturum. ping ikilisi yoksa sonuc 'unsupported'tir ve bu bir ARIZA DEGILDIR.",
+    "health_device_fields_added_1_14_0": [
+      "dial_in_interval_min",
+      "next_expected_report_epoch",
+      "report_overdue_sec",
+      "report_late",
+      "ip_probe_status",
+      "tcp_probe_status",
+      "last_probe_epoch"
+    ],
+    "auto_listening_classification": "one_shot_integrity_poll_per_session: auto + mod bilinmiyor + uc listening iken, baglanti kuruldugunda OTURUM BASINA EN FAZLA BIR integrity poll gonderilir. Gerekce: auto sessiz basladigi icin gateway hic sormazsa Operation Mode noktasi HIC okunmaz, mod ogrenilemez ve cihaz 120sn sonra continuous'a duser � Smart bir cihaz icin YANLIS SONUC. listening'te baglanti kurulmus olmasi cihazin UYANIK oldugunun kanitidir; tek poll 15sn'lik sayaci BIR KEZ sifirlar, sonra gateway susar. INITIATING BILEREK DISARIDA: orada 1.13.0'da dogrulanmis davranis AYNEN korunur."
   },
   "initiating_endpoint": {
     "why": "ip_endpoint_type=initiating cihazlarda baglantiyi CIHAZ baslatir. Gateway container ICINDE cihazin master_ip_port degerini dinler; bridge ag modunda o port host'a acilmazsa cihaz baglanamaz.",

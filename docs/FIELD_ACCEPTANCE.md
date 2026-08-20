@@ -165,6 +165,86 @@ Kod degisikligi GEREKMEZ — `operation_mode.normalize_operation_mode`
 
 ---
 
+## 3F. LISTENING + SMART yasam dongusu (1.14.0) — A..E
+
+**Neden ayri:** `initiating`te (3A) baglantiyi cihaz acar ve uyku `OnClose`
+ile bildirilir. `listening`te baglantiyi GATEWAY acar; cihaz uyudugunda
+**hicbir olay tetiklenmez** — sadece TCP denemeleri basarisiz olur. Bu
+yolun sahada dogrulanmasi 3A'nin yerine GECMEZ.
+
+**On kosul:** cihaz `ip_endpoint_type=listening`, `session_policy=smart`
+(ya da `auto`), `smart_max_silence_sec` cihazin rapor programina uygun,
+tercihen `dial_in_interval_min` tanimli.
+
+### A — Uyanik cihaz normal calisir
+
+| # | Adim | Beklenen | Sonuc |
+|---|---|---|---|
+| 1 | Cihaz uyanikken gateway baglanir | `yadnp3_master_link_open` | FIELD_PENDING |
+| 2 | Gecerli DNP3 kaniti gelir | `/health` -> `state=online` | FIELD_PENDING |
+| 3 | Telemetri backend'e ulasir | tag-engine'de olcum | FIELD_PENDING |
+
+### B — Uyku KABUL EDILIR, comm_lost URETILMEZ
+
+| # | Adim | Beklenen | Sonuc |
+|---|---|---|---|
+| 1 | Cihaz modemini kapatir (rapor sonrasi) | — | `REQUIRES_OPERATOR_FIELD_ACTION` |
+| 2 | Gateway'in TCP denemeleri basarisiz olur | `ss` -> ESTABLISHED YOK | FIELD_PENDING |
+| 3 | Gateway `smart_idle`e gecer | log: `smart_idle_entered ... reason=listening_unreachable` | FIELD_PENDING |
+| 4 | **comm_lost YOK** | SCADA'da cihaz kopuk GORUNMEZ | FIELD_PENDING |
+| 5 | `reachable=false`, `connected=false` | `/health` | FIELD_PENDING |
+| 6 | Gateway istek URETMEZ | capture: gateway->cihaz 0 bayt | FIELD_PENDING |
+
+> Adim 2/6 icin `scripts/field_capture.sh` kullanilabilir; `--port` degeri
+> `listening`te cihazin DNP3 portudur (`dnp3_tcp_port`, varsayilan 20000),
+> `master_ip_port` DEGIL.
+
+### C — Uyanma yakalanir
+
+| # | Adim | Beklenen | Sonuc |
+|---|---|---|---|
+| 1 | Cihaz rapor icin modemini acar | — | `REQUIRES_OPERATOR_FIELD_ACTION` |
+| 2 | Gateway yeniden baglanir | log: `smart_idle_wakeup` | FIELD_PENDING |
+| 3 | Yakalama gecikmesi olculur | `<= smart_listen_probe_interval_sec` (ya da <=60sn varsayilanda) | FIELD_PENDING |
+| 4 | `state=online`, veri akar | `/health` | FIELD_PENDING |
+
+> **Gecikme neden onemli:** Horstmann'in Socket Listening Timeout'u ~600sn.
+> Yeniden baglanma tavani bunun altinda kalmali; aksi halde cihaz penceresi
+> kapanmadan once gateway ona ulasamaz. `ChannelRetry` varsayilani
+> (1sn→60sn ustel) 600sn icinde >=10 deneme uretir — **kutuphane ile
+> olculmustur**, sahada yalnizca dogrulanmasi gerekir.
+
+### D — Dial-In gecikmesi `late` uretir, `lost` URETMEZ
+
+| # | Adim | Beklenen | Sonuc |
+|---|---|---|---|
+| 1 | Beklenen rapor saati gecer, cihaz susar | log: `smart_report_overdue` | FIELD_PENDING |
+| 2 | `state` HALA `smart_idle` | `/health` | FIELD_PENDING |
+| 3 | `report_late=true`, `report_overdue_sec>0` | `/health` | FIELD_PENDING |
+| 4 | **comm_lost YOK** | SCADA'da kopuk GORUNMEZ | FIELD_PENDING |
+| 5 | Tanilama sondasi calisir | log: `device_probe ... ip_probe=... tcp_probe=...` | FIELD_PENDING |
+| 6 | Cihaz gec de olsa haber verir | `report_late=false`, `state=online` | FIELD_PENDING |
+
+### E — Gercek kopus YINE yakalanir (fail-safe kontrolu)
+
+Bu adim **en kritigidir**: B ve D'nin comm_lost'u bastirmasi, gercek bir
+arizanin da gizlendigi anlamina GELMEMELIDIR.
+
+| # | Adim | Beklenen | Sonuc |
+|---|---|---|---|
+| 1 | Cihaz kalici olarak devre disi (APN/guc) | — | `REQUIRES_OPERATOR_FIELD_ACTION` |
+| 2 | `smart_max_silence_sec` dolar | log: `smart_idle_silence_exceeded` | FIELD_PENDING |
+| 3 | `state=lost`, comm_lost **TAM BIR KEZ** | SCADA'da kopuk gorunur | FIELD_PENDING |
+| 4 | Sonraki cycle'larda `smart_idle`e GERI DONMEZ | `/health` -> `state` `lost` kalir | ✅ otomatik test |
+| 5 | Sonda sonuclari teshis tasir | `ip_probe`/`tcp_probe` + log yorumu | FIELD_PENDING |
+
+> **Sonda sonuclari HICBIR ZAMAN tek basina comm_lost uretmez.** Adim 5'te
+> `ip_probe=unreachable` gormek beklenendir ve karari VERMEZ; karar
+> `smart_max_silence_sec` esiginindir. Bu ayrimi bozan bir davranis
+> gorulurse adim **FAIL** isaretlenmelidir.
+
+---
+
 ## 4. Kalite bayragi pilotu (G-QUALITY-PILOT)
 
 **Ayar (dogrulanmis kanonik ad):** `DNP3_PUBLISH_QUALITY_FLAGS`

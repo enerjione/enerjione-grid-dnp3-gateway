@@ -2,6 +2,149 @@
 
 Semver'a gore tutulur. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.14.0] - 2026-08-20
+
+**G-SMART-LISTEN-01** — Horstmann `listening` ucta Smart/Boost/Auto yasam
+dongusu + Dial-In farkindali saglik teshisi.
+
+**KOMUT DUZLEMI DEGISMEDI.** F1/F2/F3/F3C/F4/F5/F6/F7, DirectOperate, SBO,
+`/pending`, command freshness, `delivery_not_after`, idempotency,
+CommandLedger, response signature, command credential ve CROB dogrulamasi
+AYNEN duruyor. Uyuyan cihaz icin komut kuyruklama **EKLENMEDI** (bilincli
+non-goal): `reachable=false`, komut `offline` doner, fiziksel DNP3 islem
+sayisi **0**. Genel cikis (output) komut kapsami **GENISLETILMEDI**.
+
+### Fixed
+
+- **`listening` + Smart KOMBINASYONU CALISMIYORDU.** 1.13.0 bunu config
+  seviyesinde REDDEDIYORDU. Gerekce "Smart Mode'da baglantiyi cihaz
+  baslatir" idi ve bu **uc tipi ile modu birbirine karistiriyordu**:
+
+  ```
+  ip_endpoint_type  ->  TCP baglantisini KIM acar
+  operation mode    ->  cihaz modemini KAPATIR MI
+  ```
+
+  Ikisi ORTOGONALDIR. Sabit IP'li (ya da APN icinden erisilebilen) bir
+  Horstmann Smart modda calisir: modemini kapatir. Reddetmenin somut zarari
+  iki yonluydu — ya kurulum hic yapilamiyordu, ya da cihaz `continuous`
+  kosturulup gateway her tarama araliginda frame gonderiyor, cihazin 15
+  saniyelik hareketsizlik sayaci HIC dolmuyor ve modem HICBIR ZAMAN
+  kapanmiyordu. Yani ozelligin tamami calismiyordu.
+
+  Alti kombinasyonun **hepsi** artik destekleniyor:
+  `listening`/`initiating` x `boost`/`smart`/`auto`.
+
+- **`listening` + Smart'ta uyku `comm_lost` URETIYORDU.** Orada baglantiyi
+  gateway acar; cihaz uykudayken TCP baglantisi **kurulamaz**, dolayisiyla
+  `OnOpen`/`OnClose` HIC tetiklenmez ve `set_connected(False)` yolundan
+  `smart_idle`a girilemezdi. Cihaz `lost`ta kalir ve HER uyku doneminde
+  sahte comm_lost uretirdi. Giris artik okuma yolunda yapiliyor.
+
+  **Basarisiz TCP denemeleri tek basina comm_lost URETMEZ.** Bu bir muafiyet
+  degildir: hic gecerli temas yapmamis bir cihaz icin sessizlik sayaci
+  master'in kurulus anindan baslar, yani gercekten olu bir cihaz
+  `smart_max_silence_sec` dolunca yine `lost` olur.
+
+- **`enter_smart_idle` durum alanini yazmiyordu.** Icerideki mantik "uyuyor"
+  derken `/health` ve SCADA "kopuk" gorurdu.
+
+- **`auto` + `listening` hicbir zaman siniflandirilamiyordu.** `auto` sessiz
+  basladigi icin gateway hic sormuyor, `Operation Mode` noktasi HIC
+  okunmuyor ve cihaz 120sn sonra `continuous`a dusuyordu — Smart bir cihaz
+  icin yanlis sonuc. Artik `listening`te **oturum basina EN FAZLA BIR**
+  integrity poll gonderiliyor (baglanti kurulmus olmasi cihazin uyanik
+  oldugunun kanitidir). `initiating` yolu BILEREK dokunulmadi.
+
+- **`auto` fallback penceresi uykuda da ilerliyordu.** Sayac artik YALNIZCA
+  baglantili gecen sureyi sayiyor; aksi halde `auto` bir listening cihaz
+  hicbir zaman siniflandirilamadan `continuous`a duser ve tam da kacinilmak
+  istenen surekli trafigi uretirdi.
+
+### Added
+
+- **Dial-In farkindali saglik (`late`).** `dial_in_interval_min` (60..1440
+  dk) beklenen zamanlanmis rapor araligini tanimlar. Uc pencere ayri tutulur:
+
+  | Pencere | Durum | comm_lost |
+  |---|---|---|
+  | beklenen rapordan ONCE | `smart_idle` — saglikli | ❌ |
+  | rapor gecti, `max_silence` dolmadi | **LATE / DEGRADED** | ❌ |
+  | `max_silence` asildi | `lost` | ✅ tam bir kez |
+
+  `late` bir DURUM DEGIL, mevcut durumun uzerine binen bir BAYRAKTIR —
+  `state` `smart_idle` KALIR. Dial-In gecikmesi cok sik iyi huyludur
+  (hucresel tikaniklik, rapor saatinde kucuk kayma) ve `lost` sayilirsa
+  gunluk sahte alarm uretirdi. Alan verilmezse `late` HIC uretilmez.
+
+- **Aktif ag tanilama sondalari** (`dnp3_gateway/network_probe.py`): ICMP ve
+  TCP. Teshis zinciri:
+
+  ```
+  ip unreachable            -> modem / APN / yonlendirme
+  ip ok + tcp closed        -> dinleyici / guvenlik duvari / uygulama
+  tcp open + DNP3 kaniti yok -> protokol / oturum (adres, link katmani)
+  ```
+
+  > **HICBIR SONDA SONUCU `comm_lost` URETMEZ** ve hicbiri durum
+  > makinesinin girdisi DEGILDIR. ICMP saha aglarinda/APN'lerde sikca
+  > ENGELLIDIR ve Smart bir modem MESRU olarak uykudadir; "ping dusuyor ->
+  > cihaz oldu" kurali filonun yarisini sahte kopuk gosterirdi. Sondalar
+  > yalnizca cihaz `late` iken ve 300sn siklik siniriyla calisir. `ping`
+  > ikilisi yoksa sonuc `unsupported`tir ve bu bir ARIZA DEGILDIR.
+
+- **`smart_listen_probe_interval_sec`** (5..600 sn) — `listening` kanalda
+  yeniden baglanma TAVANI. Verilmezse kutuphane varsayilani kullanilir:
+  `ChannelRetry.Default()` = min 1000ms / max 60000ms ustel (**olculdu**,
+  yadnp3 3.2.1.1), Horstmann'in ~600sn Socket Listening Timeout'u icinde
+  >=10 deneme uretir — Smart icin de yeterlidir. **Ikinci bir yeniden
+  baglanma dongusu KURULMADI**: opendnp3 kanali zaten deniyor, ikinci dongu
+  ayni sokete paralel SYN uretir ve iki zamanlayici birbirini yarisa sokar.
+
+- **`/health` yeni alanlari** (cihaz basina): `dial_in_interval_min`,
+  `next_expected_report_epoch`, `report_overdue_sec`, `report_late`,
+  `ip_probe_status`, `tcp_probe_status`, `last_probe_epoch`.
+  Filo ozetinde ve saglik basliginda yeni `late` sayaci — **toplama
+  GIRMEZ** (bir cihaz ayni anda hem `smart_idle` hem `late` olabilir;
+  eklenirse iki kez sayilir ve sahte `unknown` uretir).
+
+- `tests/test_listening_smart_lifecycle.py` — 24 test: listening x
+  boost/smart/auto, basarisiz TCP denemeleri, LATE gecisleri, tek comm_lost,
+  sonda izolasyonu, komsu izolasyonu, restart kaliciligi.
+
+### Changed
+
+- **Test sahteleri artik sapamiyor.** Oturum/politika calisma-zamani alanlari
+  `_OturumDurumu` mixin'inde TEK KAYNAKTA toplandi; `_ManagedMaster` ve
+  testlerdeki taklit master siniflari ayni yerden kuruluyor. Bu alanlar
+  eskiden testlerde ELLE tekrarlaniyordu ve her yeni alan eklendiginde
+  taklitler sessizce sapiyordu (`AttributeError` — ya da daha kotusu:
+  gercekte olmayan bir davranisi dogrulayan yesil test).
+
+- `docs/HORSTMANN_SMART_MODE.md`, `docs/FIELD_ACCEPTANCE.md` (listening
+  kabul testleri A..E), `docs/BACKEND_TODO.md` (B6.1 alan sozlesmesi) ve
+  deployment sozlesmesi guncellendi.
+
+### Backend / Frontend etkisi
+
+> **FRONTEND'DE YAPILACAK:** `session_policy=smart|auto` secildiginde
+> `ip_endpoint_type=initiating` **ZORLAMASI KALDIRILMALI**. 1.13.0 bu
+> zorlamayi istiyordu; kural artik yanlis ve zorlama kalirsa gecerli bir
+> saha kurulumu (listening + smart) UI'dan girilemez.
+>
+> `master_ip_port` zorunlulugu **yalnizca `initiating`** icin gecerli olmaya
+> DEVAM EDER.
+
+Backend iki yeni opsiyonel cihaz alanini iletmelidir:
+`dial_in_interval_min`, `smart_listen_probe_interval_sec`. Ikisi de
+opsiyoneldir; eksik olmalari ARIZA DEGILDIR.
+
+### Saha kabulu
+
+Fiziksel Horstmann ile dogrulama **YAPILMADI**. `docs/FIELD_ACCEPTANCE.md`
+bolum 3F (A..E) listening yolunun kabul adimlarini tanimlar; hicbiri PASS
+isaretli DEGILDIR.
+
 ## [1.13.0] - 2026-08-20
 
 Uretim hazirlik paketi: **G-INIT-02** (initiating uc agi + fail-closed
@@ -295,7 +438,7 @@ alanlari gordugunde parse etmeyi surdurur ve `continuous` davranisini korur —
 - **Komut kuyruklama** (uyuyan cihazin komutunu bir sonraki uyanmada
   calistirma). Ayri gorev.
 
-## [1.11.4] - 2026-08-18## [1.11.4] - 2026-08-18
+## [1.11.4] - 2026-08-18
 
 Gateway uretim kapanis surumu. **Tek gercek kod degisikligi ClockGuard
 soguk-acilis fail-safe'i**; geri kalani stale dokumantasyon ve deployment
