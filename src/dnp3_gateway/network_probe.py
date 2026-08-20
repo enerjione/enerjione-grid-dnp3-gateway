@@ -51,6 +51,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Callable
 from typing import Literal
 
@@ -174,17 +175,48 @@ class DiagnosticExecutor:
     Bu sure boyunca gateway HICBIR cihazi okuyamaz. Yani tanilama, teshis
     etmeye calistigi kesintiyi GERCEK bir kesintiye cevirir. Kabul edilemez.
 
-    GARANTILER
-    ----------
+    CALISMA GARANTILERI
+    -------------------
     * Isci sayisi ve kuyruk boyu SINIRLI.
     * Cihaz basina AYNI ANDA EN FAZLA BIR is (`_ucusta`).
     * Kuyruk dolu -> is DUSURULUR, `submit` yine de ANINDA doner. ASLA bloke
       etmez, `queue.put`ta beklemez.
     * Istisnalar isci icinde yutulur; bir cihazin tanilamasi digerlerini ya
       da havuzu dusuremez.
-    * `shutdown()` iscileri temiz kapatir.
-    * Saglik/durum kararlari sondanin BITMESINI BEKLEMEZ — sonuc geldiginde
-      yalnizca teshis alanlarini tazeler.
+    * Saglik/durum kararlari sondanin BITMESINI BEKLEMEZ.
+
+    KAPANIS GARANTILERI — `daemon=True` BIR MEKANIZMA DEGILDIR
+    ----------------------------------------------------------
+    Tanilama isi BEST-EFFORT'tur; kapanista biriken is KUYRUKTAN AKITILMAZ,
+    IPTAL EDILIR. `shutdown()` sirasi:
+
+        1. Yeni `submit` DERHAL reddedilir.
+        2. Kuyrukta BEKLEYEN (henuz baslamamis) isler IPTAL edilir.
+        3. Isciler GUVENILIR sekilde uyandirilir.
+        4. YALNIZCA o an CALISAN isler bitirilir.
+        5. TUM isci thread'leri cikana kadar beklenir.
+        6. Ancak ondan sonra master/kanal yikimina izin verilir.
+
+    NEDEN BU KADAR TITIZ: kuyruktaki kapanmalar (closure) `mm.ip_probe`,
+    `mm.sonda_son_wall` ve `mm.kanal_durumu()` gibi MASTER nesnelerine
+    dokunur. Isciler hala calisirken master/kanal yikilirsa bu erisimler
+    yikilmis nesnelere gider.
+
+    ONCEKI HALI IKI SEKILDE BOZUKTU (PR #32 review):
+
+      A) `put_nowait(None)` kuyruk DOLUYKEN `queue.Full` firlatiyordu ve bu
+         yutuluyordu; isci sinyali HIC ALMADAN `get()`te sonsuza kadar
+         bekleyebilirdi.
+
+      B) Sinyaller basariyla eklense bile MEVCUT ISLERIN ARKASINDA kaliyordu.
+         2 isci + 64 kuyruk + ~2sn/is ile isciler yaklasik BIR DAKIKA daha
+         calisabilir, `join(timeout=5)` ise cok once donerdi — yani "tanilama
+         master'lardan once kapanir" garantisi FIILEN YOKTU.
+
+    Cozum: sinyalden ONCE kuyruk BOSALTILIR (hem bekleyen isler iptal olur
+    hem sinyale yer acilir), sonra sinyaller yerlestirilir. Isciler ayrica
+    `_kapali` bayragini kontrol eder, boylece yarista kapilmis bir is de
+    CALISTIRILMAZ.
     """
 
     def __init__(
@@ -203,6 +235,9 @@ class DiagnosticExecutor:
         #: Kuyruk doldugu icin ATLANAN is sayisi. Sessiz kirpma, operatore
         #: "tanilama calisti ve bir sey bulamadi" yalanini soylerdi.
         self.dropped_total = 0
+        #: KAPANISTA iptal edilen (baslamamis) is sayisi. `dropped_total`dan
+        #: AYRI: biri doygunluk, digeri kapanis — farkli seyler soylerler.
+        self.cancelled_total = 0
         self.completed_total = 0
         self._isciler = [
             threading.Thread(target=self._calis, name=f"{name}-{i}", daemon=True)
@@ -211,11 +246,13 @@ class DiagnosticExecutor:
         for t in self._isciler:
             t.start()
 
+    # ---- Gonderim -------------------------------------------------------
+
     def submit(self, key: str, fn: Callable[[], None]) -> bool:
         """Isi kuyruga ekle. ANINDA doner. Donen: kabul edildi mi.
 
         `key` tipik olarak cihaz kodudur ve ayni cihaz icin ikinci bir is
-        ucustayken yenisi KABUL EDILMEZ.
+        ucustayken yenisi KABUL EDILMEZ. Kapanis basladiysa DERHAL reddedilir.
         """
         with self._lock:
             if self._kapali or key in self._ucusta:
@@ -235,15 +272,26 @@ class DiagnosticExecutor:
             return False
         return True
 
+    # ---- Isci -----------------------------------------------------------
+
     def _calis(self) -> None:
         while True:
             is_ = self._kuyruk.get()
             if is_ is None:  # kapanis sinyali
-                self._kuyruk.task_done()
+                self._task_done()
                 return
             key, fn = is_
+            calistirildi = False
             try:
-                fn()
+                # KAPANIS YARISI: is, kuyruk bosaltilmadan hemen once
+                # kapilmis olabilir. Kapanis basladiysa CALISTIRILMAZ —
+                # kapanma sirasinda master nesnelerine dokunmak tam da
+                # kacinmak istedigimiz sey.
+                with self._lock:
+                    kapali = self._kapali
+                if not kapali:
+                    calistirildi = True
+                    fn()
             except Exception:  # noqa: BLE001
                 # IZOLE: bir cihazin tanilamasi havuzu ya da diger cihazlari
                 # DUSURMEZ.
@@ -251,8 +299,20 @@ class DiagnosticExecutor:
             finally:
                 with self._lock:
                     self._ucusta.discard(key)
-                    self.completed_total += 1
-                self._kuyruk.task_done()
+                    if calistirildi:
+                        self.completed_total += 1
+                    else:
+                        self.cancelled_total += 1
+                self._task_done()
+
+    def _task_done(self) -> None:
+        try:
+            self._kuyruk.task_done()
+        except ValueError:
+            # Sayac zaten dengede (kapanista elle bosaltma ile yaris).
+            pass
+
+    # ---- Durum ----------------------------------------------------------
 
     def stats(self) -> dict[str, int]:
         with self._lock:
@@ -260,21 +320,93 @@ class DiagnosticExecutor:
                 "in_flight": len(self._ucusta),
                 "queued": self._kuyruk.qsize(),
                 "dropped_total": self.dropped_total,
+                "cancelled_total": self.cancelled_total,
                 "completed_total": self.completed_total,
             }
 
-    def shutdown(self, *, timeout: float = 5.0) -> None:
-        """Iscileri temiz kapat. Yeni is KABUL EDILMEZ."""
+    def alive_workers(self) -> int:
+        """Hala YASAYAN isci thread sayisi (test + kapanis dogrulamasi)."""
+        return sum(1 for t in self._isciler if t.is_alive())
+
+    def is_shutdown(self) -> bool:
         with self._lock:
-            if self._kapali:
-                return
-            self._kapali = True
-        for _ in self._isciler:
+            return self._kapali
+
+    # ---- Kapanis --------------------------------------------------------
+
+    def _kuyrugu_bosalt(self) -> int:
+        """Bekleyen (BASLAMAMIS) isleri IPTAL et. Donen: iptal sayisi.
+
+        Kapanista biriken is AKITILMAZ, IPTAL EDILIR: 64 birikmis ICMP'yi
+        kosturmak kapanisi bir dakika uzatir ve tanilama BEST-EFFORT'tur.
+        """
+        iptal = 0
+        while True:
             try:
-                self._kuyruk.put_nowait(None)
+                is_ = self._kuyruk.get_nowait()
+            except queue.Empty:
+                break
+            self._task_done()
+            if is_ is None:
+                continue  # eski bir sinyal; asagida yenisi yerlestirilecek
+            key, _fn = is_
+            with self._lock:
+                self._ucusta.discard(key)
+                self.cancelled_total += 1
+            iptal += 1
+        return iptal
+
+    def shutdown(self, *, timeout: float = 10.0) -> bool:
+        """Iscileri DURDUR ve cikmalarini BEKLE. Donen: hepsi cikti mi.
+
+        `False` donerse cagiran taraf bunu SESSIZCE GECMEMELIDIR: hala
+        calisan bir isci, yikilmakta olan master nesnelerine dokunabilir.
+
+        SIRA (gerekceler sinif docstring'inde):
+          1. yeni gonderim reddedilir
+          2. kuyruk BOSALTILIR -> bekleyen isler iptal + sinyale YER ACILIR
+          3. isci basina bir sinyal GUVENILIR sekilde yerlestirilir
+          4. thread'lerin cikmasi beklenir
+
+        Varsayilan `timeout` bilincli olarak bir isin KENDI ust sinirindan
+        buyuktur: `icmp_probe` alt sureci `timeout_sec + 2` (~4sn) ile
+        sinirlidir, dolayisiyla o an calisan bir is bu pencereye sigar.
+        """
+        with self._lock:
+            zaten = self._kapali
+            self._kapali = True
+        son = time.monotonic() + max(0.5, timeout)
+
+        if not zaten:
+            iptal = self._kuyrugu_bosalt()
+            if iptal:
+                logger.debug("diagnostic_shutdown_cancelled jobs=%d", iptal)
+
+        # SINYALLERI GUVENILIR YERLESTIR. `put_nowait` + `except: pass`
+        # YETMEZ (bkz. docstring, hata A): kuyruk doluysa sinyal HIC ulasmaz
+        # ve isci `get()`te sonsuza kadar bekler. Her denemeden once yeniden
+        # bosaltiyoruz ki yer GARANTI olsun.
+        kalan = self.alive_workers()
+        while kalan > 0 and time.monotonic() < son:
+            try:
+                self._kuyruk.put(None, timeout=0.05)
+                kalan -= 1
             except queue.Full:
-                # Kuyruk doluysa isciler zaten mesgul; daemon thread olduklari
-                # icin proses kapanisini ENGELLEMEZLER.
-                pass
+                self._kuyrugu_bosalt()
+
         for t in self._isciler:
-            t.join(timeout=timeout)
+            t.join(timeout=max(0.0, son - time.monotonic()))
+
+        yasayan = self.alive_workers()
+        if yasayan:
+            # SESSIZ GECILMEZ: cagiran taraf master yikimina devam edip
+            # etmeyecegine bilerek karar vermeli.
+            logger.warning(
+                "diagnostic_shutdown_incomplete alive_workers=%d timeout=%.1fs — "
+                "tanilama iscileri sure icinde cikmadi; master yikimi bu "
+                "thread'lerle YARISABILIR",
+                yasayan,
+                timeout,
+            )
+            return False
+        return True

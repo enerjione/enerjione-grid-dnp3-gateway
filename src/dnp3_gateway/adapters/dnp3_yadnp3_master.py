@@ -4674,12 +4674,26 @@ class Yadnp3TelemetryReader(TelemetryReader):
         return ok, total
 
     def close(self) -> None:
-        # TANILAMA HAVUZU ONCE KAPANIR: ucusta bir ping varken master'lari
-        # yikmak, arka plan isinin yikilmis bir nesneye dokunmasi demektir.
-        # Yeni is de kabul edilmez, dolayisiyla kapanis uzamaz.
+        # TANILAMA HAVUZU MASTER'LARDAN ONCE VE TAMAMEN KAPANIR.
+        #
+        # Bu bir SIRALAMA TERCIHI DEGIL, DOGRULUK SARTIDIR: kuyruktaki
+        # kapanmalar `mm.ip_probe`, `mm.sonda_son_wall` ve `mm.kanal_durumu()`
+        # uzerinden MASTER nesnelerine dokunur. Isciler hala calisirken
+        # master/kanal yikilirsa bu erisimler yikilmis nesnelere gider.
+        #
+        # `shutdown()` bekleyen isleri IPTAL eder (akitmaz) ve TUM isci
+        # thread'leri cikana kadar bekler. `False` donerse SESSIZ GECILMEZ:
+        # bu, yikimin hala yasayan thread'lerle yarisacagi anlamina gelir ve
+        # sonraki bir crash'in tek ipucu bu satir olur.
         if self._tanilama_yurutucu is not None:
             try:
-                self._tanilama_yurutucu.shutdown()
+                if not self._tanilama_yurutucu.shutdown():
+                    logger.error(
+                        "diagnostic_workers_still_alive count=%d — master yikimina "
+                        "RAGMEN devam ediliyor; tanilama thread'leri yikilmis "
+                        "nesnelere dokunabilir",
+                        self._tanilama_yurutucu.alive_workers(),
+                    )
             except Exception:  # noqa: BLE001
                 logger.debug("diagnostic_executor_shutdown_error", exc_info=True)
 

@@ -162,6 +162,35 @@ Mimari kabul edildi; asagidaki maddeler merge oncesi kapatildi.
   OPENING -> OPEN`. Kutuphane "reddedildi" ile "paket dustu" ayrimini
   vermedigi icin o ayrim **uydurulmuyor** -> `unknown`.
 
+- **BLOCKER — `DiagnosticExecutor.shutdown()` iscileri GERCEKTEN durdurmuyordu.**
+  Iki ayri yoldan bozuktu:
+
+  **A) Dolu kuyrukta sinyal HIC ULASMIYORDU.** `put_nowait(None)` kuyruk
+  doluyken `queue.Full` firlatiyor, bu yutuluyordu ve isci sinyali hic
+  almadan `queue.get()`te **sonsuza kadar** bekleyebiliyordu.
+
+  **B) Sinyaller MEVCUT ISLERIN ARKASINDA kaliyordu.** Basariyla eklense
+  bile 2 isci + 64 kuyruk + ~2sn/is ile isciler **yaklasik bir dakika**
+  daha calisabilirken `join(timeout=5)` cok once donuyordu. Yani "tanilama
+  master'lardan once kapanir" garantisi **fiilen yoktu** ve kuyruktaki
+  kapanmalar (`mm.ip_probe`, `mm.sonda_son_wall`, `mm.kanal_durumu()`)
+  yikilmakta olan master nesnelerine dokunabiliyordu.
+
+  Yeni semantik — **iptal et, sonra bekle**: yeni `submit` derhal reddedilir,
+  kuyrukta bekleyen isler **iptal edilir** (bu ayni zamanda sinyale yer
+  acar), isci basina bir sinyal **guvenilir** yerlestirilir, yalnizca o an
+  **calisan** isler biter, **tum** thread'ler cikana kadar beklenir. Isciler
+  ayrica `_kapali` bayragini kontrol eder — yarista kapilmis bir is de
+  calistirilmaz.
+
+  `shutdown()` artik `bool` doner ve `close()` `False` durumunu **ERROR**
+  loglar; sessizce master yikimina devam edilmez. `daemon=True` bir
+  mekanizma olarak KULLANILMIYOR.
+
+  Yeni sayac `cancelled_total` (kapanista iptal) `dropped_total`dan
+  (kuyruk doygunlugu) **ayri** tutulur — karistirilirlarsa operator yanlis
+  yere bakar.
+
 - **Saha kabulu trafik beklentisi duzeltildi.** `gateway -> cihaz 0 bayt`
   olcutu `listening` icin **YANLISTI** ve saglikli bir kurulumu FAIL
   gosterirdi: orada baglantiyi gateway acar ve cihaz uyurken `ChannelRetry`

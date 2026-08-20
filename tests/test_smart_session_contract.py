@@ -674,6 +674,17 @@ def test_deployment_contract_1_14_0_alanlari() -> None:
     assert "bounded_async_executor" in smart["diagnostics_execution"]
     assert smart["diagnostics_probe_trigger"] == "device_late_only"
 
+    # --- Kapanis semantigi (PR #32 final review) -----------------------
+    # Tanilama iscileri master/kanal yikimindan ONCE ve TAMAMEN durur.
+    # Bu bir siralama tercihi degil, DOGRULUK SARTIDIR.
+    assert smart["diagnostics_shutdown_before_master_teardown"] is True
+    assert smart["diagnostics_shutdown_semantics"].startswith("best_effort_cancel_then_join")
+    assert smart["diagnostics_counters"] == [
+        "dropped_total",
+        "cancelled_total",
+        "completed_total",
+    ]
+
     # --- Saha kabulu trafik beklentisi (review madde 3) ----------------
     # "0 paket" olcutu `listening` icin YANLISTIR: uykuda SYN denemeleri
     # BEKLENIR. Sifir olmasi gereken sey DNP3 UYGULAMA YUKUDUR.

@@ -386,8 +386,34 @@ cevirirdi. Cihaz basina 300sn siklik siniri bunu TEK BASINA COZMEZ.
 Bu yuzden ICMP **sinirli bir arka plan havuzunda** kosar
 (`network_probe.DiagnosticExecutor`): sinirli isci, sinirli kuyruk, cihaz
 basina en fazla bir ucus, kuyruk dolunca is **dusurulur** (telemetri ASLA
-beklemez), istisnalar izole, kapanis temiz. `/health` sondanin bitmesini
-**beklemez**; son bilinen degeri doner.
+beklemez), istisnalar izole. `/health` sondanin bitmesini **beklemez**; son
+bilinen degeri doner.
+
+#### Kapanis: iptal et, sonra bekle
+
+Tanilama isi **best-effort**tur. Kapanista biriken is **akitilmaz, iptal
+edilir**:
+
+1. yeni `submit` **derhal** reddedilir
+2. kuyrukta **bekleyen** isler iptal edilir — bu ayni zamanda kapanis
+   sinyaline **yer acar**
+3. isci basina bir sinyal **guvenilir** sekilde yerlestirilir
+4. yalnizca o an **calisan** isler biter
+5. **tum** isci thread'leri cikana kadar beklenir
+6. ancak ondan sonra master/kanal yikimina devam edilir
+
+> **`daemon=True` bir mekanizma DEGILDIR.** Kuyruktaki kapanmalar
+> `mm.ip_probe`, `mm.sonda_son_wall` ve `mm.kanal_durumu()` uzerinden
+> **master nesnelerine** dokunur; isciler hala calisirken master/kanal
+> yikilirsa bu erisimler yikilmis nesnelere gider. Siralama bir tercih
+> degil, **dogruluk sartidir**.
+
+`shutdown()` `bool` doner. `False` ise cagiran taraf **sessiz gecmez** —
+`close()` ERROR loglar, cunku sonraki bir crash'in tek ipucu o satir olur.
+
+Sayaclar ayri tutulur: `dropped_total` (kuyruk **doygunlugu**),
+`cancelled_total` (**kapanista** iptal), `completed_total` (fiilen
+calistirilan). Karistirilirlarsa operator yanlis yere bakar.
 
 Tanilama yalnizca cihaz `late` iken ve `_PROBE_MIN_INTERVAL_SEC` (300sn)
 siklik siniriyla tetiklenir.

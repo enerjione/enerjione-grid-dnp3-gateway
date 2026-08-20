@@ -1111,3 +1111,213 @@ def test_l29_adapter_yolu_da_kesirli_degeri_reddeder(saha: ListeningSaha) -> Non
     assert _tavan(30.0) == 30_000
     # Kesirli -> kutuphane varsayilanina duser (30'a KIRPILMAZ).
     assert _tavan(30.9) == varsayilan
+
+
+# ==========================================================================
+# L30-L35 — KAPANIS/ESZAMANLILIK (PR #32 final review)
+#
+# `daemon=True` BIR MEKANIZMA DEGILDIR. Kuyruktaki kapanmalar `mm.ip_probe`,
+# `mm.sonda_son_wall` ve `mm.kanal_durumu()` uzerinden MASTER nesnelerine
+# dokunur; isciler hala calisirken master/kanal yikilirsa bu erisimler
+# yikilmis nesnelere gider.
+#
+# Butun testler Event/barrier ile senkronize — GERCEK uzun sleep YOK.
+# ==========================================================================
+
+#: Testlerde bir Event beklerken kullanilan ust sinir. Asilirsa test
+#: BASARISIZ olur; "biraz daha bekleyelim" ile gizlenmez.
+_OLAY_TIMEOUT = 5.0
+
+
+def test_l30_bos_kuyrukla_kapanis_tum_iscileri_bitirir() -> None:
+    """En basit hal: is yokken kapanis TUM iscileri cikarmali."""
+    yur = network_probe.DiagnosticExecutor(workers=3, queue_size=8, name="sd-bos")
+    assert yur.alive_workers() == 3
+
+    assert yur.shutdown(timeout=_OLAY_TIMEOUT) is True
+    assert yur.alive_workers() == 0, "bos kuyrukta bile isci hayatta kaldi"
+
+
+def test_l31_dolu_kuyrukla_kapanis_kilitlenmez_ve_isleri_iptal_eder() -> None:
+    """HATA A: `put_nowait(None)` kuyruk DOLUYKEN `queue.Full` firlatiyor,
+    bu yutuluyordu ve isci sinyali HIC ALMADAN `get()`te sonsuza kadar
+    bekleyebiliyordu.
+
+    Burada kuyruk BILEREK tamamen doldurulur.
+    """
+    yur = network_probe.DiagnosticExecutor(workers=2, queue_size=8, name="sd-dolu")
+    tut = threading.Event()
+    basladi = threading.Semaphore(0)
+
+    def _mesgul() -> None:
+        basladi.release()
+        tut.wait(timeout=_OLAY_TIMEOUT)
+
+    def _asla_calismamali() -> None:  # pragma: no cover
+        raise AssertionError("kapanistan sonra kuyruktaki is CALISTI")
+
+    # Iki isciyi de mesgul et.
+    assert yur.submit("mesgul-1", _mesgul)
+    assert yur.submit("mesgul-2", _mesgul)
+    assert basladi.acquire(timeout=_OLAY_TIMEOUT)
+    assert basladi.acquire(timeout=_OLAY_TIMEOUT)
+
+    # Kuyrugu TAMAMEN doldur (isciler mesgul, hicbiri cekilemez).
+    kabul = 0
+    for i in range(64):
+        if yur.submit(f"bekleyen-{i}", _asla_calismamali):
+            kabul += 1
+    assert kabul == 8, f"kuyruk beklendigi gibi dolmadi (kabul={kabul})"
+    assert yur.stats()["dropped_total"] > 0, "doygunlukta is dusurulmedi"
+
+    # Calisan isleri birak ve KAPAT. Kilitlenme OLMAMALI.
+    tut.set()
+    basla = time.monotonic()
+    tamam = yur.shutdown(timeout=_OLAY_TIMEOUT)
+    gecen = time.monotonic() - basla
+
+    assert tamam is True, "dolu kuyrukta kapanis tamamlanmadi"
+    assert yur.alive_workers() == 0, "isci hayatta kaldi (sinyal ulasmamis olabilir)"
+    assert gecen < _OLAY_TIMEOUT, f"kapanis {gecen:.1f}s surdu — kilitlenme belirtisi"
+
+    ist = yur.stats()
+    assert ist["cancelled_total"] >= 8, "bekleyen isler iptal edilmedi"
+    assert ist["queued"] == 0
+
+
+def test_l32_calisan_isler_biter_kuyruktakiler_calismaz() -> None:
+    """HATA B: sinyaller MEVCUT ISLERIN ARKASINDA kaliyordu.
+
+    2 isci + 64 kuyruk + ~2sn/is ile isciler bir DAKIKA daha calisabilir,
+    `join(timeout=5)` ise cok once donerdi. Kapanista biriken is AKITILMAZ,
+    IPTAL EDILIR.
+    """
+    yur = network_probe.DiagnosticExecutor(workers=2, queue_size=16, name="sd-akis")
+    tut = threading.Event()
+    basladi = threading.Semaphore(0)
+    calisan_bitti = threading.Event()
+    kuyruktan_calisan = []
+
+    def _aktif() -> None:
+        basladi.release()
+        tut.wait(timeout=_OLAY_TIMEOUT)
+        calisan_bitti.set()
+
+    def _kuyrukta(i: int):
+        def _f() -> None:
+            kuyruktan_calisan.append(i)
+
+        return _f
+
+    assert yur.submit("aktif-1", _aktif)
+    assert yur.submit("aktif-2", _aktif)
+    assert basladi.acquire(timeout=_OLAY_TIMEOUT)
+    assert basladi.acquire(timeout=_OLAY_TIMEOUT)
+
+    for i in range(10):
+        assert yur.submit(f"kuyruk-{i}", _kuyrukta(i))
+    assert yur.stats()["queued"] == 10
+
+    tut.set()
+    assert yur.shutdown(timeout=_OLAY_TIMEOUT) is True
+
+    # O an CALISAN isler bitmis olmali...
+    assert calisan_bitti.is_set(), "calisan is bitirilmedi"
+    # ...ama KUYRUKTAKILER HIC calismamali.
+    assert kuyruktan_calisan == [], f"kapanistan sonra {len(kuyruktan_calisan)} kuyruk isi calisti"
+    assert yur.alive_workers() == 0
+    assert yur.stats()["cancelled_total"] >= 10
+
+
+def test_l33_kapanistan_sonra_submit_derhal_reddeder() -> None:
+    yur = network_probe.DiagnosticExecutor(workers=1, queue_size=4, name="sd-red")
+    assert yur.submit("once", lambda: None) is True
+    assert yur.shutdown(timeout=_OLAY_TIMEOUT) is True
+
+    assert yur.is_shutdown() is True
+    for i in range(5):
+        assert yur.submit(f"sonra-{i}", lambda: None) is False, "kapanistan sonra is kabul edildi"
+    assert yur.stats()["queued"] == 0
+
+
+def test_l34_kapanis_dondukten_sonra_yasayan_isci_kalmaz() -> None:
+    """`shutdown()` DONDUGUNDE thread'ler GERCEKTEN olmus olmali.
+
+    `daemon=True` yalnizca proses cikisini engellememeyi saglar; calisma
+    aninda hicbir sey garanti ETMEZ.
+    """
+    yur = network_probe.DiagnosticExecutor(workers=4, queue_size=8, name="sd-thread")
+    isimler = {t.name for t in yur._isciler}
+    assert yur.shutdown(timeout=_OLAY_TIMEOUT) is True
+    assert yur.alive_workers() == 0
+
+    # Thread tablosunda da kalmamali.
+    yasayan = {t.name for t in threading.enumerate()} & isimler
+    assert not yasayan, f"kapanis sonrasi yasayan tanilama thread'i: {yasayan}"
+
+    # Idempotent: ikinci cagri patlamamali.
+    assert yur.shutdown(timeout=_OLAY_TIMEOUT) is True
+
+
+def test_l35_gateway_close_iscileri_masterlardan_once_durdurur(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SIRALAMA DOGRULUK SARTIDIR, tercih degil.
+
+    `mm.shutdown()` cagrildigi anda tanilama iscilerinin ZATEN olmus olmasi
+    gerekir; aksi halde kuyruktaki kapanmalar yikilmis master nesnelerine
+    dokunur.
+    """
+    r = _reader(tmp_path, diagnostics=True)
+    s = ListeningSaha(r)
+    monkeypatch.setattr(r, "_ensure_master", lambda d, sig=None: s._ensure(d))
+    yur = r._tanilama_yurutucu
+    assert yur is not None and yur.alive_workers() > 0
+
+    d = s.cihaz("ORDER-1", session_policy="smart", smart_max_silence_sec=86400)
+    mm = s.master("ORDER-1")
+
+    # `mm.shutdown()` cagrildigi ANDA yurutucunun durumunu yakala.
+    gozlem: dict[str, Any] = {}
+    gercek_shutdown = mm.shutdown
+
+    def _izle() -> None:
+        gozlem["alive_workers"] = yur.alive_workers()
+        gozlem["is_shutdown"] = yur.is_shutdown()
+        gercek_shutdown()
+
+    monkeypatch.setattr(mm, "shutdown", _izle)
+
+    tut = threading.Event()
+    basladi = threading.Event()
+
+    def _mesgul() -> None:
+        basladi.set()
+        tut.wait(timeout=_OLAY_TIMEOUT)
+
+    assert yur.submit("ORDER-1", _mesgul)
+    assert basladi.wait(timeout=_OLAY_TIMEOUT)
+    for i in range(20):
+        yur.submit(f"dolgu-{i}", lambda: None)
+
+    tut.set()
+    r._manager = _SahteManager()
+    r.close()
+
+    assert gozlem, "mm.shutdown hic cagrilmadi — test kurgusu bozuk"
+    assert gozlem["is_shutdown"] is True, "yurutucu master yikiminda hala acikti"
+    assert gozlem["alive_workers"] == 0, (
+        f"master yikilirken {gozlem['alive_workers']} tanilama iscisi HALA calisiyordu"
+    )
+    assert yur.alive_workers() == 0
+    assert d.code not in r._masters
+
+
+class _SahteManager:
+    """`close()` yolunda native `DNP3Manager.Shutdown()` yerine gecer."""
+
+    def __init__(self) -> None:
+        self.shutdown_sayisi = 0
+
+    def Shutdown(self) -> None:  # noqa: N802 — kutuphane imzasi
+        self.shutdown_sayisi += 1

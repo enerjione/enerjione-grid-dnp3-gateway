@@ -223,7 +223,16 @@
     "diagnostics_probe_trigger": "device_late_only",
     "sleep_traffic_expectation": "listening ucta uyku sirasinda TCP SYN / yeniden baglanma denemeleri BEKLENIR ve GEREKLIDIR (cihazin uyandigi boyle fark edilir; SYN sayisi 0 ise cihaz uyandiginda yakalanamaz). SIFIR OLMASI GEREKEN sey DNP3 UYGULAMA YUKUDUR: periyodik Class 1/2/3 scan YOK, Class 0/integrity scan YOK, DNP3 keepalive/uygulama istegi YOK. 'gateway -> cihaz 0 paket' olcutu listening icin YANLISTIR ve saglikli bir kurulumu FAIL gosterir.",
     "sleep_traffic_pass_criterion": "dnp3_application_payload_packets == 0",
-    "optional_int_parsing": "exact_integer: kesirli deger SESSIZCE KIRPILMAZ. int(60.9)->60 davranisi kaldirildi; 60.9 gecersizdir ve WARNING ile yok sayilir. Kabul: 60, '60', 60.0, '60.0', bosluklu metin. Red: kesirli degerler, nan/inf, bool (isinstance(True,int) DOGRU oldugu icin sessizce 1 olurdu), ayristirilamayan girdiler. Ayni kural DISK ONBELLEGI yolunda da uygulanir - o yol backend parser'ini ATLAR."
+    "optional_int_parsing": "exact_integer: kesirli deger SESSIZCE KIRPILMAZ. int(60.9)->60 davranisi kaldirildi; 60.9 gecersizdir ve WARNING ile yok sayilir. Kabul: 60, '60', 60.0, '60.0', bosluklu metin. Red: kesirli degerler, nan/inf, bool (isinstance(True,int) DOGRU oldugu icin sessizce 1 olurdu), ayristirilamayan girdiler. Ayni kural DISK ONBELLEGI yolunda da uygulanir - o yol backend parser'ini ATLAR.",
+    "diagnostics_shutdown_semantics": "best_effort_cancel_then_join: tanilama isi BEST-EFFORT'tur ve kapanista biriken is AKITILMAZ, IPTAL EDILIR. Sira: (1) yeni submit DERHAL reddedilir, (2) kuyrukta BEKLEYEN isler iptal edilir (bu ayni zamanda kapanis sinyaline YER ACAR), (3) isci basina bir sinyal GUVENILIR sekilde yerlestirilir, (4) YALNIZCA o an CALISAN isler biter, (5) TUM isci thread'leri cikana kadar beklenir, (6) ancak ondan sonra master/kanal yikimina devam edilir. daemon=True BIR MEKANIZMA DEGILDIR. shutdown() bool doner; False ise cagiran taraf SESSIZ GECMEZ, ERROR loglar.",
+    "diagnostics_shutdown_before_master_teardown": true,
+    "diagnostics_shutdown_rationale": "Kuyruktaki kapanmalar mm.ip_probe, mm.sonda_son_wall ve mm.kanal_durumu() uzerinden MASTER nesnelerine dokunur. Isciler hala calisirken master/kanal yikilirsa bu erisimler yikilmis nesnelere gider. Onceki hal IKI sekilde bozuktu: (A) put_nowait(None) kuyruk DOLUYKEN queue.Full firlatiyor, yutuluyor ve isci sinyali HIC ALMADAN get()te sonsuza kadar bekleyebiliyordu; (B) sinyaller MEVCUT ISLERIN ARKASINDA kaliyordu - 2 isci + 64 kuyruk + ~2sn/is ile isciler ~1 dakika daha calisabilirken join(timeout=5) cok once donuyordu.",
+    "diagnostics_counters": [
+      "dropped_total",
+      "cancelled_total",
+      "completed_total"
+    ],
+    "diagnostics_counters_semantics": "dropped_total = kuyruk DOYGUNLUGU nedeniyle kabul edilmeyen is. cancelled_total = KAPANISTA iptal edilen (baslamamis) is. completed_total = fiilen CALISTIRILAN is. Uc sayac AYRI tutulur: doygunluk ile kapanis farkli seyler soyler ve karistirilirlarsa operator yanlis yere bakar."
   },
   "initiating_endpoint": {
     "why": "ip_endpoint_type=initiating cihazlarda baglantiyi CIHAZ baslatir. Gateway container ICINDE cihazin master_ip_port degerini dinler; bridge ag modunda o port host'a acilmazsa cihaz baglanamaz.",
