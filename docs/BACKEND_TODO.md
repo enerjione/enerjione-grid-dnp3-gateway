@@ -1,6 +1,6 @@
 # Backend Koordinasyonu Gereken Isler
 
-**Durum:** B5 ACIK (yeni); B2 ACIK; B1 tek env bayragina indi; B3 ve B4 kapandi
+**Durum:** B7 ACIK (yeni, 1.15.0); B5/B6 ACIK; B2 ACIK; B1 tek env bayragina indi; B3 ve B4 kapandi
 **Olusturulma:** 2026-07-31 (production hardening calismasi)
 **Son guncelleme:** 2026-08-19
 **Neden ertelendi:** Bu maddeler gateway'i tek basina degistirerek cozulemez;
@@ -518,3 +518,70 @@ kazaniyor:
 
 B3'un backend yarisi (`signals_by_profile`) istege bagli bir esneklik
 maddesidir; yapilmazsa yerlesik profiller devrede kalir.
+
+---
+
+## B7. Cihaz basina calisma-zamani sagligi ucu — 🔴 BACKEND GEREKLI (1.15.0)
+
+**Gateway durumu:** ✅ TAMAM. Tasiyici 1.15.0'da hazir ama
+`DEVICE_HEALTH_PUBLISH_ENABLED` **varsayilan KAPALI** — backend ucu
+yayina girene kadar acilmaz.
+
+**Tam entegrasyon dokumani:** [GRID_DEVICE_HEALTH_API.md](./GRID_DEVICE_HEALTH_API.md)
+Backend ekibinin Python kaynagina bakmasi GEREKMEZ.
+
+### Neden yeni bir uc
+
+Cihaz basina saglik bugun **hicbir yerden** guvenle akmiyor. Tek tasiyici
+`X-E1-Gateway-Health` **basligi** ve o baslik `/pending` isteklerine biniyor
+— yani **fiziksel komut kanalinin** tasiyicisina. Backend ayristirma tavani
+~2 KB; 200+ cihaz **sigmaz**.
+
+> **Baslik buyutulerek cozulemez.** Bir proxy/backend baslik limitinde
+> `/pending` 400 donerse **kesici komutlari durur**. Toplu baslik **oldugu
+> gibi kalir**.
+
+### Backend'de yapilacak
+
+```
+POST /gateways/{gateway_code}/device-health
+Auth: X-Gateway-Token + X-Gateway-Code + X-Gateway-Instance-Id
+Content-Type: application/json
+```
+
+> **`X-Gateway-Command-Token` BEKLEMEYIN.** Bu uc onu **bilerek** tasimaz:
+> saglik telemetrisi komut yetkisi gerektirmez.
+
+Kontrol listesi (dokuman bolum 10):
+
+- [ ] Ucu ac, kanonik gateway auth ile dogrula
+- [ ] `schema != "device_health_v1"` → reddet
+- [ ] Gateway basina son `(boot_id, sequence)` sakla; **eski/esit** olani
+      **yok say** (bayat yazma korumasi)
+- [ ] `snapshot=true` partilerini `device_total` ile uzlastir
+- [ ] Bilinmeyen alanlari **yok say** (alan eklemek geriye uyumludur)
+
+### ⚠ UI/veri modelinde KARISTIRILMAMASI GEREKENLER
+
+| Gelen | Anlami | YANLIS olur |
+|---|---|---|
+| `connection_state=smart_idle` | **saglikli uyku** (modem kapali) | `offline`/`lost` gostermek |
+| `report_late=true` | **DEGRADED uyari**; durum HALA `smart_idle` | alarm/`lost` uretmek |
+| `ip_probe_status=unreachable` | **salt teshis** | baglanti karari vermek |
+
+> `smart_idle`i `lost` sayarsaniz **saglikli uyuyan filo arizali gorunur**.
+> `report_late`i alarm yaparsaniz Dial-In gecikmesi (cok sik iyi huylu)
+> **gunluk sahte alarm** uretir. "ping dusuyor → cihaz oldu" kurali filonun
+> **yarisini** sahte kopuk gosterir.
+
+### `gateway_instance_id` TEK BASINA YETMEZ
+
+O kimlik gateway diskinde **kalicidir** ve restart'ta **ayni kalir**.
+Restart sonrasi `sequence` 1'den baslar; yalnizca instance kimligine bakan
+bir backend yeni calismanin `sequence=1` partisini "eski" sanip **atardi**.
+Siralama **`(boot_id, sequence)`** ikilisiyle yapilmali.
+
+### Deploy sirasi
+
+**ONCE BACKEND.** Gateway bayragi backend ucu yayina girmeden acilirsa her
+turda 404 alinir ve log dolar (davranissal zarar yok, gurultu var).

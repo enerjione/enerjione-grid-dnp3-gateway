@@ -1,8 +1,8 @@
 {
   "contract_version": 1,
-  "gateway_release": "1.14.0",
-  "gateway_source_ref": "v1.14.0",
-  "gateway_source_sha": "e1181ae2ad3481e49883956b2e4ff6d2b8ae7287",
+  "gateway_release": "1.15.0",
+  "gateway_source_ref": "v1.15.0",
+  "gateway_source_sha": "1bea87f6ec22696f0a5d7654047caa0b4bbd5f3f",
   "gateway_source_sha_semantics": "BU DOSYADAKI DEGER, KENDISINI ICEREN COMMIT DEGILDIR ve olamaz: dosyaya yeni SHA yazmak yeni bir commit uretir ve SHA yeniden degisir (self-referential). Buradaki deger, bu sozlesmenin turetildigi YAYIMLANMIS BASELINE surumun commit'idir. Bir artifact'in GERCEK revizyonu iki yerde yasar ve ikisi de release sirasinda uretilir: (1) imaj etiketi org.opencontainers.image.revision=<GITHUB_SHA>, (2) release workflow'un urettigi gateway-deployment-contract.generated.json (gateway_source_sha alani GITHUB_SHA ile doldurulur). Tuketiciler revizyon icin BUNLARA bakmali; kaynak dosyadaki deger yalnizca baseline'dir.",
   "owner": "enerjione/enerjione-grid-dnp3-gateway",
   "description": "Bir uretim DNP3 gateway kurulumunun TASIMASI GEREKEN deployment sozlesmesi. Gateway repo'su sahibidir; Grid repo'su tam kopyasini vendor eder ve CI'da karsilastirir. Runtime'da iki repo birbirine baglanmaz.",
@@ -130,7 +130,7 @@
       "production_guard": "Gateway, production'da bu degerin GATEWAY_TOKEN veya GATEWAY_COMMAND_TOKEN ile ayni olmasini reddeder."
     }
   },
-  "gateway_source_sha_baseline_ref": "v1.13.0",
+  "gateway_source_sha_baseline_ref": "v1.14.0",
   "smart_session": {
     "supported": true,
     "semantics": "Horstmann Smart Navigator 2.0 Smart/Boost oturum yasam dongusu. Politika CIHAZ BASINA yapilandirilir (session_policy) ya da auto ile MASTER Operation Mode'dan turetilir. 1.14.0: UC TIPI (ip_endpoint_type) ile MOD (session_policy) BAGIMSIZ iki kavramdir ve alti kombinasyonun HEPSI desteklenir. Varsayilan 'continuous' oldugu icin mevcut kurulumlarin davranisi DEGISMEZ.",
@@ -251,5 +251,48 @@
     "host_port_uniqueness_scope": "DEPLOYMENT/ORKESTRASYON SORUMLULUGU. Gateway prosesi ayni host'taki kardes instance'lari GOREMEZ; dagitik bir port ayirici gateway icinde UYDURULMAZ. Orkestrator her gateway'e AYRIK bir blok vermeli (orn. GW-001 20100-20199, GW-002 20200-20299).",
     "network_mode": "bridge (host networking KULLANILMAZ — sinirsiz maruziyet)",
     "docker_proxy_cost": "Docker varsayilan userland-proxy ile yayinlanan HER port icin bir docker-proxy sureci baslatir. Blogu gercek initiating cihaz sayisina gore olcun."
+  },
+  "device_runtime_health_transport": {
+    "supported": true,
+    "min_gateway_version": "1.15.0",
+    "schema": "device_health_v1",
+    "http_method": "POST",
+    "path": "/gateways/{gateway_code}/device-health",
+    "auth": "canonical_gateway_credential: X-Gateway-Token + X-Gateway-Code + X-Gateway-Instance-Id + X-Request-Id (build_config_request_headers). YENI BIR CREDENTIAL SISTEMI YOK. Komut duzlemine ozel X-Gateway-Command-Token BILEREK GONDERILMEZ: saglik telemetrisi komut yetkisi gerektirmez ve o sirri yaymak F5'te ayrilan iki duzlemi yeniden birlestirirdi.",
+    "transport": "http_body",
+    "why_not_header": "X-E1-Gateway-Health basligi /pending isteklerine biner (FIZIKSEL KOMUT KANALI) ve backend tavani ~2KB'dir (MAX_HEADER_BYTES=1600). 200+ cihaz oraya SIGMAZ. Baslik buyutulseydi bir proxy/backend baslik limitinde /pending 400 doner ve KESICI KOMUTLARI DURURDU. Toplu baslik AYNEN korunur ve BUYUTULMEZ.",
+    "aggregate_header_unchanged": true,
+    "direction": "outbound_gateway_to_backend",
+    "ordering_model": "(boot_id, sequence) leksikografik. sequence = proses ici monotonik sayac; boot_id = her proses baslangicinda ARTAN, diskte tutulan sayac. gateway_instance_id TEK BASINA YETMEZ: o kimlik KALICIDIR ve restart'ta AYNI kalir, yani sifirlanan bir sequence ile birlesince backend iki calismayi ayirt edemez. DUVAR SAATI KULLANILMAZ: RTC'si bos acilan gateway'ler ve NTP siçramalari gercektir.",
+    "stale_write_protection": "Backend (boot_id, sequence) ikilisi ESKI ya da ESIT olan bir partiyi REDDEDEBILIR/YOK SAYABILIR. Gateway garantisi: eski bir calismanin partisi HER ZAMAN daha kucuk boot_id tasir, sequence'i ne kadar ilerlemis olursa olsun.",
+    "batch_max_default": 50,
+    "batch_max_range": "1..500",
+    "delivery_model": "startup'ta TAM snapshot; durum degisiminde DELTA (yalnizca degisen cihazlar); periyodik TAM snapshot ile uzlastirma (varsayilan 300sn). Bir snapshot birden fazla partiye bolunebilir; HEPSI snapshot=true tasir ve device_total kac cihaz beklendigini soyler.",
+    "snapshot_interval_sec_default": 300,
+    "retry": "bounded_exponential_backoff: 2sn -> 120sn tavan, +/-%20 jitter",
+    "backpressure": "coalescing_latest_state: cihaz basina EN SON durum tutulur, gecis basina DEGIL. Backend erisilemezken bellek cihaz sayisi kadar SINIRLI kalir (200 cihaz = en fazla 200 kayit, kesinti ne kadar surerse sursun). DISKE HICBIR SEY YAZILMAZ. Bu kanal KOMUT/OLAY DENETIM GECMISI DEGILDIR; ara gecisler bilincli olarak DUSURULUR.",
+    "blocks_dnp3_read_loop": false,
+    "blocks_command_plane": false,
+    "blocks_telemetry": false,
+    "isolation": "KENDI daemon thread'inde kosar. mark_dirty() poll thread'inden cagrilir ve ASLA BLOKLAMAZ (Event.set). Ag isi thread'in kendisindedir. Basarisiz teslim ne DNP3 okumasini, ne komutlari, ne telemetriyi etkiler.",
+    "probes_affect_connection_state": false,
+    "semantics": "smart_idle != offline (SAGLIKLI uyku). report_late != lost (DEGRADED uyari; connection_state smart_idle KALIR). Sonda sonuclari connection_state'i BELIRLEMEZ. operation_mode: 1=Smart, 0=Boost. Satellite Operation Mode YOK SAYILIR. Boost Mode Enabled (yetenek) calisma-zamani siniflandirmasina GIRMEZ.",
+    "connection_states": [
+      "online",
+      "smart_idle",
+      "recovering",
+      "lost",
+      "listener_error",
+      "unknown"
+    ],
+    "default_enabled": false,
+    "default_enabled_rationale": "DEVICE_HEALTH_PUBLISH_ENABLED varsayilan false. Backend bu ucu tanimadan acilirsa her turda 404 alinir ve log dolar. Grid tarafi hazir olunca acilir; kapaliyken HICBIR thread baslatilmaz.",
+    "env": [
+      "DEVICE_HEALTH_PUBLISH_ENABLED",
+      "DEVICE_HEALTH_BATCH_MAX",
+      "DEVICE_HEALTH_SNAPSHOT_INTERVAL_SEC",
+      "DEVICE_HEALTH_CHANGE_DEBOUNCE_SEC"
+    ],
+    "integration_doc": "docs/GRID_DEVICE_HEALTH_API.md"
   }
 }

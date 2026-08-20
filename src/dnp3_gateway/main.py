@@ -38,6 +38,7 @@ from dnp3_gateway.backend import (
     health_header,
     parse_device_ip_allowlist,
 )
+from dnp3_gateway.backend.device_health_publisher import DeviceHealthPublisher, next_boot_id
 from dnp3_gateway.command_authorization import authorize_output_command
 from dnp3_gateway.command_freshness import validate_command_freshness
 from dnp3_gateway.config import Settings, get_settings
@@ -1306,6 +1307,43 @@ def run(current_settings: Settings | None = None) -> int:
         delivery_provider=lambda: command_ledger.epoch,
     )
 
+    # --- Cihaz basina calisma-zamani sagligi (G-DEVICE-HEALTH-01) --------
+    #
+    # AYRI KANAL. `X-E1-Gateway-Health` toplu basligi OLDUGU GIBI kalir ve
+    # BUYUTULMEZ: o baslik `/pending` isteklerine biner ve backend tavani
+    # ~2 KB'dir. 200+ cihazin cihaz-bazli durumu oraya sigmaz; sigdirmaya
+    # calismak FIZIKSEL KOMUT KANALINI tehlikeye atardi.
+    #
+    # VARSAYILAN KAPALI: backend bu ucu tanimadan acilirsa her turda 404
+    # alinir ve log dolar. Grid tarafi hazir olunca `DEVICE_HEALTH_PUBLISH_
+    # ENABLED=true` ile acilir.
+    def _cihaz_saglik_kaynagi() -> dict[str, Any]:
+        """Adapter'in ANLIK cihaz saglik haritasi. Kopya tutulmaz."""
+        okuyucu = reader_holder.get("reader")
+        fn = getattr(okuyucu, "device_health", None)
+        if not callable(fn):
+            return {}
+        try:
+            return fn() or {}
+        except Exception:  # noqa: BLE001
+            logger.debug("device_health_source_error", exc_info=True)
+            return {}
+
+    device_health_publisher = DeviceHealthPublisher(
+        health_source=_cihaz_saglik_kaynagi,
+        send=config_client.post_device_health,
+        gateway_code=identity.gateway_code,
+        gateway_instance_id=identity.instance_id,
+        # SAATTEN BAGIMSIZ siralama capasi. `instance_id` restart'ta AYNI
+        # kaldigi icin tek basina yetmez (bkz. next_boot_id docstring'i).
+        boot_id=next_boot_id(cfg.gateway_state_dir, gateway_code=identity.gateway_code),
+        batch_max=cfg.device_health_batch_max,
+        change_debounce_sec=cfg.device_health_change_debounce_sec,
+        snapshot_interval_sec=cfg.device_health_snapshot_interval_sec,
+        enabled=cfg.device_health_publish_enabled,
+    )
+    device_health_publisher.start()
+
     refresh_thread = Thread(
         target=_run_config_refresh,
         kwargs={
@@ -1483,6 +1521,16 @@ def run(current_settings: Settings | None = None) -> int:
                     )
         except Exception:  # noqa: BLE001
             logger.debug("refresh_thread_join_error", exc_info=True)
+
+        # 1b) Cihaz saglik yayincisi: KENDI thread'i, best-effort kanal.
+        # Reader'dan ONCE durdurulur ki ucusta bir istek `device_health()`i
+        # yikilmakta olan bir adapter uzerinde cagirmasin. Basarisizligi
+        # kapanisin geri kalanini ETKILEMEZ.
+        try:
+            if not device_health_publisher.stop(timeout=5.0):
+                logger.warning("device_health_publisher_stop_incomplete")
+        except Exception:  # noqa: BLE001
+            logger.debug("device_health_publisher_stop_error", exc_info=True)
 
         # 2) Reader: DNP3 master/channel kapanir, TCP RST gonderir
         try:

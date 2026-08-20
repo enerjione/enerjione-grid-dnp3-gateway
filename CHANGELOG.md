@@ -2,6 +2,121 @@
 
 Semver'a gore tutulur. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.15.0] - 2026-08-20
+
+**G-DEVICE-HEALTH-01** — cihaz basina calisma-zamani sagligi icin AYRI,
+GIDEN tasiyici.
+
+### Kapatilan sorun
+
+Gateway 1.14 cihaz basina zengin saglik bilgisine **sahipti** ama Grid onu
+**guvenli sekilde alamiyordu**. Tek tasiyici `X-E1-Gateway-Health`
+**basligiydi** ve o baslik:
+
+* `/pending` isteklerine biner — yani **fiziksel komut kanalinin** tasiyicisi,
+* backend ayristirma tavani ~2 KB (`MAX_HEADER_BYTES` = 1600),
+* 200+ cihaz oraya **sigmaz**.
+
+> **Baslik buyutulerek COZULMEDI.** Buyutulseydi bir proxy/backend baslik
+> limitinde `/pending` 400 doner ve **kesici komutlari dururdu**. Toplu
+> baslik **oldugu gibi** kalir ve **buyutulmez**; yeni kanal onu rahatlatir.
+
+### Added
+
+- **`POST /gateways/{code}/device-health`** — govde tabanli, giden, komuttan
+  bagimsiz kanal. Mevcut **kanonik gateway credential**'i kullanilir
+  (`X-Gateway-Token` + kimlik basliklari); **yeni bir credential sistemi
+  kurulmadi**. Komut duzlemine ozel `X-Gateway-Command-Token` **bilerek
+  gonderilmez** — saglik telemetrisi komut yetkisi gerektirmez ve o sirri
+  yaymak F5'te ayrilan iki duzlemi yeniden birlestirirdi.
+
+- **Surumlu tel semasi `device_health_v1`** (`backend/device_health_wire.py`).
+  Zarf: `schema`, `gateway_code`, `gateway_instance_id`, `boot_id`,
+  `sequence`, `snapshot`, `device_total`, `devices`.
+
+- **Siralama modeli `(boot_id, sequence)`** — duvar saatinden **bagimsiz**.
+
+  > `gateway_instance_id` tek basina **yetmez**: o kimlik gateway diskinde
+  > **kalicidir** ve restart'ta **ayni kalir**. Restart sonrasi `sequence`
+  > 1'den baslar; yalnizca instance kimligine bakan bir backend, yeni
+  > calismanin `sequence=1` partisini "eski" sanip **atardi**. `boot_id` her
+  > acilista arttigi icin eski calismanin `sequence=9999` partisi bile yeni
+  > calismanin `sequence=1` partisinden **kucuktur**.
+  >
+  > Duvar saati kullanilmadi: sahada RTC'si bos acilan gateway'ler ve NTP
+  > siçramalari gercektir; saate bagli siralama tam da o anlarda tersine doner.
+
+- **Teslim modeli:** acilista tam snapshot → durum degisiminde delta →
+  periyodik (varsayilan 300sn) uzlastirma snapshot'i. Parti boyu sinirli
+  (varsayilan 50). Sinirli ustel geri cekilme (2sn → 120sn, ±%20 jitter).
+
+- **Backpressure: coalescing.** Cihaz basina **en son durum** tutulur, gecis
+  basina **degil**. Backend erisilemezken bellek cihaz sayisi kadar sinirli
+  kalir (200 cihaz = en fazla 200 kayit, kesinti ne kadar surerse sursun) ve
+  **diske hicbir sey yazilmaz**. Bu kanal **komut/olay denetim gecmisi
+  degildir**; ara gecisler bilincli olarak dusurulur.
+
+- **Yetenek isareti** `device_runtime_health_transport` (deployment
+  sozlesmesi, `min_gateway_version: 1.15.0`). `smart_session` /
+  `initiating_endpoint` **overload edilmedi**: Grid'in "1.14 = Smart
+  Listening var ama tasiyici yok" ile "1.15 = ikisi de var" ayrimini
+  yapabilmesi gerekiyor.
+
+- **`docs/GRID_DEVICE_HEALTH_API.md`** — backend ekibinin Python kaynagina
+  bakmadan uygulayabilecegi tam entegrasyon dokumani (HTTP, auth, sema,
+  alan tipleri, enum'lar, sequence/snapshot semantigi, retry, kontrol listesi).
+
+- Env: `DEVICE_HEALTH_PUBLISH_ENABLED` (**varsayilan false**),
+  `DEVICE_HEALTH_BATCH_MAX`, `DEVICE_HEALTH_SNAPSHOT_INTERVAL_SEC`,
+  `DEVICE_HEALTH_CHANGE_DEBOUNCE_SEC`.
+
+  > Varsayilan kapali **bilinclidir**: backend ucu tanimadan acilirsa her
+  > turda 404 alinir ve log dolar. Kapaliyken **hicbir thread baslatilmaz**.
+  > Devreye alma sirasi: **once backend ucu**, sonra gateway bayragi.
+
+### Semantik — v1.14 AYNEN korunur
+
+* `smart_idle` **!= offline** — saglikli uykudur.
+* `report_late` **!= lost** — DEGRADED uyaridir; `connection_state`
+  `smart_idle` **kalir**.
+* Sonda sonuclari `connection_state`i **belirlemez**; salt teshistir.
+* `operation_mode`: **1 = Smart, 0 = Boost**.
+* **Satellite** Operation Mode **yok sayilir**, tel kaydina **girmez**.
+* **Boost Mode Enabled** bir yetenektir; calisma-zamani siniflandirmasina
+  **girmez** ve tel kaydinda **yer almaz**.
+
+### Izolasyon
+
+Basarisiz bir saglik teslimi **hicbirini** etkilemez: DNP3 okuma dongusu,
+komut duzlemi, telemetri yayini, toplu saglik basligi. Yayinci **kendi
+daemon thread'inde** kosar; `mark_dirty()` poll thread'inden cagrilir ve
+**asla bloklamaz**. Kapanista reader'dan **once** durdurulur — ucusta bir
+istek `device_health()`i yikilmakta olan bir adapter uzerinde cagirmasin.
+
+### KOMUT DUZLEMI DEGISMEDI
+
+`/pending` semantigi, F1–F7, DirectOperate, SBO, teslim token'lari,
+CommandLedger, CROB ve komut kuyrugu davranisi **aynen** duruyor.
+`X-E1-Gateway-Health` toplu basligi **geriye uyumlu** kaldi.
+
+### Test
+
+`tests/test_device_health_transport.py` — 31 test: 1 cihaz, 200 cihaz
+(4 parti), uzun cihaz kodlariyla gercekci govde boyutu, partinin **govdede**
+gittigi (baslikta degil, AST ile), `/pending` basliginin 200 cihazda da
+sinirli kaldigi, `online -> smart_idle -> late -> lost -> kurtarma`
+gecisleri, Smart/Boost modu, `boost_mode_enabled`in calisma-zamanina
+giremedigi, backend erisilemezken **sinirli** bellek, retry/backoff,
+`mark_dirty`nin bloklamadigi (1000 cagri < 0.5sn), kapanis guvenligi,
+restart siralamasi ve bayat yeniden gonderim sozlesmesi.
+
+### Grid entegrasyonu BEKLIYOR
+
+Backend ucu **henuz yok**. Bu surum tasiyiciyi getirir ama
+`DEVICE_HEALTH_PUBLISH_ENABLED` **varsayilan kapalidir**. Grid tarafi
+`docs/GRID_DEVICE_HEALTH_API.md` bolum 10'daki kontrol listesini
+tamamlayana kadar acilmamalidir.
+
 ## [1.14.0] - 2026-08-20
 
 **G-SMART-LISTEN-01** — Horstmann `listening` ucta Smart/Boost/Auto yasam
