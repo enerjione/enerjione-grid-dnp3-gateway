@@ -420,6 +420,117 @@ siklik siniriyla tetiklenir.
 
 ---
 
+---
+
+## 5c. SMART SESSIZLIK DEGISMEZI (1.15.0)
+
+Bir Smart oturumunun **acilis isi** bittikten sonra gateway **uygulama
+katmaninda susar**:
+
+| Trafik | Smart | Continuous |
+|---|---|---|
+| Class 1/2/3 event scan | ❌ KAPALI | ✅ `DNP3_EVENT_SCAN_INTERVAL_SEC` |
+| Class 0+1+2+3 baseline/integrity scan | ❌ KAPALI | ✅ `DNP3_EVENT_BASELINE_INTERVAL_SEC` |
+| **Link katmani keepalive** | ❌ **KAPALI** | ✅ varsayilan 60sn |
+| G110 string okumasi | ⚠️ oturum basina **1 deneme** | ✅ 6 denemeye kadar backoff |
+| Acilis integrity poll | ⚠️ tek atislik (kutuphane sinirli) | ✅ |
+| Outstation unsolicited/olay yanitlari | ✅ normal kabul edilir | ✅ |
+
+### Link keepalive — 2026-08-20 saha dersi
+
+> **OLCULDU (yadnp3 3.2.1.1):** `cfg.link.KeepAliveTimeout` varsayilani
+> **60000 ms** ve 1.14.0'a kadar gateway onu **hic ayarlamiyordu**. Tamamen
+> sessiz bir master bile **60. saniyede** 10 baytlik bir `LINK_STATUS`
+> gonderiyor.
+
+Horstmann dokumantasyonu hareketsizlik sayacinin **her TCP/DNP trafigiyle**
+sifirlandigini soyler. 60 saniyede bir keepalive, 600 saniyelik oturum
+sayacini **sonsuza kadar** sifirlar — yani **taramalar kapatilsa bile modem
+hicbir zaman uyuyamaz**.
+
+Sahadaki 2026-08-20 yakalamasi yalnizca ~17 saniyelikti ve bu cerceveyi
+**gormedi**; konfigurasyon duzeltilip taramalar sustuktan **sonra** isiracak
+olan hata buydu.
+
+1.15.0'da `smart` cihazlarda `TimeDuration.Max()` ile devre disi birakilir.
+**`continuous`ta dokunulmaz** — orada olu link tespiti icin degerlidir ve
+zaten 5 saniyede bir tarama gittigi icin hicbir zaman tetiklenmez.
+
+### G110 string okumasi
+
+Ayni fonksiyondaki diger tum yoklamalar `smart` kapisiyla korunuyordu; G110
+yolu **korumasizdi**. Cihaz G110 dondurmezse 15/30/60/120/240 sn backoff ile
+**6 `ScanRange`** gider — sessizlik penceresinin tam ortasina dusen
+**tekrarlayan** uygulama istekleri.
+
+1.15.0: `smart`ta **oturum basina tek deneme**. Seri no / IMEI / firmware
+bilgisi degerlidir ve tek atislik acilis isi sozlesmece serbesttir; cihaz
+cevap vermezse bir daha sorulmaz. **`continuous`ta backoff aynen korunur.**
+
+### Acilis integrity poll — kutuphane siniri
+
+`AssignClassDuringStartup=False` acilis **"assign class"** gorevini kapatir
+ama opendnp3'un **acilis integrity poll'unu kapatmaz**: yadnp3 binding'i
+`MasterParams.startupIntegrityClassMask` alanini **sunmuyor**.
+
+Bu **tek atisliktir** (cihaz cevap verince tekrarlanmaz) ve 600 saniyelik
+sayaci **engellemez**, dolayisiyla sozlesme geregi serbest birakilmistir.
+
+---
+
+## 2c. GOZLEM ile EYLEM AYRIDIR (1.15.0)
+
+`Operation Mode` **her cihazda** okunur ve `/health` uzerinden raporlanir.
+**Etkin politika ise yalnizca `configured_session_policy=auto` iken
+degistirilir.**
+
+> **Yapilandirilan politika her zaman otoriterdir.** Gateway, Operation Mode
+> `smart` gorunce `continuous` bir cihazi **asla** susturmaz. Oyle yapsaydi
+> Grid'in acik niyeti sessizce ezilirdi.
+
+Once gozlem ve eylem **tek bir erken donuse** bagliydi:
+
+```python
+if mm.configured_session_policy != "auto":
+    return False          # <-- modu OKUMA kodu da bunun ARDINDAYDI
+```
+
+Sonucu sinsiydi: `continuous` yapilandirilmis bir cihaz mod noktasini
+durustce raporlasa bile gateway onu **hic yorumlamiyordu** ve
+`operation_mode="unknown"` kaliyordu. Yani **"panel SMART diyor ama gateway
+continuous kosuyor"** uyusmazligi gateway'in **hicbir yuzeyinde** (log,
+`/health`, saglik basligi) gorunmuyordu — 2026-08-20'de teshis icin
+**tcpdump acmak** gerekti.
+
+Artik uyusmazlik kenar-tetikli bir WARNING uretir:
+
+```
+device_policy_mismatch device=SN2-1 observed_operation_mode=smart
+  configured_policy=continuous effective_policy=continuous periodic_scans=true
+```
+
+**Politika degistirilmez**; operatore backend'de `session_policy` duzeltmesi
+soylenir (bkz. [BACKEND_TODO.md](./BACKEND_TODO.md#b5)).
+
+### Saha teshis komutu (tcpdump GEREKMEZ)
+
+```bash
+docker logs eg-gw-<kod> 2>&1 | grep -E "yadnp3_master_enabled|device_policy_mismatch|auto_policy_fallback|yadnp3_periodic_scans_enabled"
+```
+
+`yadnp3_master_enabled` satiri artik **acikca** basar:
+
+```
+device=SN2-1 mode=listening(client) endpoint=10.0.0.5:20001 ...
+ip_endpoint_type=listening configured_policy=continuous effective_policy=continuous
+operation_mode=unknown periodic_scans=true event_scan=5s baseline_scan=30s
+```
+
+`periodic_scans=true` gorulduyse cihaz **5 saniyede bir** Class 1/2/3 istegi
+gonderiyor demektir ve Horstmann'in hareketsizlik sayaci **asla dolamaz**.
+
+---
+
 ## 6. Yapilandirma anahtarlari
 
 | Anahtar | Yer | Varsayilan | Aciklama |
