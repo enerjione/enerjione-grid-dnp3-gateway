@@ -48,9 +48,7 @@ from .test_smart_session_policy import SINYALLER, SahteMaster
 AKIM_IDX = 2
 MOD_IDX = 15
 
-MOD_SINYALI = make_signal(
-    "master.operation_mode", data_type="binary", object_group=1, index=MOD_IDX
-)
+MOD_SINYALI = make_signal("master.operation_mode", data_type="binary", object_group=1, index=MOD_IDX)
 SINYALLER_MODLU = [*SINYALLER, MOD_SINYALI]
 
 
@@ -262,9 +260,7 @@ def test_l6_idle_sirasinda_gateway_kaynakli_trafik_yok(saha: ListeningSaha) -> N
 
 
 def test_l7_rapor_penceresi_icinde_late_yok(saha: ListeningSaha) -> None:
-    d = saha.cihaz(
-        "DIAL-1", session_policy="smart", smart_max_silence_sec=86400, dial_in_interval_min=60
-    )
+    d = saha.cihaz("DIAL-1", session_policy="smart", smart_max_silence_sec=86400, dial_in_interval_min=60)
     saha.gateway_bagladi("DIAL-1")
     saha.dnp3_kaniti("DIAL-1")
     saha.oku_ve_onayla(d)
@@ -283,9 +279,7 @@ def test_l8_rapor_gecince_late_ama_comm_lost_yok(
 ) -> None:
     """LATE ile LOST ayrimi. Bu ikisi karistirilirsa ya erken alarm
     (operator korkar) ya da gec alarm (gercek ariza gizlenir) olur."""
-    d = saha.cihaz(
-        "DIAL-2", session_policy="smart", smart_max_silence_sec=86400, dial_in_interval_min=60
-    )
+    d = saha.cihaz("DIAL-2", session_policy="smart", smart_max_silence_sec=86400, dial_in_interval_min=60)
     saha.gateway_bagladi("DIAL-2")
     saha.dnp3_kaniti("DIAL-2")
     saha.oku_ve_onayla(d)
@@ -305,9 +299,7 @@ def test_l8_rapor_gecince_late_ama_comm_lost_yok(
 
 
 def test_l9_late_taze_temasla_duzelir(saha: ListeningSaha) -> None:
-    d = saha.cihaz(
-        "DIAL-3", session_policy="smart", smart_max_silence_sec=86400, dial_in_interval_min=60
-    )
+    d = saha.cihaz("DIAL-3", session_policy="smart", smart_max_silence_sec=86400, dial_in_interval_min=60)
     saha.gateway_bagladi("DIAL-3")
     saha.dnp3_kaniti("DIAL-3")
     saha.oku_ve_onayla(d)
@@ -523,9 +515,7 @@ def test_l19_icmp_basarisizligi_tek_basina_comm_lost_uretmez(
     monkeypatch.setattr(network_probe, "icmp_probe", lambda host, **kw: network_probe.IP_UNREACHABLE)
     monkeypatch.setattr(network_probe, "tcp_probe", lambda host, port, **kw: network_probe.TCP_TIMEOUT)
 
-    d = s.cihaz(
-        "PROBE-1", session_policy="smart", smart_max_silence_sec=86400, dial_in_interval_min=60
-    )
+    d = s.cihaz("PROBE-1", session_policy="smart", smart_max_silence_sec=86400, dial_in_interval_min=60)
     s.gateway_bagladi("PROBE-1")
     s.dnp3_kaniti("PROBE-1")
     s.oku_ve_onayla(d)
@@ -540,9 +530,7 @@ def test_l19_icmp_basarisizligi_tek_basina_comm_lost_uretmez(
     assert saglik["last_probe_epoch"] is not None
 
 
-def test_l20_sonda_yalnizca_gecikmisken_calisir(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_l20_sonda_yalnizca_gecikmisken_calisir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Normal uykuda ping/TCP denemesi gereksiz trafik ve gurultudur."""
     r = _reader(tmp_path)
     s = ListeningSaha(r)
@@ -556,9 +544,7 @@ def test_l20_sonda_yalnizca_gecikmisken_calisir(
     monkeypatch.setattr(network_probe, "icmp_probe", _say)
     monkeypatch.setattr(network_probe, "tcp_probe", lambda host, port, **kw: network_probe.TCP_OPEN)
 
-    d = s.cihaz(
-        "PROBE-2", session_policy="smart", smart_max_silence_sec=86400, dial_in_interval_min=60
-    )
+    d = s.cihaz("PROBE-2", session_policy="smart", smart_max_silence_sec=86400, dial_in_interval_min=60)
     s.gateway_bagladi("PROBE-2")
     s.dnp3_kaniti("PROBE-2")
     s.oku_ve_onayla(d)
@@ -638,9 +624,7 @@ def test_l22_karisik_komsular_birbirini_etkilemez(saha: ListeningSaha) -> None:
     assert durum["MIX-BOOST"] == "online"
 
 
-def test_l23_restart_listening_smart_idle_i_korur(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_l23_restart_listening_smart_idle_i_korur(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Restart, uyuyan filoyu comm_lost firtinasina CEVIRMEMELI."""
     yol = str(tmp_path / "session_state.json")
 
@@ -691,9 +675,7 @@ def test_l24_health_ozeti_late_ve_lost_u_ayirir(saha: ListeningSaha) -> None:
         smart_max_silence_sec=86400,
         dial_in_interval_min=60,
     )
-    kopuk = saha.cihaz(
-        "SUM-LOST", ip_address="10.0.0.22", session_policy="smart", smart_max_silence_sec=3600
-    )
+    kopuk = saha.cihaz("SUM-LOST", ip_address="10.0.0.22", session_policy="smart", smart_max_silence_sec=3600)
     for kod in ("SUM-LATE", "SUM-LOST"):
         saha.gateway_bagladi(kod)
         saha.dnp3_kaniti(kod)

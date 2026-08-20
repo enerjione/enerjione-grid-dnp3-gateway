@@ -126,9 +126,7 @@ def test_gs05b_parse_asamasinda_uyari_yok(caplog: pytest.LogCaptureFixture) -> N
     with caplog.at_level("ERROR"):
         deger = _parse_session_policy(_cihaz_item(session_policy="smart"))
     assert deger == "smart"
-    assert not [
-        r for r in caplog.records if "config_session_policy_endpoint_mismatch" in r.getMessage()
-    ]
+    assert not [r for r in caplog.records if "config_session_policy_endpoint_mismatch" in r.getMessage()]
 
 
 # ==========================================================================

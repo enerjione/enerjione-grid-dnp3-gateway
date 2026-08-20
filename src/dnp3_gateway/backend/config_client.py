@@ -507,9 +507,7 @@ SMART_LISTEN_PROBE_MIN_SEC = 5
 SMART_LISTEN_PROBE_MAX_SEC = 600
 
 
-def _parse_optional_int(
-    item: dict[str, Any], alan: str, *, lo: int, hi: int
-) -> int | None:
+def _parse_optional_int(item: dict[str, Any], alan: str, *, lo: int, hi: int) -> int | None:
     """Opsiyonel tamsayi alani; yoksa/gecersizse None + WARNING.
 
     `session_policy` gibi konfigurasyonu DUSURMEZ: bu alanlarin yanlis
@@ -522,9 +520,7 @@ def _parse_optional_int(
     try:
         n = int(ham)
     except (TypeError, ValueError):
-        logger.warning(
-            "config_%s_invalid code=%r received=%r — yok sayildi", alan, item.get("code"), ham
-        )
+        logger.warning("config_%s_invalid code=%r received=%r — yok sayildi", alan, item.get("code"), ham)
         return None
     if not (lo <= n <= hi):
         logger.warning(
