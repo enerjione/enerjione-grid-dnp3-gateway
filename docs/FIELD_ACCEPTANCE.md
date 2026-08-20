@@ -453,6 +453,77 @@ dogrulanamaz.
 
 ---
 
+## 3I. RETEST PROSEDURU — ADIM 0 ATLANMAZ
+
+### ADIM 0 — ARTEFAKT KIMLIGI (bu adim atlanirsa sonuclar ANLAMSIZDIR)
+
+Saha makinesinin **tam olarak test edilecek commit'ten** uretilmis bir
+artefakt kosturdugu DOGRULANMADAN hicbir olcum yorumlanmaz.
+
+> **YAYINLANMIS ARTEFAKT YALNIZCA `main` VE `v*` TAG'LERI ICIN URETILIR.**
+> `.github/workflows/ci.yml` docker isi `push: false` ile derler (yalnizca
+> CI icinde calistirmak icin); `release-image.yml` ise `push: branches:
+> [main]` ve `tags: ["v*.*.*"]` tetikleyicilerine baglidir.
+>
+> Yani bir **PR dal ucu** icin GHCR'de imaj **YOKTUR**. O SHA'yi sahada
+> kosturmak isteyen once artefakt URETMELIDIR.
+
+**Kontrol:**
+
+```bash
+# Sahadaki container GERCEKTE ne kosturuyor?
+docker inspect eg-gw-<kod> --format '{{index .Config.Labels "org.opencontainers.image.revision"}}'
+docker inspect eg-gw-<kod> --format '{{index .Config.Labels "org.opencontainers.image.version"}}'
+docker inspect eg-gw-<kod> --format '{{.Image}}'
+```
+
+`revision` degeri test edilecek SHA ile **BIREBIR** ayni degilse **DURUN**.
+
+**Artefakt uretme (tag basmadan):** `release-image.yml` `workflow_dispatch`
+destekler; ilgili dalda elle tetiklendiginde `sha-<kisa-sha>` ve dal adi
+etiketleriyle imaj yayinlar.
+
+```bash
+gh workflow run release-image.yml --ref <dal-adi>
+# sonra:
+docker pull ghcr.io/enerjione/enerjione-grid-dnp3-gateway:sha-<kisa7>
+```
+
+### ADIM 1 — Yakalama
+
+**Sure: fiziksel Session Timeout'un EN AZ 2 KATI.** 120 sn test degeri icin
+`>= 300 sn`. Kisa yakalama 60 saniyelik keepalive'in kapandigini
+**dogrulayamaz** — 2026-08-20'deki 17 saniyelik yakalama tam da bunu kacirdi.
+
+```bash
+sudo tcpdump -i any -n -w /tmp/sn2.pcap "host <CIHAZ_IP> and tcp port <PORT>"
+docker logs eg-gw-<kod> > /tmp/gw.log 2>&1
+```
+
+### ADIM 2 — Analiz (elle paket sayilmaz)
+
+```bash
+python3 scripts/field_smart_verify.py     --pcap /tmp/sn2.pcap --log /tmp/gw.log     --device-ip <CIHAZ_IP> --gateway-ip <GATEWAY_CONTAINER_IP>     --port <PORT> --device-code SN2_0 --session-timeout 120
+```
+
+Arac kabul raporunun istedigi **her sayiyi** uretir: yakalama suresi, son
+anlamli DNP3 alisverisi, TCP kapanis ani, olculen sessizlik suresi,
+`REQUEST_LINK_STATUS` sayisi, tekrarlayan integrity/event scan sayisi, durum
+gecis zaman cizelgesi ve `comm_lost`/`recovery_timeout` sayimlari.
+
+**Cikis kodu:** `0` = KABUL, `1` = RED, `2` = kullanim/ortam hatasi.
+
+> Arac cerceveleri **kod cozumleyerek** siniflar. 2026-08-20'de "10 baytlik
+> cerceve" elle yorumlandi ve ilk turda **yanlis atfedildi** (Grid'in
+> `link status period=0` ayarina); gercekte gateway'in kendi
+> `REQUEST_LINK_STATUS` keepalive'iydi. `tshark` yoksa arac **calismayi
+> reddeder** — tahmine dayali analiz uretmez.
+
+> **Saf TCP ACK/SYN paketleri DNP3 yuku SAYILMAZ.** Uyku sirasindaki
+> yeniden baglanma denemeleri BEKLENIR.
+
+---
+
 ## 4. Kalite bayragi pilotu (G-QUALITY-PILOT)
 
 **Ayar (dogrulanmis kanonik ad):** `DNP3_PUBLISH_QUALITY_FLAGS`
