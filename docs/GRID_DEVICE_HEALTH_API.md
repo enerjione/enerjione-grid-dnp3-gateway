@@ -121,7 +121,14 @@ Govde **okunmaz**; yalnizca durum kodu onemlidir. Backend bos govde donebilir.
   "tcp_probe_status": "connecting",
   "last_probe_epoch": null,
 
-  "ip_endpoint_type": "listening"
+  "ip_endpoint_type": "listening",
+
+  "device_clock_status": "ok",
+  "device_clock_offset_sec": -0.4,
+  "last_device_time_epoch": 1755600000.0,
+  "need_time_iin": false,
+
+  "session_started_epoch": 1755599000.0
 }
 ```
 
@@ -144,6 +151,11 @@ Govde **okunmaz**; yalnizca durum kodu onemlidir. Backend bos govde donebilir.
 | `tcp_probe_status` | enum | `open` \| `connecting` \| `unknown` |
 | `last_probe_epoch` | float \| null | Son tanilama ani. |
 | `ip_endpoint_type` | enum | `listening` \| `initiating` |
+| `device_clock_status` | enum \| null | **1.15.1+** `unknown` \| `ok` \| `invalid` \| `need_time` |
+| `device_clock_offset_sec` | float \| null | **1.15.1+** `cihaz_saati - gateway_saati` (saniye, isaretli). |
+| `last_device_time_epoch` | float \| null | **1.15.1+** Cihazin **kendi** bildirdigi son damga. |
+| `need_time_iin` | bool \| null | **1.15.1+** IIN1.4 (NEED_TIME) bayragi. `null` = hic IIN gorulmedi. |
+| `session_started_epoch` | float \| null | **1.15.1+** Acik oturumun basladigi an; oturum kapaliyken `null`. |
 
 `null` epoch **"hic olmadi"** demektir — `0` gonderilmez (panelde 1970
 tarihleri cikmasin diye).
@@ -179,6 +191,51 @@ max_silence asildi               -> lost
 > aglarinda/APN'lerde sikca engellidir ve Smart bir modem **mesru olarak**
 > uykudadir. "ping dusuyor → cihaz oldu" kurali filonun yarisini sahte kopuk
 > gosterir. Baglanti karari **yalnizca** `connection_state`indir.
+
+### Cihaz RTC sagligi ≠ baglanti durumu  *(1.15.1+)*
+
+Sahada bir Horstmann'in RTC'si **2066** yilina kaymisti ve bu bilgi
+calisma-zamani sagliginda **hic gorunmuyordu**. `device_clock_status` tam
+olarak bu bosluğu kapatir.
+
+| Deger | Anlam |
+|---|---|
+| `ok` | Cihaz damga gonderdi ve makul aralikta. |
+| `invalid` | Damga **kanitlanabilir** sekilde yanlis (tolerans disi). |
+| `need_time` | Cihaz IIN1.4 ile saat **istiyor**; senkronizasyonla duzelir. |
+| `unknown` | Cihaz hic damga gondermedi (or. yalnizca statik/Class 0 okumasi). |
+
+**Oncelik: `invalid` > `need_time` > `ok` > `unknown`.** `invalid`in
+`need_time`den **once** gelmesi bilinclidir: DNP3 zaman senkronizasyonu —
+hangi prosedur secilirse secilsin — **talep gudumludur** (master yalnizca
+cihaz IIN1.4 assert ettiginde saat yazar). Saat yanlis **ama** cihaz saat
+istemiyorsa durum **kendiliginden duzelmez**; sahada gorulen tam olarak
+buydu.
+
+> **Bu alanlar `connection_state`i ETKILEMEZ.** Saati bozuk bir cihaz
+> `online` olabilir, olcum gondermeye devam eder ve komut kabul eder.
+> Etkilenen tek sey **cihazin kendi olay damgasina duyulan guven**tir.
+> `device_clock_status = "invalid"` gorup cihazi kopuk saymak, saglikli
+> filoyu arizali gosterir.
+
+> **Gateway zorla saat yazmaz.** RTC yanlis olup `need_time_iin = false`
+> ise gateway **yalnizca gorunur kilar**; duzeltme cihaz/saha isidir.
+> (Ayrica gateway kendi saatinden emin degilse — ClockGuard — istense bile
+> yazmaz.)
+
+`device_clock_offset_sec` isaretlidir: **pozitif** = cihaz saati ileri,
+**negatif** = geri.
+
+### `session_started_epoch` — dikkat  *(1.15.1+)*
+
+Acik DNP3 oturumunun basladigi an. **Oturum kapaliyken `null`dur** —
+yani `smart_idle` bir cihazda normal olarak `null` gorursunuz; bu bir
+hata degildir.
+
+> **Delta tetiklemez.** Bu alan *gozlem* sinifindadir: her yeni oturum
+> zaten bir `connection_state` gecisi uretir, dolayisiyla ayrica delta
+> tetiklemesi gereksiz trafik olurdu (bkz. §6 "Neden her degisiklik delta
+> uretmez"). Guncel degeri **her zaman** periyodik snapshot'ta bulursunuz.
 
 ### Operation Mode
 
@@ -229,6 +286,29 @@ gelen (boot_id, sequence) >  saklanan  ->  UYGULA ve sakla
   snapshot** gonderilir — delta silinen bir cihazi **tasimaz**.
 * Varsayilan **300 saniyede bir** uzlastirma snapshot'i gelir — delta
   kaybolsa bile backend en gec o surede gercekle hizalanir.
+
+#### Neden her alan degisikligi delta uretmez  *(1.15.1+)*
+
+Kayittaki alanlar iki sinifa ayrilir:
+
+| Sinif | Ornekler | Delta tetikler mi |
+|---|---|---|
+| **Semantik** | `connection_state`, `connected`, `reachable`, `report_late`, `operation_mode`, `device_clock_status`, `need_time_iin`, `tcp_probe_status` | **Evet** |
+| **Gozlem** | `last_frame_epoch`, `last_valid_contact_epoch`, `report_overdue_sec`, `last_probe_epoch`, `device_clock_offset_sec`, `last_device_time_epoch`, `session_started_epoch`, `next_expected_report_epoch` | **Hayir** |
+
+1.15.0'da delta karari **tam kayit esitligiyle** veriliyordu. `last_frame_epoch`
+her frame'de degistigi icin telemetri alan **her** cihaz (ozellikle
+`continuous` filosu) neredeyse her toplama penceresinde bir POST uretiyordu —
+sahada `device_health_published` logu **~2 saniyede bir** goruluyordu.
+
+**Payload sozlesmesi DEGISMEDI**: hicbir alan kaldirilmadi, hicbir alan
+seyrekleşmedi. Degisen tek sey **ne zaman gonderildigi**dir.
+
+> **Backend etkisi:** gozlem alanlarinin *en taze* degeri delta'lar arasinda
+> beklemeye alinmaz — bir delta gonderildiginde kaydin **tamami** (guncel
+> gozlem degerleriyle) gider. Sadece "yalnizca gozlem alani degisti" durumu
+> tek basina POST tetiklemez; o degerler bir sonraki delta'da ya da en gec
+> periyodik snapshot'ta gelir.
 
 ### Cok parcali snapshot — **`device_total` tek basina YETMEZ**
 

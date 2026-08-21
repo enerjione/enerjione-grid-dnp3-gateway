@@ -61,10 +61,26 @@ def test_uretim_varsayilani_gecerli() -> None:
     assert _dogrula() is ParameterReason.VALID
 
 
-@pytest.mark.parametrize("op", ["latch_on", "latch_off", "pulse_on", "pulse_off"])
-def test_desteklenen_dort_op_type(op: str) -> None:
-    """`_op_map` ile AYNI kume — mevcut sozlesme daraltilmadi."""
+@pytest.mark.parametrize("op", ["latch_on", "latch_off"])
+def test_horstmann_profilinde_izinli_op_typelar(op: str) -> None:
+    """Resmi Device Profile: Latch On/Off = ALWAYS."""
     assert _dogrula(op_type=op) is ParameterReason.VALID
+
+
+@pytest.mark.parametrize("op", ["pulse_on", "pulse_off"])
+def test_pulse_horstmann_profilinde_reddedilir(op: str) -> None:
+    """P0 UYUMLULUK: resmi Device Profile `Pulse On/Off = NEVER` diyor.
+
+    1.15.0'a kadar validator bunlari KABUL EDIYORDU; yani gateway cihazin
+    "ASLA desteklemiyorum" dedigi bir istegi TELE KOYABILIYORDU. Bu bir
+    "cihaz nasilsa reddeder" durumu degildir: fiziksel bir cikisa `pulse`
+    gondermek, latch bekleyen operatorun niyetinden BASKA bir sonuc
+    uretebilir.
+
+    `_op_map` kutuphane kodlayicisidir ve dort tipi de KODLAYABILIR; kapi
+    GATEWAY SINIRIDIR.
+    """
+    assert _dogrula(op_type=op) is ParameterReason.INVALID_OP_TYPE
 
 
 def test_buyuk_harf_op_type_mevcut_davranis_korunur() -> None:
@@ -124,9 +140,19 @@ def test_araligin_ustunde_count_reddedilir(c: int) -> None:
 
 
 def test_count_sinir_degerleri() -> None:
+    """Tip/aralik sinirlari KORUNDU; ustune HORSTMANN PROFIL kisiti geldi.
+
+    `COUNT_MIN..COUNT_MAX` (1..255) DNP3 `uint8` alan sinirinin ta kendisi
+    ve kodlama katmani icin hala gecerli. Ama resmi Device Profile
+    `Count > 1 = NEVER` dedigi icin gateway sinirinda TEK gecerli deger 1.
+    """
     assert _dogrula(count=COUNT_MIN) is ParameterReason.VALID
-    assert _dogrula(count=COUNT_MAX) is ParameterReason.VALID
+    assert COUNT_MIN == 1, "profil kisiti COUNT_MIN=1 varsayar"
+    # Alan sinirinin ustu ZATEN reddediliyordu...
     assert _dogrula(count=COUNT_MAX + 1) is ParameterReason.INVALID_COUNT
+    # ...ve artik alan sinirinin ICINDE olan >1 degerler de reddediliyor.
+    assert _dogrula(count=COUNT_MAX) is ParameterReason.INVALID_COUNT
+    assert _dogrula(count=2) is ParameterReason.INVALID_COUNT
 
 
 def test_count_bool_reddedilir() -> None:

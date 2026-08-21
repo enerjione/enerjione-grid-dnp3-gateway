@@ -505,15 +505,36 @@ def test_operate_gecerli_komut_tam_bir_fiziksel_cagri(sunucu) -> None:
 
 
 def test_operate_gecerli_acik_degerler_calisir(sunucu) -> None:
+    """Acikca verilen GECERLI degerler aynen cihaza gider.
+
+    `count` HORSTMANN PROFILINE gore 1 olmak zorunda (Count > 1 = NEVER),
+    bu yuzden ornek deger 2'den 1'e cekildi. Testin amaci degismedi:
+    "alan acikca verildiginde aynen tasinir".
+    """
     tutucu, port = sunucu
     reader = _GercekReader()
     tutucu["reader"] = reader
 
-    _kod, govde = _post_operate(port, _operate_govdesi(count=2, on_time_ms=0, off_time_ms=0))
+    _kod, govde = _post_operate(port, _operate_govdesi(count=1, on_time_ms=0, off_time_ms=0))
 
     assert govde["ok"] is True
     assert len(reader.fiziksel) == 1
-    assert reader.fiziksel[0]["count"] == 2
+    assert reader.fiziksel[0]["count"] == 1
+
+
+def test_operate_count_2_horstmann_profilinde_reddedilir(sunucu) -> None:
+    """P0 UYUMLULUK: `Count > 1 = NEVER`. Fiziksel islem SIFIR olmali."""
+    tutucu, port = sunucu
+    reader = _GercekReader()
+    tutucu["reader"] = reader
+
+    kod, govde = _post_operate(port, _operate_govdesi(count=2, on_time_ms=0, off_time_ms=0))
+
+    # MEVCUT HTTP SOZLESMESI KORUNUR: parametre reddi 200 + ok:false.
+    assert kod == 200
+    assert govde["ok"] is False
+    assert govde["status"] == "invalid_count"
+    assert reader.fiziksel == [], "profil disi count TELE CIKTI"
 
 
 def test_operate_timeout_sec_f6_alani_degil(sunucu) -> None:

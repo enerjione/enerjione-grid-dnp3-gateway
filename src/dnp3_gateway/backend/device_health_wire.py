@@ -62,6 +62,11 @@ EFFECTIVE_POLICIES: frozenset[str] = frozenset({"continuous", "smart", "unknown"
 #: dokumandaki 0x01/0x81 DEGER DEGIL bayrak oktetidir).
 OPERATION_MODES: frozenset[str] = frozenset({"smart", "boost", "unknown"})
 
+#: Cihaz RTC durumu (1.15.1). Horstmann RTC'si ciddi biçimde kayabiliyor
+#: (sahada 2066 gorulduu). Gateway damgayi ZATEN reddediyordu ama bu bilgi
+#: yalnizca telemetri payload'inda gorunuyordu; runtime health'te izi yoktu.
+DEVICE_CLOCK_STATES: frozenset[str] = frozenset({"unknown", "ok", "invalid", "need_time"})
+
 #: ICMP sonda sonuclari.
 IP_PROBE_STATES: frozenset[str] = frozenset({"reachable", "unreachable", "unsupported", "unknown"})
 #: TCP durumu — yadnp3 KANAL durumundan turetilir, ham soket ACILMAZ.
@@ -97,6 +102,15 @@ def _sayi(deger: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return f if f == f and f not in (float("inf"), float("-inf")) else None
+
+
+def _bool_veya_none(deger: Any) -> bool | None:
+    """`None` KORUNUR: "bilinmiyor" ile "hayir" AYRI seylerdir.
+
+    `need_time_iin=None` = cihazdan henuz hic IIN gorulmedi.
+    `need_time_iin=False` = gorulduu ve bayrak KAPALI.
+    """
+    return None if deger is None else bool(deger)
 
 
 def build_device_record(device_code: str, saglik: dict[str, Any]) -> dict[str, Any]:
@@ -139,7 +153,98 @@ def build_device_record(device_code: str, saglik: dict[str, Any]) -> dict[str, A
         "ip_endpoint_type": _token(
             saglik.get("ip_endpoint_type"), frozenset({"listening", "initiating"}), "listening"
         ),
+        # --- Cihaz RTC saglig (1.15.1, OPSIYONEL EKLENTI) ---
+        # Cihaz saati YANLIS olsa bile olcum ATILMAZ ve `connection_state`
+        # DEGISMEZ. Bu alanlar yalnizca "cihazin damgasina guvenilir mi"
+        # sorusunu cevaplar.
+        "device_clock_status": _token(saglik.get("device_clock_status"), DEVICE_CLOCK_STATES),
+        "device_clock_offset_sec": _sayi(saglik.get("device_clock_offset_sec")),
+        "need_time_iin": _bool_veya_none(saglik.get("need_time_iin")),
+        "last_device_time_epoch": _epoch(saglik.get("last_device_time_epoch")),
+        # --- Oturum kimligi (1.15.1, OPSIYONEL EKLENTI) ---
+        # Backend "AYNI online oturum suruyor" ile "YENI oturum basladi"
+        # ayrimini bundan yapar. Uyuyan cihaz icin config/FW guncelleme
+        # akisinin bekledigi DOGAL WAKE sinyali budur.
+        "session_started_epoch": _epoch(saglik.get("session_started_epoch")),
     }
+
+
+# ---------------------------------------------------------------------------
+# DELTA KARARI — SEMANTIK DURUM vs GOZLEM ALANLARI
+# ---------------------------------------------------------------------------
+#
+# SAHA HATASI (1.15.0): delta karari TAM KAYIT ESITLIGI ile veriliyordu
+# (`gonderilen != kayit`). Kayitta her poll'da degisen alanlar oldugu icin
+# yayinci neredeyse HER debounce penceresinde cihazi "changed" sayiyordu:
+#
+#   * `report_overdue_sec` — LATE iken 0.1sn cozunurlukle surekli artar
+#   * `last_frame_epoch` / `last_valid_contact_epoch` — HER frame'de degisir
+#
+# Ikincisi daha genis etkiliydi: telemetri alan HER cihaz (ozellikle
+# `continuous` filosu) 2 saniyede bir POST uretiyordu — LATE durumu hic
+# olmasa bile. 200 cihazda bu, 2 saniyede bir 4 partilik trafik demekti.
+#
+# COZUM: payload SOZLESMESI DEGISMEZ, alan KALDIRILMAZ. Yalnizca DELTA
+# KARARI "semantik durum degisimi" uzerinden verilir. Gozlem alanlari
+# partiye AYNEN girer (gercek state degisiminde ve periyodik snapshot'ta
+# guncel degerleriyle) ama TEK BASLARINA yayin TETIKLEMEZ.
+
+#: Degisimi GERCEK bir durum degisikligi olan alanlar — delta TETIKLER.
+SEMANTIC_FIELDS: frozenset[str] = frozenset(
+    {
+        "device_code",
+        "connection_state",
+        "connected",
+        "reachable",
+        "configured_session_policy",
+        "effective_session_policy",
+        "operation_mode",
+        "dial_in_interval_min",
+        "report_late",
+        "ip_probe_status",
+        "tcp_probe_status",
+        "ip_endpoint_type",
+        "device_clock_status",
+        "need_time_iin",
+    }
+)
+
+#: Surekli degisen / turetilmis alanlar — TEK BASLARINA delta tetiklemez.
+OBSERVATIONAL_FIELDS: frozenset[str] = frozenset(
+    {
+        "next_expected_report_epoch",
+        "report_overdue_sec",
+        "last_valid_contact_epoch",
+        "last_frame_epoch",
+        "last_probe_epoch",
+        "device_clock_offset_sec",
+        "last_device_time_epoch",
+        # OTURUM DAMGASI GOZLEMDIR, TETIKLEYICI DEGIL.
+        # Yeni bir oturum zaten `connection_state` gecisi uretir
+        # (smart_idle/lost -> recovering -> online) ve o delta bu alani
+        # GUNCEL degeriyle tasir. Ayrica tetikleyici yapmak, ayni olayi iki
+        # kez yayinlamaktan baska bir sey saglamazdi.
+        "session_started_epoch",
+    }
+)
+
+
+def semantic_signature(record: dict[str, Any]) -> tuple:
+    """Kaydin SEMANTIK imzasi — delta karsilastirmasi YALNIZCA buna bakar.
+
+    Deterministik siralama: alan eklendiginde imza kaymasin diye `sorted`.
+    """
+    return tuple(record.get(alan) for alan in sorted(SEMANTIC_FIELDS))
+
+
+def siniflandirilmamis_alanlar(record: dict[str, Any]) -> set[str]:
+    """Iki kumeden HICBIRINDE olmayan alanlar.
+
+    Testler bunu BOS olmaya zorlar: ileride eklenen bir alan sessizce
+    "delta tetiklemeyen" ya da "storm ureten" tarafa dusmesin — sinifi
+    BILINCLI olarak secilsin.
+    """
+    return set(record) - SEMANTIC_FIELDS - OBSERVATIONAL_FIELDS
 
 
 def build_envelope(

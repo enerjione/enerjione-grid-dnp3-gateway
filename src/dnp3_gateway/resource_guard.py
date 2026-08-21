@@ -198,7 +198,7 @@ class ClockGuard:
             host acilir -> RTC/NTP henuz duzelmemis
             -> backend ULASILAMAZ (yani Date gozlemi YOK)
             -> onbellekli config ile DNP3 ayaga kalkar
-            -> DNP3_TIME_SYNC=lan
+            -> DNP3_TIME_SYNC acik (lan ya da nonlan)
             -> DOGRULANMAMIS host saati outstation'lara yazilir
 
         Yani "olcemedim" en riskli durumken en gevsek karari veriyordu.

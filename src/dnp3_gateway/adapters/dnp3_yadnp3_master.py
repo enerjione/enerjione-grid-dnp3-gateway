@@ -24,7 +24,7 @@ import logging
 import math
 import threading
 import time
-from typing import Any
+from typing import Any, ClassVar
 
 from dnp3_gateway import network_probe
 from dnp3_gateway.adapters.base import SignalReading, TelemetryReader
@@ -38,7 +38,11 @@ from dnp3_gateway.backend.config_client import (
     SMART_LISTEN_RECONNECT_MIN_SEC,
     exact_int,
 )
-from dnp3_gateway.command_parameters import validate_command_parameters
+from dnp3_gateway.command_parameters import (
+    HORSTMANN_COUNT,
+    HORSTMANN_OP_TYPES,
+    validate_command_parameters,
+)
 from dnp3_gateway.operation_mode import (
     MODE_BOOST,
     MODE_SMART,
@@ -458,6 +462,18 @@ HORSTMANN_IDLE_TIMEOUT_SEC = 15.0
 # Veri dogrulugunu pil tasarrufunun onune koyuyoruz; ayrica `continuous`
 # 1.11.x'ten beri suregelen davranistir. Karar SESSIZ DEGIL: WARNING
 # loglanir ve `/health` `auto_fallback=true` ile gosterir.
+#: HORSTMANN DNP V3.0 DEVICE PROFILE — uygulama katmani fragment sinirlari.
+#: Cihazin BIZE gonderebildigi azami fragment (bizim RX tavanimiz).
+#: HORSTMANN PROFILI — TIME AND DATE nesnesi ve senkronizasyon fonksiyonu.
+#: Profil G50V1 + FC=23 DELAY MEASUREMENT ilan eder; G50V3 ve FC=24
+#: RECORD CURRENT TIME profilde YOKTUR (bkz. tests/test_horstmann_conformance).
+_HORSTMANN_TIME_OBJECT = (50, 1)
+_HORSTMANN_TIME_SYNC_FC = 23
+
+_HORSTMANN_TX_FRAGMENT_MAX = 2048
+#: Cihazin BIZDEN alabildigi azami fragment (bizim TX tavanimiz).
+_HORSTMANN_RX_FRAGMENT_MAX = 1024
+
 _AUTO_KARAR_TIMEOUT_SEC = 120.0
 
 # AKTIF TANILAMA SONDASI — SIKLIK SINIRI
@@ -676,6 +692,16 @@ class _DeviceCache:
         # Mevcut link oturumunun acilis damgasi (monotonic). Taze bir oturumu
         # zorla yikmamak icin okunur; bkz. `link_age`.
         self._link_opened_at = 0.0
+        #: CIHAZ RTC GOZLEMI (1.15.1). Cihazin KENDI damgasi + gateway
+        #: saatiyle farki. Olcum ASLA atilmaz; bu alanlar yalnizca
+        #: "damgaya guvenilir mi" sorusunu cevaplar.
+        self._son_cihaz_zamani: float | None = None
+        self._son_cihaz_zamani_offset: float | None = None
+        self._son_cihaz_zamani_kalitesi: str | None = None
+        #: Oturum baslangici (DUVAR saati). `_link_opened_at` monotoniktir
+        #: ve tel uzerinde anlamsizdir; backend "YENI oturum basladi"
+        #: ayrimini bu alandan yapar.
+        self._link_opened_wall: float = 0.0
         # G110 (string) okuma durumu — bkz. `g110_iste` / `g110_gerekli`.
         self._g110_bekliyor = False
         self._g110_geldi = False
@@ -858,6 +884,13 @@ class _DeviceCache:
                 self._g110_bekliyor = False
             prev = self._values.get(key)
             self._values[key] = (raw, value_string, flags, device_time, time_quality)
+            # CIHAZ SAATI GOZLEMI — tek gecis noktasi burasi.
+            # Offset GOZLEM ANINDA hesaplanir; poll zamaninda
+            # hesaplansaydi aradaki gecikme kadar kayardi.
+            if device_time is not None:
+                self._son_cihaz_zamani = float(device_time)
+                self._son_cihaz_zamani_offset = float(device_time) - time.time()
+                self._son_cihaz_zamani_kalitesi = time_quality
             now = time.monotonic()
             self._last_update_at = now
             self._last_update_wall = time.time()
@@ -1125,6 +1158,52 @@ class _DeviceCache:
                 return -1.0
             return time.monotonic() - self._link_opened_at
 
+    def session_started_wall(self) -> float | None:
+        """Mevcut oturumun baslangici (duvar saati); bagli degilse None.
+
+        Backend "AYNI online oturum suruyor" ile "YENI oturum basladi"
+        ayrimini bundan yapar — uyuyan bir cihaz icin config/FW guncelleme
+        akisinin bekledigi DOGAL WAKE sinyali budur.
+        """
+        with self._lock:
+            if not self._connected:
+                return None
+            return self._link_opened_wall or None
+
+    def device_clock_snapshot(self) -> tuple[str, float | None, float | None]:
+        """(durum, offset_sn, son_cihaz_epoch) — CIHAZ RTC sagligi.
+
+        DURUM SIRASI ve GEREKCESI:
+          `invalid`   — damga KANITLANABILIR sekilde yanlis (tolerans disi).
+                        NEED_TIME'dan ONCE gelir: DNP3 zaman senkronizasyonu
+                        -- HANGI PROSEDUR SECILIRSE SECILSIN (lan/nonlan) --
+                        TALEP GUDUMLUDUR (opendnp3 yalnizca IIN1.4 asserted
+                        iken saat yazar), yani saat yanlis AMA cihaz saat
+                        ISTEMIYORSA durum kendiliginden DUZELMEZ. Sahada
+                        gorulen tam olarak buydu (2066).
+          `need_time` — cihaz IIN1.4 ile saat ISTIYOR; kendiliginden duzelir.
+          `ok`        — damga var ve makul araliginda.
+          `unknown`   — cihaz hic damga gondermedi (statik/Class 0 okumasi).
+
+        `need_time_iin` AYRI bir alan olarak da tasinir; iki sinyal de
+        gorunur kalir.
+
+        BU DEGER `connection_state`i ETKILEMEZ ve OLCUM ATTIRMAZ.
+        """
+        with self._lock:
+            epoch = self._son_cihaz_zamani
+            offset = self._son_cihaz_zamani_offset
+            kalite = self._son_cihaz_zamani_kalitesi
+            need_time = bool(self._iin_flags.get("need_time"))
+        if epoch is None:
+            return ("need_time" if need_time else "unknown"), None, None
+        gecerli, _ = dogrula_cihaz_zamani(epoch, kalite, time.time())
+        if gecerli is None or kalite == "invalid":
+            return "invalid", offset, epoch
+        if need_time:
+            return "need_time", offset, epoch
+        return "ok", offset, epoch
+
     def set_connected(self, ok: bool) -> None:
         """TCP durumu degisti (opendnp3 `OnOpen` / `OnClose`).
 
@@ -1144,6 +1223,7 @@ class _DeviceCache:
             if ok and not self._connected:
                 now = time.monotonic()
                 self._link_opened_at = now
+                self._link_opened_wall = time.time()
                 # YENI baglanti = yeni recovery hakki (bkz. relink_izinli).
                 self._recovery_failed_seq = None
                 # UYANDI: yeni oturum basliyor. Idle bayragi BURADA temizlenir
@@ -1953,6 +2033,12 @@ class _OturumDurumu:
         # YAPILANDIRILAN politika (config'ten gelen, DEGISMEZ) ile ETKIN
         # politika (calisma aninda uygulanan) AYRI tutulur. `auto` disinda
         # ikisi ayni; `auto`da etkin politika mod gozlendikce belirlenir.
+        #: Son BILDIRILEN cihaz RTC durumu (kenar-tetikli log icin).
+        #:
+        #: BURADA, `_ManagedMaster.__init__`te DEGIL: bu sinifin varlik sebebi
+        #: taklit master'larin alan kacirmasini IMKANSIZ kilmaktir.
+        self.saat_durumu: str = "unknown"
+
         istenen = str(session_policy).lower()
         #: CONFIG'ten gelen politika — DEGISMEZ, health'te oldugu gibi raporlanir.
         self.configured_session_policy: str = istenen if istenen in ("smart", "auto") else "continuous"
@@ -2181,6 +2267,28 @@ class _ManagedMaster(_OturumDurumu):
         # saatini basiyordu (bkz. BACKEND_TODO.md#B2). B2 acildigi an — cihaz
         # damgasi yayina girdiginde — zaman-senk olmadan durum KOTULESIRDI:
         # "hepsi ayni yanlis saat" yerine "hepsi FARKLI yanlis saat".
+        # ---- FRAGMENT LIMITLERI — HORSTMANN DEVICE PROFILE (P1) ----------
+        #
+        # Resmi profil (SN 2.0 / Pole Master):
+        #     Horstmann TX app fragment = 2048   (cihazin BIZE gonderdigi)
+        #     Horstmann RX app fragment = 1024   (cihazin BIZDEN alabildigi)
+        #
+        # opendnp3 IKISINI DE 2048 varsayar ve gateway bunlari HIC
+        # ayarlamiyordu. `maxTxFragSize=2048` cihazin ILAN ETTIGI alma
+        # sinirinin IKI KATI: bugun gonderdigimiz cerceveler kucuk oldugu
+        # icin (class scan ~24 bayt, CROB ~30 bayt) sorun cikmiyor, ama
+        # istek buyudugu an cihazin ayristiramayacagi bir fragment tele
+        # cikardi. Ilan edilen sinira uymak DARALTMADIR, risk tasimaz.
+        #
+        # maxRxFragSize 2048 KALIR: cihaz bize 2048'e kadar gonderebilir ve
+        # onu kesmek cok parcali Class 0 / G110 cevaplarini bozardi.
+        try:
+            cfg.master.maxTxFragSize = _HORSTMANN_RX_FRAGMENT_MAX
+            cfg.master.maxRxFragSize = max(
+                int(getattr(cfg.master, "maxRxFragSize", 0) or 0), _HORSTMANN_TX_FRAGMENT_MAX
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("yadnp3_fragment_limit_unsupported device=%s", device.code, exc_info=True)
         self._apply_time_sync(cfg, time_sync)
         cfg.link.LocalAddr = int(local_address)
         cfg.link.RemoteAddr = int(device.dnp3_address)
@@ -2387,33 +2495,99 @@ class _ManagedMaster(_OturumDurumu):
         )
         return True
 
+    #: `DNP3_TIME_SYNC` degeri -> `opendnp3.TimeSyncMode` uye ADI adaylari.
+    #:
+    #: Adlar VARSAYILMAZ, OLCULDU. yadnp3 3.2.1.1 `TimeSyncMode` uyeleri tam
+    #: olarak: `LAN`, `NonLAN`, `None`. (`None_`, `NONE`, `NONLAN`,
+    #: `SerialTimeSync` bu surumde YOKTUR; surum farklarina karsi ek adaylar
+    #: birakildi.)
+    #:
+    #: KRITIK: her satirin adaylari YALNIZCA O PROSEDURUN kendi isimleridir.
+    #: Eski kod tek bir liste yuruyordu -- `("LAN", "SerialTimeSync", "NonLAN")`
+    #: -- yani `LAN` bulunamazsa sessizce BASKA BIR PROSEDURE dusuyordu.
+    #: Yanlis prosedurle saat yazmak, hic yazmamaktan KOTUDUR: operator
+    #: "senkronize" sanir, cihaz ise desteklemedigi nesneyi reddeder.
+    _TIME_SYNC_ENUM_ADAYLARI: ClassVar[dict[str, tuple[str, ...]]] = {
+        "lan": ("LAN",),
+        "nonlan": ("NonLAN", "NonLan", "NONLAN", "SerialTimeSync"),
+        "none": ("None", "None_", "NONE"),
+    }
+
     @staticmethod
     def _apply_time_sync(cfg: Any, mode: str) -> None:
-        """`cfg.master.timeSyncMode` ayarla. Binding desteklemiyorsa sessiz gec.
+        """`cfg.master.timeSyncMode` ayarla. Cozulemezse FAIL-CLOSED.
 
-        `mode`: "lan" (TCP icin dogru olan LAN prosedu) veya "none".
-        Enum adlari binding surumleri arasinda degisebildigi icin birkac
-        alternatif denenir; hicbiri yoksa eski davranis (senkronizasyon yok)
-        korunur ve bir kez WARNING atilir.
+        `mode`: ``"lan"`` | ``"nonlan"`` | ``"none"``.
+
+        PROSEDUR TASIYICIYA DEGIL, OUTSTATION PROFILINE GORE SECILIR
+        -----------------------------------------------------------
+        Bu fonksiyonun eski docstring'i ``"lan" (TCP icin dogru olan LAN
+        prosedu)`` diyordu. Bu YANLISTI: DNP3 zaman senkronizasyon proseduru
+        TCP/serial ayrimindan degil, cihazin DNP3 Implementation Table'inda
+        ILAN ETTIGI function code / nesne setinden belirlenir.
+
+        OLCULEN tel davranisi (yadnp3 3.2.1.1, gercek outstation'a karsi):
+
+            lan     -> FC=24 RECORD_CURRENT_TIME  +  WRITE G50V3
+            nonlan  -> FC=23 DELAY_MEASUREMENT    +  WRITE G50V1
+            none    -> saat hic yazilmaz
+
+        Horstmann SN 2.0 / Pole Master resmi Device Profile FC=23 ve G50V1
+        ILAN EDER; FC=24 ve G50V3 ILAN EDILMEMISTIR. Yani o cihazlarda LAN
+        proseduru, cihazin desteklemedigi bir nesneyi yazmaya calisir ve
+        NEED_TIME asserted olsa bile senkronizasyon basarisiz olabilir.
+
+        MODEL BAZLI OTOMATIK SECIM YOK -- BILINCLI KARAR
+        -----------------------------------------------
+        `DeviceConfig`te kanonik bir `model` alani YOKTUR. Eldeki tek yakin
+        alan `signal_profile`tir ve sozlesmesi acikca "gateway bu string'i
+        sadece tasir, anlamlandirmaz" der. Ona bakip prosedur secmek bir
+        string heuristic'i olurdu: backend bir gun profil adini degistirse
+        gateway SESSIZCE yanlis prosedure gecerdi. Bu yuzden secim ACIK
+        YAPILANDIRMAYLA yapilir -- Horstmann kurulumunda
+        ``DNP3_TIME_SYNC=nonlan``.
+
+        FAIL-CLOSED
+        -----------
+        Istenen prosedur binding'de yoksa saat senkronizasyonu KAPATILIR ve
+        ERROR loglanir; baska bir prosedure DUSULMEZ.
         """
         want = (mode or "lan").strip().lower()
         enum_cls = getattr(opendnp3, "TimeSyncMode", None)
         if enum_cls is None:
-            logger.warning(
-                "yadnp3_time_sync_unsupported — binding TimeSyncMode sunmuyor; "
-                "outstation saatleri senkronize EDILMEYECEK"
+            logger.error(
+                "yadnp3_time_sync_unsupported mode=%s — binding TimeSyncMode SUNMUYOR; "
+                "outstation saatleri senkronize EDILMEYECEK",
+                want,
             )
             return
-        if want in ("none", "off", "disabled"):
-            candidates = ("None_", "NONE", "None")
-        else:
-            candidates = ("LAN", "SerialTimeSync", "NonLAN")
-        for name in candidates:
-            value = getattr(enum_cls, name, None)
+
+        adaylar = _ManagedMaster._TIME_SYNC_ENUM_ADAYLARI.get(want)
+        if adaylar is None:
+            # Settings dogrulayicisi bunu normalde yakalar (gateway acilmaz);
+            # burasi adapter dogrudan cagrildiginda devrededir. Eski kod
+            # taninmayan her degeri LAN sayiyordu — artik SAYMIYOR.
+            logger.error(
+                "yadnp3_time_sync_invalid mode=%r — gecerli degerler: lan | nonlan | none. "
+                "TANINMAYAN DEGER LAN SAYILMAZ; saat senkronizasyonu KAPATILDI",
+                mode,
+            )
+            return
+
+        for ad in adaylar:
+            value = getattr(enum_cls, ad, None)
             if value is not None:
                 cfg.master.timeSyncMode = value
                 return
-        logger.warning("yadnp3_time_sync_enum_not_found mode=%s — saat senkronizasyonu kapali", want)
+
+        logger.error(
+            "yadnp3_time_sync_enum_not_found mode=%s adaylar=%s mevcut=%s — istenen prosedur "
+            "bu binding'de YOK. BASKA BIR PROSEDURE DUSULMEDI (yanlis prosedurle saat yazmak "
+            "hic yazmamaktan kotudur); saat senkronizasyonu KAPATILDI",
+            want,
+            list(adaylar),
+            [ad for ad in dir(enum_cls) if not ad.startswith("_")],
+        )
 
     def _g110_gvid(self):
         """GroupVariationID(110, 0) — surum farki icin iki isim dener."""
@@ -2636,7 +2810,31 @@ class _ManagedMaster(_OturumDurumu):
                 "control": op_type,
             }
 
-        opt = self._op_map().get(op_type.lower())
+        # SAVUNMA DERINLIGI: `validate_command_parameters` bu ikisini zaten
+        # reddeder (Horstmann profili: Pulse = NEVER, Count > 1 = NEVER).
+        # Burada tekrar bakiyoruz ki dogrulayici bir gun atlanirsa bile
+        # uyumsuz bir cerceve TELE CIKMASIN.
+        normal_op = op_type.strip().lower()
+        if normal_op not in HORSTMANN_OP_TYPES or int(count) != HORSTMANN_COUNT:
+            logger.error(
+                "yadnp3_crob_profile_violation device=%s index=%s op_type=%s count=%s — "
+                "Horstmann DNP3 Device Profile ihlali (Pulse=NEVER, Count>1=NEVER); "
+                "komut TELE CIKARILMADI",
+                self.device.code,
+                index,
+                normal_op,
+                count,
+            )
+            return {
+                "ok": False,
+                "status": "bad_request",
+                "error": (
+                    f"Horstmann profil ihlali: op_type={normal_op!r} count={count} "
+                    "(izin verilen: latch_on/latch_off, count=1)"
+                ),
+                "control": op_type,
+            }
+        opt = self._op_map().get(normal_op)
         if opt is None:
             return {"ok": False, "status": "bad_request", "error": f"gecersiz op_type: {op_type!r}"}
 
@@ -3383,6 +3581,53 @@ class Yadnp3TelemetryReader(TelemetryReader):
         self._mod_sinyal_onbellek[device.code] = (kimlik, sinyal)
         return sinyal
 
+    def _saat_durumunu_bildir(
+        self,
+        *,
+        device_code: str,
+        mm: _ManagedMaster,
+        durum: str,
+        offset: float | None,
+        epoch: float | None,
+        need_time: bool,
+    ) -> None:
+        """Cihaz RTC durumu KENDAR-TETIKLI loglanir.
+
+        Damga HER olcumle gelir; her frame'de loglamak defteri bogar ve
+        gercek arizalari gizler. Yalnizca DURUM DEGISTIGINDE bir satir.
+        """
+        if mm.saat_durumu == durum:
+            return
+        onceki, mm.saat_durumu = mm.saat_durumu, durum
+        if durum == "invalid":
+            logger.warning(
+                "dnp3_device_clock_invalid device=%s device_epoch=%s gateway_epoch=%.0f "
+                "offset_sec=%s need_time=%s — cihaz RTC'si MAKUL ARALIGIN DISINDA. "
+                "Olcumler ETKILENMEZ ve cihaz kopuk SAYILMAZ; yalnizca cihazin KENDI "
+                "olay damgasina guvenilmez. DIKKAT: DNP3 zaman senkronizasyonu secilen "
+                "prosedurden BAGIMSIZ olarak TALEP GUDUMLUDUR — "
+                "cihaz IIN1.4 (NEED_TIME) bildirmiyorsa gateway saat YAZMAZ ve bu "
+                "durum kendiliginden DUZELMEZ; cihaz tarafinda saat/RTC kontrolu gerekir.",
+                device_code,
+                f"{epoch:.0f}" if epoch else "?",
+                time.time(),
+                f"{offset:.0f}" if offset is not None else "?",
+                str(need_time).lower(),
+            )
+        elif durum == "need_time":
+            logger.info(
+                "dnp3_device_clock_need_time device=%s — cihaz IIN1.4 ile saat istiyor; "
+                "DNP3_TIME_SYNC=lan|nonlan ile yazilmasi BEKLENIR (prosedur cihazin "
+                "ilan ettigi profile gore secilir; Horstmann SN 2.0 icin `nonlan`)",
+                device_code,
+            )
+        elif durum == "ok" and onceki in ("invalid", "need_time"):
+            logger.info(
+                "dnp3_device_clock_recovered device=%s offset_sec=%s — cihaz saati normale dondu",
+                device_code,
+                f"{offset:.1f}" if offset is not None else "?",
+            )
+
     def _politika_uyusmazligini_bildir(self, mm: _ManagedMaster, device: DeviceConfig, gozlenen: str) -> None:
         """Cihaz SMART diyor ama gateway TARAMA gonderiyor -> KENAR-TETIKLI uyari.
 
@@ -3840,8 +4085,9 @@ class Yadnp3TelemetryReader(TelemetryReader):
             with self._smart_sayaclari_lock:
                 self._smart_uyanma_total += 1
             logger.info(
-                "smart_idle_wakeup device=%s idle_duration=%.0fs — cihaz kendi "
-                "istegiyle baglandi (ariza raporu ya da zamanlanmis rapor)",
+                "smart_idle_wakeup device=%s idle_duration=%.0fs — cellular endpoint "
+                "yeniden erisilebilir; Listening Endpoint TCP oturumu kuruldu "
+                "(event ya da zamanlanmis wake olabilir)",
                 device.code,
                 uyanma,
             )
@@ -4642,6 +4888,17 @@ class Yadnp3TelemetryReader(TelemetryReader):
                     fark = time.time() - sonraki_rapor
                     gecikme_sn = round(fark, 1) if fark > 0 else 0.0
 
+                saat_durum, saat_offset, saat_epoch = mm.cache.device_clock_snapshot()
+                iin = mm.cache.iin_snapshot()
+                self._saat_durumunu_bildir(
+                    device_code=code,
+                    mm=mm,
+                    durum=saat_durum,
+                    offset=saat_offset,
+                    epoch=saat_epoch,
+                    need_time=bool(iin.get("need_time")),
+                )
+
                 out[code] = {
                     "state": mm.cache.state(),
                     # YAPILANDIRILAN ile ETKIN politika AYRI raporlanir:
@@ -4695,6 +4952,19 @@ class Yadnp3TelemetryReader(TelemetryReader):
                     "ip_probe_status": mm.ip_probe,
                     "tcp_probe_status": mm.kanal_durumu(),
                     "last_probe_epoch": mm.sonda_son_wall,
+                    # --- CIHAZ RTC SAGLIGI (1.15.1) --------------------
+                    # SALT GOZLEM. `connection_state`i ETKILEMEZ ve olcum
+                    # ATTIRMAZ; yalnizca "cihazin damgasina guvenilir mi"
+                    # sorusunu cevaplar. Sahada Horstmann RTC'si 2066'ya
+                    # kaymisti ve bu bilgi runtime health'te HIC gorunmuyordu.
+                    "device_clock_status": saat_durum,
+                    "device_clock_offset_sec": saat_offset,
+                    "last_device_time_epoch": saat_epoch,
+                    "need_time_iin": iin.get("need_time"),
+                    # --- OTURUM KIMLIGI (1.15.1) -----------------------
+                    # Backend "AYNI oturum suruyor" ile "YENI oturum basladi"
+                    # ayrimini bundan yapar (dogal wake sinyali).
+                    "session_started_epoch": mm.cache.session_started_wall(),
                     # Uyuyan cihaz FIZIKSEL olarak ulasilamazdir; komut yolu
                     # bunu oldugu gibi gorur (sahte basari URETILMEZ).
                     "reachable": mm.ulasilabilir(),

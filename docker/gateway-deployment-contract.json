@@ -1,8 +1,8 @@
 {
   "contract_version": 1,
-  "gateway_release": "1.15.0",
-  "gateway_source_ref": "v1.15.0",
-  "gateway_source_sha": "1bea87f6ec22696f0a5d7654047caa0b4bbd5f3f",
+  "gateway_release": "1.15.1",
+  "gateway_source_ref": "v1.15.1",
+  "gateway_source_sha": "bf9649b629d61e9a726ebdd0eee0493f02cd6225",
   "gateway_source_sha_semantics": "BU DOSYADAKI DEGER, KENDISINI ICEREN COMMIT DEGILDIR ve olamaz: dosyaya yeni SHA yazmak yeni bir commit uretir ve SHA yeniden degisir (self-referential). Buradaki deger, bu sozlesmenin turetildigi YAYIMLANMIS BASELINE surumun commit'idir. Bir artifact'in GERCEK revizyonu iki yerde yasar ve ikisi de release sirasinda uretilir: (1) imaj etiketi org.opencontainers.image.revision=<GITHUB_SHA>, (2) release workflow'un urettigi gateway-deployment-contract.generated.json (gateway_source_sha alani GITHUB_SHA ile doldurulur). Tuketiciler revizyon icin BUNLARA bakmali; kaynak dosyadaki deger yalnizca baseline'dir.",
   "owner": "enerjione/enerjione-grid-dnp3-gateway",
   "description": "Bir uretim DNP3 gateway kurulumunun TASIMASI GEREKEN deployment sozlesmesi. Gateway repo'su sahibidir; Grid repo'su tam kopyasini vendor eder ve CI'da karsilastirir. Runtime'da iki repo birbirine baglanmaz.",
@@ -34,7 +34,7 @@
     "DNP3_EVENT_SCAN_INTERVAL_SEC": "5 ve EXPLICIT olmak ZORUNDA. Ayar verilmezse config.py varsayilani 0'dir ve factory `scan = dnp3_event_scan_interval_sec or default_poll_interval_sec` ile scan'i POLL'a dusurur; poll=1 oldugu icin scan=1s olur. 401 cihazli sahada olculdu (2026-08-04): saniyede 401 DNP3 istegi, gateway CPU'su cihaz sayisiyla dogru orantili. Cihazlar unsolicited modda calisir, scan yalnizca yedek mekanizmadir; seyreltmek veri tazeligini orantili bozmaz.",
     "DNP3_EVENT_BASELINE_INTERVAL_SEC": "30. Class 0 tam baseline tazeleme araligi. config.py aciklamasi '30-300 sn idealdir' der; 30 iki saha gateway'inde aylardir kosan ve KABUL EDILMIS degerdir. Gateway compose sablonundaki 60, ilk commit'ten (2026-04-30) beri hic gozden gecirilmemis degerdir. Yuksek cihaz sayili sahalarda 60'a cikarmak Class 0 trafigini yariya indirir; bu ayri bir olcumlu karardir, bu sozlesme kanitsiz degistirmez.",
     "DNP3_MANAGER_THREADS": "0 = otomatik (min 4). Kod varsayilaniyla ayni; sozlesmede EXPLICIT tutulur ki kutuphane varsayilani degisirse uretim davranisi sessizce kaymasin.",
-    "DNP3_TIME_SYNC": "lan. Outstation RTC drift'i ve guc kesintisi sonrasi reset icin. Kod varsayilaniyla ayni; ayni gerekceyle explicit."
+    "DNP3_TIME_SYNC": "lan = GENEL varsayilan (geriye uyumluluk). Prosedur TASIYICIYA DEGIL, outstation'in ILAN ETTIGI profile gore secilir. HORSTMANN filosunda `nonlan` YAPIN: profil FC=23 + G50V1 ilan eder, FC=24 + G50V3 ILAN EDILMEMISTIR. Gecersiz deger gateway'i ACMAZ (fail-closed)."
   },
   "required_environment": [
     "GATEWAY_CODE",
@@ -130,7 +130,7 @@
       "production_guard": "Gateway, production'da bu degerin GATEWAY_TOKEN veya GATEWAY_COMMAND_TOKEN ile ayni olmasini reddeder."
     }
   },
-  "gateway_source_sha_baseline_ref": "v1.14.0",
+  "gateway_source_sha_baseline_ref": "v1.15.0",
   "smart_session": {
     "supported": true,
     "semantics": "Horstmann Smart Navigator 2.0 Smart/Boost oturum yasam dongusu. Politika CIHAZ BASINA yapilandirilir (session_policy) ya da auto ile MASTER Operation Mode'dan turetilir. 1.14.0: UC TIPI (ip_endpoint_type) ile MOD (session_policy) BAGIMSIZ iki kavramdir ve alti kombinasyonun HEPSI desteklenir. Varsayilan 'continuous' oldugu icin mevcut kurulumlarin davranisi DEGISMEZ.",
@@ -333,6 +333,116 @@
     "poll_loop_notification": "run_poll_cycle sonrasi `finally` dalinda mark_dirty(). `finally` BILINCLI: bir cycle patlasa bile durum degismis olabilir (read_device bir cihazi lost'a cekip sonrakinde hata verebilir). Config degisiminde (changed=True) request_snapshot() cagrilir — delta silinen cihazi TASIMAZ.",
     "state_change_latency": "~poll_interval + change_debounce (yayincinin 30sn yedek uyanmasi DEGIL)",
     "compose_enable_path": "docker/compose.template.yml DEVICE_HEALTH_* degiskenlerini ${VAR:-varsayilan} ile gecirir. Operator compose dosyasini DUZENLEMEDEN, yanindaki .env ile acar. Elle duzenleme bir sonraki render'da SESSIZCE geri alinirdi. render_compose.py --device-health-enabled bayragi RENDER edilmis varsayilani acar; varsayilan YINE false.",
-    "dedicated_http_client": "AYRI BackendConfigClient/oturum (command_client ile ayni kalip). config_client ile paylasilsaydi saglik POST'lari config-refresh ile AYNI baglanti havuzunu tuketirdi."
+    "dedicated_http_client": "AYRI BackendConfigClient/oturum (command_client ile ayni kalip). config_client ile paylasilsaydi saglik POST'lari config-refresh ile AYNI baglanti havuzunu tuketirdi.",
+    "optional_device_fields_1_15_1": {
+      "device_clock_status": "unknown | ok | invalid | need_time. CIHAZIN KENDI RTC'sinin sagligi. connection_state'i ETKILEMEZ, olcum DUSURMEZ ve bu alandan comm_lost URETILMEZ; etkilenen tek sey cihazin KENDI olay damgasina duyulan guvendir. Oncelik: invalid > need_time > ok > unknown.",
+      "device_clock_offset_sec": "cihaz_saati - gateway_saati (saniye, ISARETLI). Pozitif = cihaz ileri.",
+      "last_device_time_epoch": "Cihazin KENDI bildirdigi son damga (unix epoch, UTC).",
+      "need_time_iin": "IIN1.4 (NEED_TIME). null = hic IIN gorulmedi.",
+      "session_started_epoch": "Acik DNP3 oturumunun basladigi an; oturum KAPALIYKEN null (smart_idle cihazda normaldir).",
+      "backward_compatible": true,
+      "why_optional": "Eski backend bu alanlari YOK SAYABILIR. Sema adi (device_health_v1) DEGISMEDI ve hicbir mevcut alan kaldirilmadi."
+    },
+    "delta_trigger_model_1_15_1": {
+      "semantic_fields": [
+        "device_code",
+        "connection_state",
+        "connected",
+        "reachable",
+        "configured_session_policy",
+        "effective_session_policy",
+        "operation_mode",
+        "dial_in_interval_min",
+        "report_late",
+        "ip_probe_status",
+        "tcp_probe_status",
+        "ip_endpoint_type",
+        "device_clock_status",
+        "need_time_iin"
+      ],
+      "observational_fields": [
+        "next_expected_report_epoch",
+        "report_overdue_sec",
+        "last_valid_contact_epoch",
+        "last_frame_epoch",
+        "last_probe_epoch",
+        "device_clock_offset_sec",
+        "last_device_time_epoch",
+        "session_started_epoch"
+      ],
+      "rule": "DELTA yalnizca SEMANTIC bir alan degistiginde gonderilir. 1.15.0'da karar TAM KAYIT ESITLIGIYLE veriliyordu; last_frame_epoch her frame'de degistigi icin telemetri alan HER cihaz (ozellikle continuous filosu) neredeyse her toplama penceresinde POST uretiyordu (sahada ~2sn'de bir).",
+      "payload_unchanged": "Gonderilen kayit HER ZAMAN tum guncel gozlem degerlerini tasir. Degisen tek sey NE ZAMAN gonderildigidir. Periyodik snapshot ve backpressure/coalescing davranisi AYNI.",
+      "backend_impact": "Yalnizca gozlem alani degisti diye POST beklemeyin; o degerler bir sonraki delta'da ya da en gec periyodik snapshot'ta gelir."
+    }
+  },
+  "time_synchronization": {
+    "env": "DNP3_TIME_SYNC",
+    "values": [
+      "lan",
+      "nonlan",
+      "none"
+    ],
+    "default": "lan",
+    "default_unchanged_why": "Varsayilani degistirmek Horstmann OLMAYAN her kurulumun prosedurunu degistirirdi. Secim ACIK YAPILANDIRMAYLA yapilir.",
+    "measured_wire_behavior": {
+      "lan": "FC=24 RECORD_CURRENT_TIME + WRITE G50V3",
+      "nonlan": "FC=23 DELAY_MEASUREMENT + WRITE G50V1",
+      "none": "saat HIC yazilmaz"
+    },
+    "measured_with": "yadnp3 3.2.1.1, gercek outstation'a karsi (tests/test_horstmann_conformance.py AB/AC).",
+    "horstmann_required_value": "nonlan",
+    "horstmann_rationale": "Resmi DNP V3.0 Device Profile (Smart Navigator 2.0 / Pole Master) FC=23 ve G50V1 ILAN EDER; FC=24 ve G50V3 ILAN EDILMEMISTIR. ASIMETRI: G50V1 acikca destekli, G50V3 ilan edilmemis -> nonlan her iki varsayim altinda da guvenlidir.",
+    "no_model_autodetect": "MODEL BAZLI OTOMATIK SECIM YOK. DeviceConfig'te kanonik `model` alani YOKTUR; `signal_profile` sozlesme geregi gateway tarafindan ANLAMLANDIRILMAZ. Ona bakmak string heuristic'i olurdu ve backend profil adini degistirdigi gun gateway SESSIZCE yanlis prosedure gecerdi.",
+    "fail_closed": "Gecersiz deger GATEWAY'I ACMAZ (Settings dogrulayicisi). Istenen prosedur binding'de yoksa ERROR loglanir ve senkronizasyon KAPATILIR — BASKA BIR PROSEDURE DUSULMEZ. 1.15.0'a kadar taninmayan HER deger sessizce `lan` sayiliyordu.",
+    "legacy_aliases": {
+      "off": "none",
+      "disabled": "none",
+      "disable": "none"
+    },
+    "demand_driven": "Master YALNIZCA cihaz IIN1.4 (NEED_TIME) assert ettiginde saat yazar. FORCE TIME SYNC YOKTUR: RTC yanlis olup NEED_TIME gelmiyorsa gateway yalnizca device_clock_status ile GORUNUR kilar.",
+    "clock_guard_unchanged": "Gateway kendi saatinden emin degilse (RTC/NTP dogrulanmamis) istense bile YAZMAZ. Bu davranis 1.15.1'de DEGISMEDI.",
+    "field_verification": "REQUIRED — fiziksel Horstmann uzerinde DOGRULANMAMISTIR. Kabul: PCAP'te IIN1.4=1, FC=23, G50V1 WRITE, RTC duzelmesi (2066 -> 2026) ve sonraki yanitlarda IIN1.4=0."
+  },
+  "horstmann_profile_conformance": {
+    "normative_source": "Dipl.-Ing. H. Horstmann GmbH — DNP V3.0 Device Profile Document (Smart Navigator 2.0 / Pole Master), DNP3 Implementation Table.",
+    "command_constraints": {
+      "allowed_op_types": [
+        "latch_on",
+        "latch_off"
+      ],
+      "allowed_count": 1,
+      "rejected": "pulse_on / pulse_off (profil: NEVER) ve count != 1 (profil: Count > 1 = NEVER). Gateway SINIRINDA reddedilir; uyumsuz istek TELE HIC CIKMAZ.",
+      "queue_and_clear_bits": "CROB control code'unun Queue (0x10) ve Clear (0x20) bitleri HER ZAMAN sifirdir (profil: NEVER). Tel uzerinde dogrulanir.",
+      "narrowing_only": "Bu bir DARALTMADIR. Hicbir yetki/tazelik/idempotency katmani gevsetilmedi; uretimdeki komutlarin tamami zaten latch_on/count=1 kullaniyor."
+    },
+    "fragment_limits": {
+      "max_tx_frag_size": 1024,
+      "max_rx_frag_size": 2048,
+      "why": "Horstmann RX = 1024 (cihazin BIZDEN alabildigi), TX = 2048 (cihazin BIZE gonderdigi). opendnp3 IKISINI DE 2048 varsayiyordu, yani cihazin ayristirabileceginin IKI KATI bir fragment tele cikabilirdi. maxRxFragSize 2048 KALIR: kismak cok parcali Class 0 / G110 cevaplarini bozardi.",
+      "link_frame_max": 292
+    },
+    "not_used_capabilities": {
+      "FC_13_COLD_RESTART": "Profilde destekli; gateway GONDERMEZ (cihazi yeniden baslatir). Testle sabitlendi.",
+      "FC_22_ASSIGN_CLASS": "Profilde destekli; gateway GONDERMEZ (cihazin olay siniflandirmasini KALICI degistirir). Testle sabitlendi.",
+      "G41V2_ANALOG_OUTPUT_COMMAND": "Profilde destekli; gateway'de analog output komut yolu YOKTUR ve EKLENMEDI.",
+      "SEQUENTIAL_FILE_TRANSFER": "Profil zaten NO der. Konfigurasyon/firmware yolu DNP3 Binary Output tetigi + FTP indirmedir; bu DNP3 File Transfer DEGILDIR."
+    },
+    "measured_qualifiers": {
+      "FC_1_READ_G60": "0x06 (all / no range)",
+      "FC_1_READ_G110V0": "0x01 (2 oktetlik start-stop)",
+      "FC_2_WRITE_G80V1": "0x00 (1 oktetlik start-stop)",
+      "FC_3_4_5_G12V1": "0x28 (2 oktetlik index + count)",
+      "declared_set": [
+        "0x00",
+        "0x01",
+        "0x06",
+        "0x07",
+        "0x08",
+        "0x17",
+        "0x27",
+        "0x28"
+      ],
+      "verified_by": "tests/test_horstmann_wire_matrix.py — link cercevesi CRC bloklariyla birlikte cozulerek."
+    }
   }
 }

@@ -42,7 +42,11 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from dnp3_gateway.backend.device_health_wire import build_device_record, build_envelope
+from dnp3_gateway.backend.device_health_wire import (
+    build_device_record,
+    build_envelope,
+    semantic_signature,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -101,9 +105,15 @@ class DeviceHealthPublisher:
         self._enabled = bool(enabled)
 
         self._lock = threading.Lock()
-        #: Cihaz basina EN SON gonderilmis kayit. Delta hesabi buna gore
-        #: yapilir; boylece degismeyen cihazlar tekrar tekrar gonderilmez.
-        self._gonderilen: dict[str, dict[str, Any]] = {}
+        #: Cihaz basina EN SON gonderilmis SEMANTIK IMZA. Delta hesabi
+        #: yalnizca buna bakar.
+        #:
+        #: TAM KAYIT DEGIL: 1.15.0'da tam kayit saklaniyor ve esitlik
+        #: karsilastiriliyordu; `report_overdue_sec` ve `last_frame_epoch`
+        #: gibi her poll'da degisen alanlar yuzunden yayinci neredeyse HER
+        #: debounce penceresinde POST uretiyordu (sahada ~2 saniyede bir).
+        #: bkz. device_health_wire.SEMANTIC_FIELDS.
+        self._gonderilen: dict[str, tuple] = {}
         self._sequence = 0
         #: Kacinci TAM snapshot. `snapshot_id` bundan turetilir ve HER YENI
         #: snapshot turunda artar — kismi basarisizliktan sonraki yeniden
@@ -251,15 +261,19 @@ class DeviceHealthPublisher:
                 snapshot = (time.monotonic() - self._son_snapshot_at) >= self._snapshot_interval
 
         kayitlar: list[dict[str, Any]] = []
-        guncel: dict[str, dict[str, Any]] = {}
+        guncel: dict[str, tuple] = {}
         for kod, saglik in ham.items():
             try:
                 kayit = build_device_record(kod, saglik)
             except Exception:  # noqa: BLE001
                 logger.debug("device_health_record_error device=%s", kod, exc_info=True)
                 continue
-            guncel[kod] = kayit
-            if snapshot or self._gonderilen.get(kod) != kayit:
+            imza = semantic_signature(kayit)
+            guncel[kod] = imza
+            # DELTA YALNIZCA SEMANTIK IMZAYA BAKAR. Gonderilen parti yine
+            # TAM kayittir (gozlem alanlari GUNCEL degerleriyle gider);
+            # sadece TETIKLEME karari sadelestirildi.
+            if snapshot or self._gonderilen.get(kod) != imza:
                 kayitlar.append(kayit)
 
         # Silinen cihazlar: artik config'te yoklar. Snapshot zaten tam durumu
@@ -336,7 +350,7 @@ class DeviceHealthPublisher:
                 # YALNIZCA GONDERILEN kayitlar "gonderildi" sayilir; parti
                 # yarida kalirsa kalanlar bir sonraki turda YENIDEN denenir.
                 for k in parca:
-                    self._gonderilen[k["device_code"]] = k
+                    self._gonderilen[k["device_code"]] = semantic_signature(k)
 
         if basarili:
             with self._lock:
