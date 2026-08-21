@@ -2,6 +2,178 @@
 
 Semver'a gore tutulur. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.15.1] - 2026-08-21
+
+Dar kapsamli bakim paketi: **cihaz saglik delta firtinasi** + **cihaz RTC
+gozlemlenebilirligi** + resmi Horstmann DNP V3.0 Device Profile'a karsi
+**uyumluluk denetimi** ve orada KANITLANAN kusurlarin duzeltilmesi.
+
+Tel sozlesmesi **degismedi**: `device_health_v1` sema adi ayni, hicbir alan
+kaldirilmadi. Smart sessizlik ve komut duzlemi degismezleri **korundu**.
+
+### Fixed
+
+- **Cihaz saglik POST firtinasi (P1).** `device_health_published` sahada
+  **~2 saniyede bir** goruluyordu. Kok neden: delta karari **tam kayit
+  esitligiyle** veriliyordu (`device_health_publisher.py`), dolayisiyla her
+  poll'da degisen alanlar cihazi "degisti" gosteriyordu.
+
+  > **Etki bildirilenden GENISTI.** `report_overdue_sec` yalnizca cihaz
+  > GECIKMISKEN oynar; ama `last_frame_epoch` / `last_valid_contact_epoch`
+  > **her frame'de** degisir. Yani LATE hic olmasa bile telemetri alan **her**
+  > cihaz — ozellikle `continuous` filosu — POST uretiyordu.
+
+  Cozum: delta karari artik **semantik imza** uzerinden veriliyor
+  (`SEMANTIC_FIELDS` / `OBSERVATIONAL_FIELDS`, `device_health_wire.py`).
+  Yayinlanan payload **aynen** eskisi gibi tum guncel gozlem degerlerini
+  tasir; degisen tek sey **ne zaman** gonderildigidir. Periyodik snapshot
+  ve backpressure/coalescing davranisi **degismedi**.
+
+  Yeni bir alan eklenip **siniflandirilmazsa** test kirilir
+  (`test_her_alan_bilincli_olarak_siniflandirilmis`) — sessizce yeni bir
+  firtina kaynagi dogamaz.
+
+- **CROB profil ihlali (P0).** Komut dogrulayici `pulse_on` / `pulse_off`
+  ve `count` 1..255 araligini **kabul ediyordu**. Resmi Horstmann Device
+  Profile ise: **Pulse On/Off = NEVER**, **Count > 1 = NEVER**,
+  **Queue / Clear Queue = NEVER**.
+
+  > Bu "cihaz nasilsa reddeder" durumu **degildir**: reddin `CommandStatus`u
+  > firmware'e gore degisir, ve fiziksel bir cikisa `pulse` gondermek latch
+  > bekleyen operatorun niyetinden **baska** bir fiziksel sonuc uretebilir.
+
+  Artik uyumsuz istek **tele hic cikmaz**: `command_parameters.py` reddeder
+  (`invalid_op_type` / `invalid_count`) ve adapter'da ikinci bir savunma
+  katmani vardir. **Daraltmadir**; hicbir yetki/tazelik/idempotency katmani
+  gevsetilmedi ve uretimdeki komutlarin tamami zaten `latch_on / count=1`
+  kullaniyor — saha davranisi **degismez**.
+
+- **Uygulama fragment limiti (P1).** `maxTxFragSize` opendnp3 varsayilani
+  **2048** idi; Horstmann'in ilan ettigi **RX limiti 1024**. Yani cihazin
+  ayristirabileceginin **iki kati** bir fragment tele cikabilirdi. Artik
+  1024'e sabitlendi. `maxRxFragSize` **2048 kalir** (cihaz bize 2048'e kadar
+  gonderebilir; kismak cok parcali Class 0 / G110 cevaplarini bozardi).
+
+- **Yaniltici Smart wake logu (P2).** `smart_idle_wakeup` satiri "cihaz
+  **kendi istegiyle** baglandi" diyordu; oysa gateway'in gordugu tek sey
+  hucresel ucun yeniden erisilebilir olmasi ve **Listening Endpoint** TCP
+  oturumunun kurulmasidir. Bunun event kaynakli mi yoksa zamanlanmis wake
+  mi oldugu **gateway'den anlasilamaz**. Log artik tam olarak bunu soyluyor.
+  Durum makinesine **dokunulmadi**.
+
+### Added
+
+- **Cihaz RTC gozlemlenebilirligi** — `device_health_v1`e dort **istege
+  bagli, geriye uyumlu** alan (bkz. `docs/GRID_DEVICE_HEALTH_API.md`):
+
+  | Alan | Anlam |
+  |---|---|
+  | `device_clock_status` | `unknown` \| `ok` \| `invalid` \| `need_time` |
+  | `device_clock_offset_sec` | `cihaz_saati - gateway_saati` (isaretli) |
+  | `last_device_time_epoch` | cihazin **kendi** bildirdigi son damga |
+  | `need_time_iin` | IIN1.4 (NEED_TIME) bayragi |
+
+  Sahada bir Horstmann'in RTC'si **2066**'ya kaymisti ve bu bilgi
+  calisma-zamani sagliginda **hic gorunmuyordu**.
+
+  > **Bu alanlar `connection_state`i ETKILEMEZ**, olcum **dusurmez** ve
+  > saat durumundan **comm_lost uretilmez**. Saati bozuk cihaz `online`
+  > olabilir; etkilenen tek sey cihazin **kendi damgasina** duyulan guvendir.
+
+  Durum onceligi **`invalid` > `need_time` > `ok` > `unknown`**: senkronizasyon
+  **talep gudumludur**, yani saat yanlis olup cihaz NEED_TIME bildirmiyorsa
+  durum **kendiliginden duzelmez**. Loglama **kenar-tetiklidir** — her
+  frame'de degil, yalnizca durum degistiginde bir satir.
+
+- **`session_started_epoch`** — acik oturumun basladigi an (kapaliyken
+  `null`). Backend "ayni oturum suruyor" ile "yeni oturum basladi" ayrimini
+  bundan yapar. **Gozlem** sinifindadir: her yeni oturum zaten bir
+  `connection_state` gecisi uretir.
+
+- **`DNP3_TIME_SYNC` artik `lan | nonlan | none`.**
+
+  Dogru prosedur **tasiyiciya degil, outstation'in ilan ettigi profile**
+  baglidir. Gercek bir outstation'a karsi **olculdu** (yadnp3 3.2.1.1):
+
+  | Deger | Tel uzerinde |
+  |---|---|
+  | `lan` | FC=24 RECORD_CURRENT_TIME + WRITE **G50V3** |
+  | `nonlan` | FC=23 DELAY_MEASUREMENT + WRITE **G50V1** |
+  | `none` | saat hic yazilmaz |
+
+  Horstmann profili **FC=23 ve G50V1 ilan eder**; FC=24 ve G50V3 **ilan
+  edilmemistir**. Horstmann kurulumlarinda **`DNP3_TIME_SYNC=nonlan`
+  verin** (bkz. `docs/HORSTMANN_SMART_MODE.md` §6b).
+
+  > **Genel varsayilan `lan` KALDI.** Varsayilani degistirmek Horstmann
+  > olmayan **her** kurulumun prosedurunu degistirirdi.
+  >
+  > **Model bazli otomatik secim YAPILMADI.** `DeviceConfig`te kanonik bir
+  > `model` alani yok; `signal_profile` ise sozlesme geregi gateway
+  > tarafindan **anlamlandirilmaz**. Ona bakmak string heuristic'i olurdu ve
+  > backend profil adini degistirdigi gun gateway **sessizce** yanlis
+  > prosedure gecerdi.
+
+- **Uyumluluk matrisi testleri** (`tests/test_horstmann_wire_matrix.py`) —
+  fonksiyon kodu ve qualifier matrisi, gercek bir outstation'a karsi
+  **link cercevesi cozulerek** uretilir. `cfg` alanina bakip PASS vermez.
+
+- **G22 Counter Event denetim testleri** (`tests/test_g22_counter_event.py`)
+  — **kusur bulunmadi, kanit uretildi.** Profildeki 6 sayac noktasinin
+  hepsi **Class 1**dir, yani uretimde bu noktalar G20 statigi olarak degil
+  **G22 olayi** olarak gelir; bu yol tek basina kanitlanmali idi.
+
+  Gercek bir outstation'a karsi olculdu (uretim SOE handler'i beslenerek):
+
+  | Soru | Olculen |
+  |---|---|
+  | G22 parse ediliyor mu | **Evet** — `Group22Var1`, `isEventVariation=True` |
+  | Callback tipi | `opendnp3.Counter` (`FrozenCounter` **degil**; iki tip arasinda kalitim **yok**) |
+  | Cache object_group | **20** — G22, ayni noktanin olay bicimidir |
+  | G21'e sizma | **Yok** — G23 icin ayri `FrozenCounter` yolu dogrulandi |
+  | G22V5 damgasi | **Korunuyor** (`1755600000000` ms -> `device_time`, `synchronized`) |
+  | G22V1 damgasi | **Uydurulmuyor** (`device_time=None`), olcum korunuyor |
+  | ROLLOVER/DISCONTINUITY | **`invalid` sayilmiyor** (`good`); ayni bitler G30'da `invalid` |
+
+  > **G21 / G23 = NOT USED**, cunku frozen counter yalnizca **FREEZE**
+  > fonksiyon kodlarindan (FC=7/8/9/10) sonra olusur ve gateway bunlarin
+  > hicbirini gondermez. Testle sabitlendi.
+
+### Changed
+
+- **`DNP3_TIME_SYNC` fail-closed oldu.** Gecersiz deger artik **gateway'i
+  acmaz**; eskiden taninmayan **her** deger sessizce `lan` sayiliyordu, yani
+  bir yazim hatasi operatore hicbir sey soylemeden cihazin ilan **etmedigi**
+  bir prosedurle saat yazdirabiliyordu. Istenen prosedur binding'de yoksa
+  ERROR loglanir ve senkronizasyon **kapatilir** — **baska bir prosedure
+  dusulmez**. (`off` / `disabled` takma adlari geriye uyumluluk icin `none`a
+  normalize edilir.)
+
+- **Yaniltici dokumantasyon duzeltildi.** `config.py`, `.env.example`,
+  `docker/.env.template`, `docker/compose.template.yml` ve kod yorumlarindaki
+  *"TCP baglantilar icin 'lan' dogru secimdir"* ifadesi **yanlisti** ve
+  kaldirildi.
+
+### Degismeyenler (bilincli)
+
+- **Zorla saat senkronizasyonu YOK.** Master yalnizca cihaz IIN1.4 assert
+  ettiginde saat yazar. RTC yanlis olup NEED_TIME gelmiyorsa gateway
+  yalnizca **gorunur kilar**.
+- **ClockGuard** degismedi: gateway kendi saatinden emin degilse yazmaz.
+- **Smart sessizligi** degismedi: periyodik tarama yok, 60sn link keepalive
+  yok, modem uyandirma yok, dogal oturum kapanisi ve recovery ayni.
+- **Komut duzlemi** degismedi: tazelik, `delivery_not_after`, yetkilendirme,
+  CommandLedger, idempotency, sonuc semantigi, model bazli index dogrulama.
+- **Sabit Dial-In takvimi UYGULANMADI** (`dial_in_hour_utc` vb.) — yalnizca
+  analiz edildi.
+- **Uyuyan cihaz komut kuyrugu / uzaktan uyandirma EKLENMEDI.**
+- **DNP3 file transfer EKLENMEDI** (profil zaten `Sequential File Transfer =
+  NO` der).
+- **COLD RESTART (FC=13) ve ASSIGN CLASS (FC=22)** profilde destekli olsa da
+  gateway bunlari **gondermez** — testle sabitlendi.
+- **FREEZE fonksiyon kodlari (FC=7/8/9/10)** gonderilmez; dolayisiyla
+  G21/G23 uretimde **olusmaz**.
+
 ## [1.15.0] - 2026-08-20
 
 **G-DEVICE-HEALTH-01** — cihaz basina calisma-zamani sagligi icin AYRI,

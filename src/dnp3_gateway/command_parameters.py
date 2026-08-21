@@ -77,6 +77,43 @@ TIME_MS_MAX = 2**32 - 1
 #: yapilabilsin; adapter'daki kontrol savunma derinligi olarak kalir.
 SUPPORTED_OP_TYPES = frozenset({"latch_on", "latch_off", "pulse_on", "pulse_off"})
 
+# ---------------------------------------------------------------------------
+# HORSTMANN DNP3 DEVICE PROFILE — CROB UYUMLULUK KISITI (P0)
+# ---------------------------------------------------------------------------
+#
+# Resmi DNP V3.0 Device Profile Document (Dipl.-Ing. H. Horstmann GmbH,
+# Smart Navigator 2.0 / Pole Master) Binary Output kabiliyetini soyle ilan
+# eder:
+#
+#     Latch On          ALWAYS        Pulse On          NEVER
+#     Latch Off         ALWAYS        Pulse Off         NEVER
+#     Count > 1         NEVER         Queue             NEVER
+#                                     Clear Queue       NEVER
+#
+# 1.15.0'a kadar validator `pulse_on`/`pulse_off`u ve `count` 1..255
+# araligini KABUL EDIYORDU. Yani gateway, cihazin "ASLA desteklemiyorum"
+# dedigi bir istegi TELE KOYABILIYORDU.
+#
+# Bu bir "cihaz nasilsa reddeder" durumu DEGILDIR:
+#   * G12V1 icin reddin CommandStatus'u cihaza/firmware'e gore degisir
+#     (NOT_SUPPORTED gelebilir, ama sessiz/kismi davranis da mumkundur);
+#   * fiziksel bir cikisa `pulse` gondermek, latch bekleyen bir operatorun
+#     niyetinden BASKA bir fiziksel sonuc uretebilir;
+#   * `count > 1` ayni cikisi birden fazla kez surmek demektir.
+#
+# Dogru yer GATEWAY SINIRIDIR: uyumsuz istek TELE HIC CIKMAZ.
+#
+# Bu bir DARALTMADIR (fail-safe) — hicbir yetki/tazelik/idempotency katmani
+# gevsetilmedi. Uretimdeki 26 komutun tamami zaten `latch_on / count=1`
+# kullaniyor (bkz. docs/RUNBOOK.md), dolayisiyla saha davranisi DEGISMEZ.
+
+#: Horstmann profilinin izin verdigi operasyon tipleri.
+HORSTMANN_OP_TYPES = frozenset({"latch_on", "latch_off"})
+
+#: Horstmann profilinde `Count > 1 = NEVER`. Tek gecerli deger 1'dir.
+#: (`count = 0` ayrica reddedilir — bkz. COUNT_MIN gerekcesi.)
+HORSTMANN_COUNT = 1
+
 
 #: HAM (dogrulanmamis) CROB parametresi.
 #:
@@ -164,10 +201,21 @@ def validate_command_parameters(
         )
     # `.lower()` MEVCUT davranistir (bkz. `_op_map` cagrisi) ve korunuyor;
     # yeni bir alias/fuzzy esleme EKLENMEDI.
-    if op_type.strip().lower() not in SUPPORTED_OP_TYPES:
+    normal = op_type.strip().lower()
+    if normal not in SUPPORTED_OP_TYPES:
         return ParameterResult(
             ParameterReason.INVALID_OP_TYPE,
             f"desteklenmeyen op_type: {op_type!r}",
+        )
+    # HORSTMANN PROFIL KISITI: Pulse On/Off = NEVER.
+    if normal not in HORSTMANN_OP_TYPES:
+        return ParameterResult(
+            ParameterReason.INVALID_OP_TYPE,
+            (
+                f"op_type={normal!r} Horstmann DNP3 Device Profile'inda DESTEKLENMIYOR "
+                f"(Pulse On/Off = NEVER); izin verilen: {sorted(HORSTMANN_OP_TYPES)}. "
+                "Kalici cikis icin `latch_on` / `latch_off` kullanin."
+            ),
         )
 
     if not _tam_sayi_mi(count):
@@ -182,6 +230,17 @@ def validate_command_parameters(
                 f"count araliginda degil: {count} (izin verilen {COUNT_MIN}..{COUNT_MAX}); "
                 "0 'islemi sifir kez uygula' demektir ve cihaz hicbir sey yapmadan "
                 "SUCCESS doner"
+            ),
+        )
+    # HORSTMANN PROFIL KISITI: Count > 1 = NEVER.
+    if count != HORSTMANN_COUNT:
+        return ParameterResult(
+            ParameterReason.INVALID_COUNT,
+            (
+                f"count={count} Horstmann DNP3 Device Profile'inda DESTEKLENMIYOR "
+                f"(Count > 1 = NEVER); tek gecerli deger {HORSTMANN_COUNT}. "
+                "Ayni cikisi birden fazla kez surmek fiziksel olarak istenmeyen "
+                "bir sonuc uretebilir."
             ),
         )
 

@@ -129,6 +129,11 @@ Ciktidaki kritik alanlar:
 | `disk.level` | `ok` | `low`/`critical` ise disk temizligi gerek. |
 | `clock.safe_for_time_sync` | `true` | False ise sunucu saati sapmis; NTP kontrol. |
 
+> **Cihaz saati ≠ gateway saati.** `clock.*` GATEWAY'in kendi saatidir.
+> Cihazin RTC'si icin `device_health` kanalindaki `device_clock_status`a
+> bakin (bkz. `docs/GRID_DEVICE_HEALTH_API.md`). Cihaz saati bozukken
+> cihaz **online** olabilir ve olcum gondermeye devam eder.
+
 Detayli operasyonel metrikler `/info` ve `/metrics` endpoint'leri uzerinden
 **Bearer auth ile** (`GATEWAY_REFRESH_TOKEN`). Auth-suz `/health` sadece minimum
 status + issues raporlar (recon malzemesi sizmasin).
@@ -256,6 +261,12 @@ Get-Content "$env:ProgramData\EnerjiOne\dnp3-gateway\GW-001.log" -Tail 200 -Wait
 | `dnp3_device_restart device=..` | Outstation yeniden basladi | WARNING |
 | `dnp3_need_time device=..` | Cihaz saat yazilmasini bekliyor | INFO |
 | `dnp3_time_sync_suspended device=..` | Gateway saati guvenilmez; cihaza saat YAZILMIYOR | ERROR |
+| `dnp3_device_clock_invalid device=..` | **Cihazin KENDI RTC'si makul araligin disinda** (sahada gorulen: 2066). Olcumler ETKILENMEZ ve cihaz kopuk SAYILMAZ; yalnizca cihazin kendi olay damgasina guvenilmez. Senkronizasyon TALEP GUDUMLU oldugu icin cihaz NEED_TIME bildirmiyorsa **kendiliginden duzelmez** | WARNING |
+| `dnp3_device_clock_need_time device=..` | Cihaz IIN1.4 ile saat istiyor; `DNP3_TIME_SYNC` acikken yazilmasi beklenir | INFO |
+| `dnp3_device_clock_recovered device=..` | Cihaz saati normale dondu | INFO |
+| `yadnp3_time_sync_invalid mode=..` | **`DNP3_TIME_SYNC` gecersiz** — saat senkronizasyonu KAPATILDI. (Normalde gateway bu degerle hic ACILMAZ; bu satir adapter dogrudan cagrildiginda gorulur.) | ERROR |
+| `yadnp3_time_sync_enum_not_found mode=..` | **Istenen zaman senkronizasyon proseduru bu opendnp3 binding'inde YOK** — baska bir prosedure DUSULMEDI, senkronizasyon KAPATILDI | ERROR |
+| `yadnp3_crob_profile_violation device=..` | **Horstmann profil disi komut** (Pulse ya da count>1) — TELE CIKARILMADI | ERROR |
 | `dnp3_non_finite_value device=.. signal=..` | Cihaz sayisal olmayan deger (NaN/Inf) raporladi; `quality=invalid` ile yayinlandi | WARNING |
 | `dnp3_command_result device=.. ok=.. dnp3_status=..` | CROB sonucu (detayli DNP3 durumu) | INFO |
 | `signals_builtin_used device=.. profil=..` | Backend bu model icin sinyal gondermedi, yerlesik harita kullanildi | INFO |

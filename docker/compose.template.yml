@@ -112,7 +112,16 @@ services:
       DNP3_EVENT_SCAN_INTERVAL_SEC: "5"
       # opendnp3 IO thread sayisi: 0 = otomatik (min 4). 300 cihazda 8-12.
       DNP3_MANAGER_THREADS: "0"
-      # Outstation saat senkronizasyonu (RTC drift + guc kesintisi sonrasi reset).
+      # Outstation saat senkronizasyon PROSEDURU: lan | nonlan | none.
+      # (RTC drift + guc kesintisi sonrasi reset icin gereklidir.)
+      #
+      # PROSEDUR TASIYICIYA DEGIL, CIHAZIN ILAN ETTIGI PROFILE GORE SECILIR:
+      #   lan    -> FC=24 RECORD_CURRENT_TIME + WRITE G50V3
+      #   nonlan -> FC=23 DELAY_MEASUREMENT   + WRITE G50V1
+      #
+      # HORSTMANN SN 2.0 / Pole Master resmi Device Profile FC=23 + G50V1
+      # ILAN EDER (FC=24 / G50V3 ILAN EDILMEMISTIR). Horstmann filosunda
+      # bu degeri "nonlan" YAPIN. Varsayilan geriye uyumluluk icin "lan".
       DNP3_TIME_SYNC: "lan"
       # NOT: DNP3_RESPONSE_TIMEOUT_SEC / DNP3_READ_STRATEGY kaldirildi —
       # bunlar YALNIZCA legacy DNP3_LIBRARY=dnp3py dalinda gecerli; varsayilan

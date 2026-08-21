@@ -212,3 +212,46 @@ def test_dev_allows_rabbitmq_url_and_placeholder(
     assert s.gateway_token == "gw-001-token"
     assert s.rabbitmq_url.startswith("amqp://")
     assert s.nats_dual_publish_enabled is True
+
+
+# ==========================================================================
+# DNP3_TIME_SYNC — PROSEDUR SECIMI (1.15.1)
+# ==========================================================================
+
+
+def test_time_sync_varsayilani_degismedi(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Horstmann icin `nonlan` DOGRU olsa da GENEL VARSAYILAN degismedi.
+
+    Varsayilani degistirmek, Horstmann olmayan her kurulumda prosedur
+    degistirmek demektir; bu bir bakim paketinin isi degildir.
+    """
+    monkeypatch.delenv("DNP3_TIME_SYNC", raising=False)
+    s = Settings(_env_file=None)  # type: ignore[call-arg]
+    assert s.dnp3_time_sync == "lan"
+
+
+@pytest.mark.parametrize("deger", ["lan", "nonlan", "none", "LAN", " NonLAN "])
+def test_time_sync_gecerli_degerler(monkeypatch: pytest.MonkeyPatch, deger: str) -> None:
+    monkeypatch.setenv("DNP3_TIME_SYNC", deger)
+    s = Settings(_env_file=None)  # type: ignore[call-arg]
+    assert s.dnp3_time_sync == deger.strip().lower()
+
+
+@pytest.mark.parametrize("deger", ["off", "disabled", "disable"])
+def test_time_sync_eski_takma_adlar_none_a_normalize(monkeypatch: pytest.MonkeyPatch, deger: str) -> None:
+    """GERIYE UYUMLULUK: 1.15.0'a kadar bu adlar "senkronizasyon yok"tu."""
+    monkeypatch.setenv("DNP3_TIME_SYNC", deger)
+    s = Settings(_env_file=None)  # type: ignore[call-arg]
+    assert s.dnp3_time_sync == "none"
+
+
+@pytest.mark.parametrize("deger", ["nonlann", "lan2", "auto", "yes", ""])
+def test_time_sync_gecersiz_deger_gateway_i_acmaz(monkeypatch: pytest.MonkeyPatch, deger: str) -> None:
+    """FAIL-CLOSED: eskiden taninmayan HER deger sessizce LAN sayiliyordu.
+
+    Yani `DNP3_TIME_SYNC=nonlann` yazan operator, cihazin ilan ETMEDIGI bir
+    prosedurle saat yazildigini HIC ogrenemiyordu. Artik gateway acilmaz.
+    """
+    monkeypatch.setenv("DNP3_TIME_SYNC", deger)
+    with pytest.raises(ValueError, match="DNP3_TIME_SYNC"):
+        Settings(_env_file=None)  # type: ignore[call-arg]

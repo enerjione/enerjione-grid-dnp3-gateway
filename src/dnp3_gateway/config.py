@@ -844,13 +844,30 @@ class Settings(BaseSettings):
     dnp3_time_sync: str = Field(
         default="lan",
         description=(
-            "DNP3 master->outstation zaman senkronizasyonu: lan | none. "
+            "DNP3 master->outstation zaman senkronizasyon PROSEDURU: "
+            "lan | nonlan | none. "
+            "DOGRU SECIM TASIYICIYA (TCP/serial) DEGIL, OUTSTATION'IN ILAN "
+            "ETTIGI IMPLEMENTATION PROFILE'A BAGLIDIR. (Bu alanin eski "
+            "aciklamasi 'TCP baglantilar icin lan dogru secimdir' diyordu; "
+            "bu YANLISTI.) "
+            "OLCULEN TEL DAVRANISI (yadnp3 3.2.1.1): "
+            "lan -> FC=24 RECORD_CURRENT_TIME + WRITE G50V3; "
+            "nonlan -> FC=23 DELAY_MEASUREMENT + WRITE G50V1; "
+            "none -> saat HIC yazilmaz. "
+            "HORSTMANN Smart Navigator 2.0 / Pole Master resmi Device Profile "
+            "FC=23 ve G50V1 ILAN EDER; FC=24 ve G50V3 ILAN EDILMEMISTIR — bu "
+            "cihazlarda dogru deger 'nonlan'dir. Varsayilan geriye uyumluluk "
+            "icin 'lan' KALIR; Horstmann kurulumlarinda ACIKCA 'nonlan' verin. "
             "Outstation'lar tipik olarak ayda 10-60sn RTC drift yapar ve guc "
             "kesintisinden sonra saatlerini sifirlar; master zaman yazmazsa "
             "cihaz kendi olay damgalarini yanlis saatle uretir ve IIN1.4 "
-            "(NEED_TIME) bayragini sonsuza kadar set tutar. TCP baglantilar "
-            "icin 'lan' (LAN prosedu) dogru secimdir. Gateway saati guvenilmez "
-            "goruldugunde (bkz. saat sapmasi kontrolu) yazim otomatik durur."
+            "(NEED_TIME) bayragini sonsuza kadar set tutar. "
+            "SENKRONIZASYON TALEP GUDUMLUDUR: master yalnizca cihaz IIN1.4 "
+            "asserted ettiginde saat yazar; saat yanlis olup cihaz NEED_TIME "
+            "bildirmiyorsa gateway ZORLA yazmaz, durum yalnizca "
+            "`device_clock_status` ile gorunur kilinir. "
+            "Gateway saati guvenilmez goruldugunde (ClockGuard) yazim "
+            "otomatik durur."
         ),
     )
     dnp3_publish_quality_flags: bool = Field(
@@ -961,6 +978,32 @@ class Settings(BaseSettings):
         s = (v or "").strip().lower()
         if s not in valid:
             raise ValueError(f"DNP3_READ_STRATEGY gecersiz: '{v}'. Gecerli: {sorted(valid)}")
+        return s
+
+    @field_validator("dnp3_time_sync")
+    @classmethod
+    def _validate_time_sync(cls, v: str) -> str:
+        """Zaman senkronizasyon PROSEDURUNU dogrula.
+
+        FAIL-CLOSED: gecersiz deger sessizce bir prosedure DUSMEZ. Eskiden
+        `_apply_time_sync` taninmayan her degeri LAN sayiyordu; yani bir yazim
+        hatasi (`DNP3_TIME_SYNC=nonlann`) operatore hicbir sey soylemeden
+        cihazin ilan ETMEDIGI bir prosedurle saat yazdirabiliyordu. Artik
+        gateway ACILMAZ.
+        """
+        # Geriye uyumluluk: 1.15.0'a kadar `_apply_time_sync` bu takma adlari
+        # "senkronizasyon yok" olarak kabul ediyordu.
+        takma = {"off": "none", "disabled": "none", "disable": "none"}
+        s = (v or "").strip().lower()
+        s = takma.get(s, s)
+        valid = {"lan", "nonlan", "none"}
+        if s not in valid:
+            raise ValueError(
+                f"DNP3_TIME_SYNC gecersiz: '{v}'. Gecerli: {sorted(valid)}. "
+                "Prosedur outstation'in ilan ettigi profile gore secilir: "
+                "FC=23/G50V1 ilan eden cihazlarda (or. Horstmann SN 2.0) "
+                "'nonlan', FC=24/G50V3 ilan edenlerde 'lan'."
+            )
         return s
 
     @field_validator("dnp3_library")
