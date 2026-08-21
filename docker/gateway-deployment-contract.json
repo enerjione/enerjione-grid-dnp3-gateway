@@ -425,7 +425,8 @@
       "FC_13_COLD_RESTART": "Profilde destekli; gateway GONDERMEZ (cihazi yeniden baslatir). Testle sabitlendi.",
       "FC_22_ASSIGN_CLASS": "Profilde destekli; gateway GONDERMEZ (cihazin olay siniflandirmasini KALICI degistirir). Testle sabitlendi.",
       "G41V2_ANALOG_OUTPUT_COMMAND": "Profilde destekli; gateway'de analog output komut yolu YOKTUR ve EKLENMEDI.",
-      "SEQUENTIAL_FILE_TRANSFER": "Profil zaten NO der. Konfigurasyon/firmware yolu DNP3 Binary Output tetigi + FTP indirmedir; bu DNP3 File Transfer DEGILDIR."
+      "SEQUENTIAL_FILE_TRANSFER": "Profil zaten NO der. Konfigurasyon/firmware yolu DNP3 Binary Output tetigi + FTP indirmedir; bu DNP3 File Transfer DEGILDIR.",
+      "G21_G23_FROZEN_COUNTER": "Frozen counter YALNIZCA FREEZE fonksiyon kodlarindan (FC=7/8/9/10) sonra olusur. Gateway bunlarin HICBIRINI gondermez -> uretimde G21/G23 OLUSMAZ. Testle sabitlendi."
     },
     "measured_qualifiers": {
       "FC_1_READ_G60": "0x06 (all / no range)",
@@ -443,6 +444,19 @@
         "0x28"
       ],
       "verified_by": "tests/test_horstmann_wire_matrix.py — link cercevesi CRC bloklariyla birlikte cozulerek."
+    },
+    "counter_event_g22": {
+      "status": "PASS",
+      "why_audited_separately": "G20=Counter, G21=Frozen Counter, G22=Counter Event, G23=Frozen Counter Event — AYRI nesnelerdir. Profildeki 6 sayac noktasinin hepsi Class 1'dir, yani uretimde G20 statigi olarak DEGIL G22 OLAYI olarak gelir.",
+      "measured_callback_type": "opendnp3.Counter (FrozenCounter DEGIL; iki tip arasinda kalitim iliskisi YOK, yani isinstance dallanmasi birini digerine yollayamaz)",
+      "measured_cache_object_group": 20,
+      "cache_group_rationale": "G22 ayni FIZIKSEL noktanin olay bicimidir. Ayri bir cache grubu acmak backend'de ayni nokta icin IKI sinyal uretirdi.",
+      "g22_leak_into_g21": false,
+      "timestamp_g22v5": "KORUNUYOR — device_time yazilir, time_quality=synchronized",
+      "timestamp_g22v1": "YOK; gateway damga UYDURMAZ (device_time=None). Olcum yine de KORUNUR.",
+      "counter_flags": "Ham bayrak byte'i kirpilmadan tasinir (olculen 0x61 = ONLINE|ROLLOVER|DISCONTINUITY).",
+      "rollover_not_invalid": "ROLLOVER (bit5) / DISCONTINUITY (bit6) DEGERI GECERSIZ KILMAZ -> quality=good. ANALOG'da ayni bitler OVERRANGE/REFERENCE_ERR'dir ve `invalid` uretir. Karistirmak, her rollover'da saglikli bir enerji sayacini 'bozuk' gostermek olurdu.",
+      "verified_by": "tests/test_g22_counter_event.py — gercek outstation, uretim SOE handler'i beslenerek."
     }
   }
 }

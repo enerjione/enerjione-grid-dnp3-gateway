@@ -118,6 +118,27 @@ kaldirilmadi. Smart sessizlik ve komut duzlemi degismezleri **korundu**.
   fonksiyon kodu ve qualifier matrisi, gercek bir outstation'a karsi
   **link cercevesi cozulerek** uretilir. `cfg` alanina bakip PASS vermez.
 
+- **G22 Counter Event denetim testleri** (`tests/test_g22_counter_event.py`)
+  — **kusur bulunmadi, kanit uretildi.** Profildeki 6 sayac noktasinin
+  hepsi **Class 1**dir, yani uretimde bu noktalar G20 statigi olarak degil
+  **G22 olayi** olarak gelir; bu yol tek basina kanitlanmali idi.
+
+  Gercek bir outstation'a karsi olculdu (uretim SOE handler'i beslenerek):
+
+  | Soru | Olculen |
+  |---|---|
+  | G22 parse ediliyor mu | **Evet** — `Group22Var1`, `isEventVariation=True` |
+  | Callback tipi | `opendnp3.Counter` (`FrozenCounter` **degil**; iki tip arasinda kalitim **yok**) |
+  | Cache object_group | **20** — G22, ayni noktanin olay bicimidir |
+  | G21'e sizma | **Yok** — G23 icin ayri `FrozenCounter` yolu dogrulandi |
+  | G22V5 damgasi | **Korunuyor** (`1755600000000` ms -> `device_time`, `synchronized`) |
+  | G22V1 damgasi | **Uydurulmuyor** (`device_time=None`), olcum korunuyor |
+  | ROLLOVER/DISCONTINUITY | **`invalid` sayilmiyor** (`good`); ayni bitler G30'da `invalid` |
+
+  > **G21 / G23 = NOT USED**, cunku frozen counter yalnizca **FREEZE**
+  > fonksiyon kodlarindan (FC=7/8/9/10) sonra olusur ve gateway bunlarin
+  > hicbirini gondermez. Testle sabitlendi.
+
 ### Changed
 
 - **`DNP3_TIME_SYNC` fail-closed oldu.** Gecersiz deger artik **gateway'i
@@ -150,6 +171,8 @@ kaldirilmadi. Smart sessizlik ve komut duzlemi degismezleri **korundu**.
   NO` der).
 - **COLD RESTART (FC=13) ve ASSIGN CLASS (FC=22)** profilde destekli olsa da
   gateway bunlari **gondermez** — testle sabitlendi.
+- **FREEZE fonksiyon kodlari (FC=7/8/9/10)** gonderilmez; dolayisiyla
+  G21/G23 uretimde **olusmaz**.
 
 ## [1.15.0] - 2026-08-20
 
